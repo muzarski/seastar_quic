@@ -16,12 +16,56 @@
  * under the License.
  */
 
-namespace seastar {
+#include <seastar/core/iostream.hh>
+#include <seastar/net/quic.hh>
 
-namespace net {
-    
-    // TODO
+namespace seastar::net {
 
-}
+    class quic_data_sink_impl : public data_sink_impl {
+    public:
+        temporary_buffer<char> allocate_buffer(size_t size) override {
+            return temporary_buffer<char>(size);
+        }
+        
+        future<> put(packet data) override {
+            return make_ready_future<>();
+        }
+        
+        future<> put(std::vector<temporary_buffer<char>> data) override {
+            return make_ready_future<>();    
+        }
+        
+        future<> put(temporary_buffer<char> buf) override {
+            return make_ready_future<>();
+        }
+        
+        future<> flush() override {
+            return make_ready_future<>();
+        }
+        
+        future<> close() override {
+            return make_ready_future<>();
+        }
+        
+        [[nodiscard]] size_t buffer_size() const noexcept override {
+            return 0;
+        }
+        
+    };
 
-}
+    class quic_data_source_impl : public data_source_impl {
+    public:
+        future<temporary_buffer<char>> get() override {
+           return make_ready_future<temporary_buffer<char>>(); 
+        }
+        
+        future<temporary_buffer<char>> skip(uint64_t n) override {
+            return make_ready_future<temporary_buffer<char>>();
+        }
+        
+        future<> close() override {
+            return make_ready_future<>();
+        }
+    };
+
+} // namespace seastar::net
