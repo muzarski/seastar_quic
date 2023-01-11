@@ -17,14 +17,38 @@
  */
 #pragma once
 
-namespace seastar {
-    
-namespace net {
+#include <seastar/core/seastar.hh>
+#include <seastar/core/iostream.hh>
 
+namespace seastar::net {
+
+    class quic_connected_socket {
+    public:
+        input_stream<char> input(size_t id);
+        output_stream<char> output(size_t id);
+    };
+    
+    struct quic_accept_result {
+        quic_connected_socket connection;
+        socket_address remote_address;
+    };
+    
+    class quic_server_socket {
+    public:
+        future<quic_accept_result> accept();
+        socket_address local_address();
+    };
+    
+    // Initiate the quic server, provide certs, choose version etc.
+    quic_server_socket quic_listen(socket_address sa, 
+                                   const std::string &cert_file, const std::string &cert_key);
+    
+    // Initiate connection to the server, provide certs, choose, version etc.
+    future<quic_connected_socket> quic_connect(socket_address sa, 
+                                               const std::string &cert_file, const std::string &cert_key);
     
     
-}
     
-}
+} // namespace seastar::net
 
 

@@ -739,6 +739,7 @@ add_library (seastar
   src/util/tmp_file.cc
   src/util/short_streams.cc
   src/websocket/server.cc
+  src/net/quic.cc
   )
 
 add_library (Seastar::seastar ALIAS seastar)
