@@ -755,7 +755,8 @@ target_include_directories (seastar
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<BUILD_INTERFACE:${Seastar_GEN_BINARY_DIR}/include>
   PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/quiche/quiche/include)
 
 set (Seastar_PRIVATE_CXX_FLAGS
   -UNDEBUG
@@ -771,6 +772,11 @@ if (Seastar_COMPRESS_DEBUG)
   # -gz doesn't imply -g, so it is safe to add it regardless of debug
   # info being enabled.
   list (APPEND Seastar_PRIVATE_CXX_FLAGS -gz)
+endif()
+
+find_library(QUICHE_LIB NAMES libquiche.a HINTS ${CMAKE_CURRENT_SOURCE_DIR}/quiche/target/debug REQUIRED)
+if(QUICHE_LIB)
+  message(STATUS "Found quiche library - ${QUICHE_LIB}")
 endif()
 
 target_link_libraries (seastar
@@ -791,7 +797,8 @@ target_link_libraries (seastar
     rt::rt
     yaml-cpp::yaml-cpp
     "$<BUILD_INTERFACE:Valgrind::valgrind>"
-    Threads::Threads)
+    Threads::Threads
+    ${QUICHE_LIB})
 
 set (Seastar_SANITIZE_MODES "Debug" "Sanitize")
 if ((Seastar_SANITIZE STREQUAL "ON") OR
