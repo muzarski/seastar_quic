@@ -18,6 +18,7 @@
 
 #include <seastar/core/iostream.hh>
 #include <seastar/net/quic.hh>
+#include <quiche.h>
 
 namespace seastar::net {
 
