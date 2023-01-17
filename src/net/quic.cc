@@ -232,6 +232,7 @@ public:
                     _read_queue.push(std::move(message));
                 }
             }
+            return seastar::make_ready_future<>();
         });
     }
 
@@ -318,14 +319,18 @@ public:
     : _quiche_configuration(cert, key, quic_config)
     , _udp_channel(make_udp_channel(sa))
     , _buffer(MAX_DATAGRAM_SIZE)
-    , _send_queue(make_ready_future<>()) {}
+    , _send_queue(make_ready_future<>()) {
+        (void) service_loop();
+    }
     
     explicit posix_quic_server_socket_impl(const std::string& cert, const std::string& key,
             const quic_connection_config& quic_config)
     : _quiche_configuration(cert, key, quic_config)
     , _udp_channel(make_udp_channel())
     , _buffer(MAX_DATAGRAM_SIZE)
-    , _send_queue(make_ready_future<>()) {}
+    , _send_queue(make_ready_future<>()) {
+        (void) service_loop();
+    }
 
     virtual ~posix_quic_server_socket_impl() = default;
 
@@ -421,7 +426,7 @@ private:
         std::memcpy(key._cid, header_info.dcid.data, header_info.dcid.length);
 
         if (_connections.find(key) == _connections.end()) {
-            return handle_pre_hs_connection(header_info, std::move(datagram));
+            return handle_pre_hs_connection(header_info, std::move(datagram), key);
         } else {
             return handle_post_hs_connection(_connections[key], std::move(datagram));
         }
@@ -446,7 +451,7 @@ private:
         return make_ready_future<>();
     }
 
-    future<> handle_pre_hs_connection(const quic_header_info& header_info, udp_datagram&& datagram) {
+    future<> handle_pre_hs_connection(const quic_header_info& header_info, udp_datagram&& datagram, connection_id& key) {
         if (!quiche_version_is_supported(header_info.version)) {
             fmt::print("Negotiating the version...\n");
             return negotiate_version(header_info, std::move(datagram));
@@ -487,13 +492,17 @@ private:
             return make_ready_future<>();
         }
 
-        auto [it, succeeded] = _connections.emplace(connection_id{}, connection);
+        auto [it, succeeded] = _connections.emplace(key, connection);
         if (!succeeded) {
             fmt::print("Emplacing a connection has failed.\n");
             quiche_conn_free(connection);
             return make_ready_future<>();
         } else {
-            request.set_value(/* TODO: ... */);
+            request.set_value(quic_accept_result {
+                // TODO: Create real connected socket object here.
+                .connection = quic_connected_socket{},
+                .remote_address = datagram.get_src()
+            });
             (void) it->second.service_loop(); // TODO: Think if this really is the rigth thing to do here.
         }
 
