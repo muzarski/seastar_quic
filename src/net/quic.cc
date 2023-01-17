@@ -252,10 +252,10 @@ private:
     // Best if we could use std::colony (C++23) or some equivalent of it.
     //
     // Note: Since we iterate over the connections every time we enter
-    // the service loop, so providing a cache-friendly data structure
-    // is crucial. On the other hand, however, we might also spend
-    // a considerable amount of time on them. That shouldn't happen
-    // often, though, so the point stands.
+    // the service loop, providing a cache-friendly data structure
+    // is crucial. On the other hand, handling each of them may
+    // take a considerable amount of time, and in that case, it wouldn't
+    // be that much of a problem, i.e. it wouldn't be a bottleneck.
     std::unordered_map<connection_id, quic_connection>  _connections;
     future<>                                            _send_queue;
 
@@ -287,7 +287,7 @@ public:
                 switch (sock_addr.ss_family) {
                 case AF_INET:   return socket_address(*reinterpret_cast<const ::sockaddr_in*>(&sock_addr));
                 case AF_INET6:  return socket_address(*reinterpret_cast<const ::sockaddr_in6*>(&sock_addr));
-                default:                        assert(false);
+                default:        assert(false);
                 }
             };
 
@@ -410,7 +410,7 @@ private:
         /* TODO: Validate the token here */
 
         if (_accept_requests.empty()) {
-            // If there are no request for accepting a client, ignore the message;
+            // If there are no requests for accepting a client, ignore the message.
             return make_ready_future<>();
         }
 
