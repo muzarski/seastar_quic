@@ -131,6 +131,10 @@ struct connection_id {
     connection_id() {
         std::memset(_cid, 0, sizeof(_cid));
     }
+    
+    bool operator==(const connection_id& other) const noexcept {
+        return std::memcmp(_cid, other._cid, sizeof(_cid)) == 0;
+    }
 };
 
 } // anonymous namespace
@@ -140,7 +144,7 @@ namespace std {
 
 template<>
 struct hash<seastar::net::connection_id> {
-    size_t operator()(seastar::net::connection_id cid) noexcept {
+    size_t operator()(seastar::net::connection_id cid) const noexcept {
         size_t result = 0;
         for (auto it = std::begin(cid._cid); it != std::end(cid._cid); ++it) {
             result ^= *it + 0x9e3779b9
@@ -202,6 +206,7 @@ public:
     temporary_buffer<char> read() {
         // TODO: Think how to handle this efficiently so that we wait
         // only as long as we should.
+        return {};
     }
 };
 
@@ -432,7 +437,7 @@ private:
             return make_ready_future<>();
         }
 
-        auto [it, succeeded] = _connections.emplace(this, connection);
+        auto [it, succeeded] = _connections.emplace(connection_id{}, connection);
         if (!succeeded) {
             fmt::print("Emplacing a connection has failed.\n");
             quiche_conn_free(connection);
@@ -566,9 +571,9 @@ namespace {
 
 future<quic_connected_socket>
 quic_connect(socket_address sa, const std::string& cert_file, const std::string& cert_key,
-             const quic_connection_config& quic_config)
-{
-    // ...
+             const quic_connection_config& quic_config) {
+    // TODO
+    return make_ready_future<quic_connected_socket>();
 }
 
 } // namespace seastar::net
