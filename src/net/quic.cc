@@ -911,11 +911,12 @@ future<quic_connected_socket> quic_client_socket::connect(socket_address sa) {
         connected_promise.set_exception(std::runtime_error("Creating quic connection failed."));
         return connected_promise.get_future();
     }
-    
+
+    connection = make_lw_shared<quic_client_connection>(conn, this->shared_from_this(), la, sa);
+
     // TODO someone will have to clean it up, probably the `quic_connected_socket`.
     receive_fiber = receive_loop();
-    
-    connection = make_lw_shared<quic_client_connection>(conn, this->shared_from_this(), la, sa);
+
     return connection->init().then([this] () {
         return connected_promise.get_future();
     });
