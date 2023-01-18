@@ -489,7 +489,37 @@ private:
         return make_ready_future<>();
     }
 
-    future<> handle_pre_hs_connection(const quic_header_info& header_info, udp_datagram&& datagram, connection_id& key) {
+    
+    // TODO make it look pretty :)
+    static bool validate_token(const uint8_t *token, size_t token_len,
+                               struct sockaddr_storage *addr, socklen_t addr_len,
+                               uint8_t *odcid, size_t *odcid_len) {
+        if ((token_len < sizeof("quiche") - 1) ||
+            std::memcmp(token, "quiche", sizeof("quiche") - 1)) {
+            return false;
+        }
+
+        token += sizeof("quiche") - 1;
+        token_len -= sizeof("quiche") - 1;
+
+        if ((token_len < addr_len) || std::memcmp(token, addr, addr_len)) {
+            return false;
+        }
+
+        token += addr_len;
+        token_len -= addr_len;
+
+        if (*odcid_len < token_len) {
+            return false;
+        }
+
+        memcpy(odcid, token, token_len);
+        *odcid_len = token_len;
+
+        return true;
+    }
+
+    future<> handle_pre_hs_connection(quic_header_info& header_info, udp_datagram&& datagram, connection_id& key) {
         if (!quiche_version_is_supported(header_info.version)) {
             fmt::print("Negotiating the version...\n");
             return negotiate_version(header_info, std::move(datagram));
@@ -500,7 +530,21 @@ private:
             return quic_retry(header_info, std::move(datagram));
         }
 
-        /* TODO: Validate the token here */
+        /* TODO: refactor it or something. */
+        sockaddr addr = datagram.get_src().as_posix_sockaddr();
+        socklen_t addr_len = sizeof(addr);
+        
+        auto *peer_addr = (struct sockaddr_storage*) &addr;
+        socklen_t peer_addr_len = addr_len;
+        
+        sockaddr local_addr = datagram.get_dst().as_posix_sockaddr();
+        socklen_t local_addr_len = sizeof(local_addr);
+        
+        if (!validate_token(header_info.token.data, header_info.token.size, peer_addr, peer_addr_len,
+                           reinterpret_cast<uint8_t *>(header_info.odcid.data), &header_info.odcid.length)) {
+            fmt::print("Invalid address validation token.");
+            return make_ready_future<>();
+        }
 
         if (_accept_requests.empty()) {
             // If there are no requests for accepting a client, ignore the message.
@@ -510,18 +554,15 @@ private:
         auto request = std::move(_accept_requests.front());
         _accept_requests.pop();
 
-        const ::sockaddr local_addr = datagram.get_dst().as_posix_sockaddr();
-        const ::sockaddr peer_addr = datagram.get_src().as_posix_sockaddr();
-
         quiche_conn* connection = quiche_accept(
             header_info.dcid.data,
             header_info.dcid.length,
             header_info.odcid.data,
             header_info.odcid.length,
             &local_addr,
-            sizeof(local_addr),
-            &peer_addr,
-            sizeof(peer_addr),
+            local_addr_len,
+            &addr,
+            peer_addr_len,
             _quiche_configuration.get_underlying_config()
         );
 
