@@ -97,6 +97,7 @@ public:
             case quic_cc_algorithm::CUBIC:  return QUICHE_CC_CUBIC;
             case quic_cc_algorithm::RENO:   return QUICHE_CC_RENO;
             }
+            return QUICHE_CC_RENO;
         };
         
         quiche_config_set_max_idle_timeout(_config, config.max_idle_timeout);
@@ -159,7 +160,17 @@ struct hash<seastar::net::connection_id> {
 
 namespace seastar::net {
 
-namespace {
+    quic_server_socket::quic_server_socket(std::unique_ptr<quic_server_socket_impl> impl) noexcept : _impl(std::move(impl)) { }
+
+    future<quic_accept_result> quic_server_socket::accept() {
+        return _impl->accept();
+    }
+
+    socket_address quic_server_socket::local_address() const noexcept {
+        return _impl->local_address();
+    }
+
+    namespace {
 
 class posix_quic_server_socket_impl;
 
