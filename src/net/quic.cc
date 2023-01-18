@@ -445,7 +445,15 @@ private:
 
     future<> handle_post_hs_connection(quic_connection& connection, udp_datagram&& datagram) {
         auto* fa = datagram.get_data().fragment_array();
-        quiche_recv_info recv_info;
+        auto local_addr = datagram.get_dst().as_posix_sockaddr();
+        auto peer_addr = datagram.get_src().as_posix_sockaddr();
+
+        quiche_recv_info recv_info = {
+                &peer_addr,
+                sizeof(peer_addr),
+                &local_addr,
+                sizeof(local_addr)
+        };
 
         const auto recv_result = quiche_conn_recv(
             connection._connection,
@@ -514,7 +522,8 @@ private:
                 .connection = quic_connected_socket{},
                 .remote_address = datagram.get_src()
             });
-            (void) it->second.service_loop(); // TODO: Think if this really is the rigth thing to do here.
+            // Outer TODO: Uncomment when this works (or delete)
+            // (void) it->second.service_loop(); // TODO: Think if this really is the rigth thing to do here.
         }
 
         return handle_post_hs_connection(it->second, std::move(datagram));

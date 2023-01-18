@@ -30,8 +30,8 @@
 
 seastar::future<> service_loop() {
     // TODO: Either add keys to the repo or generate them here.
-    std::string cert_file = "cert.crt";
-    std::string key_file = "cert.key";
+    std::string cert_file = "/home/danielmastalerz/Pulpit/seastar_quic/quiche/quiche/examples/cert.crt";
+    std::string key_file = "/home/danielmastalerz/Pulpit/seastar_quic/quiche/quiche/examples/cert.key";
 
     return seastar::do_with(seastar::net::quic_listen(seastar::make_ipv4_address({1234}), cert_file, key_file),
                             [](auto &listener) {
