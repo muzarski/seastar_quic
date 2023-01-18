@@ -239,4 +239,4 @@ esac
 
 git submodule update --init --recursive -- quiche
 cd quiche
-cargo build
+cargo build --features ffi
