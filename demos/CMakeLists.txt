@@ -122,3 +122,7 @@ seastar_add_demo (tutorial_examples
 
 seastar_add_demo (http_client
   SOURCES http_client_demo.cc)
+
+seastar_add_demo (quic_accept_connections
+        SOURCES quic_accept_connections.cc)
+
