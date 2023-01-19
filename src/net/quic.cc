@@ -58,6 +58,17 @@ private:
 
 public:
     quiche_configuration() = delete;
+    quiche_configuration(quiche_configuration &other) = delete;
+    quiche_configuration& operator=(quiche_configuration &other) = delete;
+
+    quiche_configuration(quiche_configuration &&other) noexcept {
+        _config = std::exchange(other._config, nullptr);
+    }
+    
+    quiche_configuration& operator=(quiche_configuration &&other) noexcept {
+        _config = std::exchange(other._config, nullptr);
+        return *this;
+    }
     
     explicit quiche_configuration(const quic_connection_config &config) 
     : _config(quiche_config_new(QUICHE_PROTOCOL_VERSION))
@@ -804,7 +815,7 @@ public:
 };
 
 
-class quic_client_connection : public enable_lw_shared_from_this<quic_client_connection> {
+class quic_client_connection {
 private:
     quiche_conn *conn;
     lw_shared_ptr<quic_client_socket> sock;
@@ -813,10 +824,10 @@ private:
     timer<std::chrono::steady_clock> timeout_timer;
 
 public:
-    quic_client_connection(quiche_conn *connection, lw_shared_ptr<quic_client_socket> socket, 
+    quic_client_connection(quiche_conn *connection, const lw_shared_ptr<quic_client_socket> &socket, 
                            socket_address la, socket_address pa) :
         conn(connection),
-        sock(std::move(socket)),
+        sock(socket),
         local_address(la),
         peer_address(pa),
         timeout_timer() {}
