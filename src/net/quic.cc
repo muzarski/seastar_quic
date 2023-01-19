@@ -981,8 +981,9 @@ future<quic_connected_socket> quic_client_socket::connect(socket_address sa) {
 // one implementation for the rest of the classes.
 future<quic_connected_socket>
 quic_connect(socket_address sa, const quic_connection_config& quic_config) {
-    return seastar::do_with(quic_client_socket(quic_config), [sa] (quic_client_socket& client_socket) {
-        return client_socket.connect(sa);
+    return seastar::do_with(make_lw_shared<quic_client_socket>(quic_config), 
+            [sa] (lw_shared_ptr<quic_client_socket>& client_socket) {
+        return client_socket->connect(sa);
     });
 }
 
