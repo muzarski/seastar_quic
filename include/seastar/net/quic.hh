@@ -69,14 +69,21 @@ public:
 class quic_server_socket {
 private:
     std::unique_ptr<quic_server_socket_impl> _impl;
+
 public:
     quic_server_socket() noexcept = default;
-    explicit quic_server_socket(std::unique_ptr<quic_server_socket_impl> impl) noexcept;
+    explicit quic_server_socket(std::unique_ptr<quic_server_socket_impl> impl) noexcept
+    : _impl(std::move(impl)) {}
     quic_server_socket(quic_server_socket&& qss) noexcept = default;
     ~quic_server_socket() noexcept = default;
 
-    future<quic_accept_result> accept();
-    socket_address local_address() const noexcept;
+    future<quic_accept_result> accept() {
+        return _impl->accept();
+    }
+
+    socket_address local_address() const noexcept {
+        return _impl->local_address();
+    }
 };
 
 // Initiate the quic server, provide certs, choose version etc.
