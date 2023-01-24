@@ -38,7 +38,11 @@ seastar::future<> service_loop() {
                                 return seastar::keep_doing([&listener]() {
                                     return listener.accept().then([](seastar::net::quic_accept_result result) {
                                         std::cout << "Connection accepted from " << result.remote_address << std::endl;
-                                        return seastar::make_ready_future<>();
+                                        auto in = result.connection.input(4);
+                                        return in.read().then([](seastar::temporary_buffer<char> buf) {
+                                            std::string msg = buf.get();
+                                            std::cout << "Received message: " << msg << std::endl;
+                                        });
                                     });
                                 });
                             });
