@@ -347,10 +347,14 @@ class posix_quic_server_socket_impl;
 // Class representing a single connection created by a QUIC server.
 class quic_connection {
 private:
+    // TODO: How much should it be? Or should we only read when necessary?
+    constexpr static size_t STREAM_READ_QUEUE_SIZE = 10000;
+
+private:
     quiche_conn*                                _connection     = nullptr;
     std::vector<char>                           _buffer;
-    std::queue<temporary_buffer<char>>          _read_queue;
-    std::queue<promise<temporary_buffer<char>>> _read_requests;
+    queue<temporary_buffer<char>>               _read_queue;
+    promise<>                                   _readable;
 
 private:
     friend class posix_quic_server_socket_impl;
@@ -360,11 +364,13 @@ public:
     // of containers to avoid problems later on.
     // Feel free to delete it if you've made sure it's unnecessary.
     quic_connection()
-    : _buffer(MAX_DATAGRAM_SIZE) {}
+    : _buffer(MAX_DATAGRAM_SIZE)
+    , _read_queue(STREAM_READ_QUEUE_SIZE) {}
 
     quic_connection(quiche_conn* connection)
     : _connection(connection)
-    , _buffer(MAX_DATAGRAM_SIZE) {}
+    , _buffer(MAX_DATAGRAM_SIZE)
+    , _read_queue(STREAM_READ_QUEUE_SIZE) {}
 
     ~quic_connection() {
         // TODO: Right now, this destructor is more proof-of-concept-like
@@ -379,7 +385,7 @@ public:
     }
 
     future<> service_loop();
-    void write(temporary_buffer<char> tb);
+    void write(temporary_buffer<char> tb, std::uint64_t stream_id);
     future<temporary_buffer<char>> read();
 };
 
@@ -388,63 +394,55 @@ future<> quic_connection::service_loop() {
     // once the destructor of the class has been called. Something similar to how
     // std::jthread works.
     return keep_doing([this] {
-        bool fin = false;
-        const auto recv_result = quiche_conn_stream_recv(
-            _connection,
-            0,
-            reinterpret_cast<uint8_t*>(_buffer.data()),
-            _buffer.size(),
-            &fin
-        );
+        return _readable.get_future().then([this] {
+            std::uint64_t stream_id;
+            auto iter = quiche_conn_readable(_connection);
+            while (quiche_stream_iter_next(iter, &stream_id)) {
+                bool fin = false;
+                const auto recv_result = quiche_conn_stream_recv(
+                        _connection,
+                        stream_id,
+                        reinterpret_cast<uint8_t*>(_buffer.data()),
+                        _buffer.size(),
+                        &fin
+                );
 
-        if (recv_result != QUICHE_ERR_DONE) {
-            // There is a message.
+                if (recv_result < 0) {
+                    fmt::print("Reading from a stream has failed with message: {}\n", recv_result);
+                    // TODO: Handle this properly.
+                } else {
+                    /* TODO: Handle the message properly when fin == true.
+                            Right now we only send an empty FIN message to the endpoint. */
+                    if (fin) {
+                        quiche_conn_stream_send(_connection, stream_id, nullptr, 0, true);
+                        // TODO: Do something...
+                    }
 
-            if (recv_result < 0) {
-                fmt::print("Reading from a stream has failed with message: {}\n", recv_result);
-                // TODO: Handle this properly.
+                    temporary_buffer<char> message(_buffer.data(), recv_result);
+                    _read_queue.push(std::move(message));
+                }
             }
-            /* TODO: Handle the message properly when fin == true.
-                    Right now we only send an empty FIN message to the endpoint. */
-            if (fin) {
-                quiche_conn_stream_send(_connection, 0, nullptr, 0, true);
-                // TODO: Do something...
+            if (!quiche_conn_is_readable(_connection)) {
+                _readable = promise<>();
             }
-
-            temporary_buffer<char> message(_buffer.data(), recv_result);
-            if (!_read_requests.empty()) {
-                auto promise = std::move(_read_requests.front());
-                promise.set_value(std::move(message));
-            } else {
-                _read_queue.push(std::move(message));
-            }
-        }
-        return seastar::make_ready_future<>();
+            return make_ready_future<>();
+        });
     });
 }
 
-void quic_connection::write(temporary_buffer<char> tb) {
+[[maybe_unused]] void quic_connection::write(temporary_buffer<char> tb, std::uint64_t stream_id) {
     // TODO: Handle this properly.
     [[maybe_unused]] const auto send_result = quiche_conn_stream_send(
         _connection,
-        0,  // TODO: Hardcoded stream
+        stream_id,
         reinterpret_cast<const uint8_t*>(tb.get()),
         tb.size(),
         0         // Don't close the stream.
     );
 }
 
-future<temporary_buffer<char>> quic_connection::read() {
-    if (_read_queue.empty()) {
-        promise<temporary_buffer<char>> promise;
-        auto result = promise.get_future();
-        _read_requests.push(std::move(promise));
-        return result;
-    } else {
-        auto result = std::move(_read_queue.front());
-        _read_queue.pop();
-        return make_ready_future<temporary_buffer<char>>(std::move(result));
-    }
+[[maybe_unused]] future<temporary_buffer<char>> quic_connection::read() {
+    return _read_queue.pop_eventually();
 }
 
 // TODO: Try to get rid of the POSIX networking structures
@@ -563,6 +561,10 @@ future<> posix_quic_server_socket_impl::service_loop() {
         // returning an iterator over the connections that
         // have some data to send.
         for (auto& [_, connection] : _connections) {
+            if (quiche_conn_is_readable(connection._connection)) {
+                connection._readable.set_value();
+            }
+
             while (true) {
                 const auto send_result = quiche_conn_send(
                     connection._connection,
@@ -572,7 +574,8 @@ future<> posix_quic_server_socket_impl::service_loop() {
                 );
 
                 if (send_result == QUICHE_ERR_DONE) {
-                    fmt::print("Done writing\n");
+                    // TODO: I would delete this print, it only clutters the output.
+                    // fmt::print("Done writing\n");
                     break;
                 }
 
@@ -773,9 +776,8 @@ future<> posix_quic_server_socket_impl::handle_pre_hs_connection(quic_header_inf
             .connection     = quic_connected_socket{},
             .remote_address = datagram.get_src()
         });
-        // TODO 1: Uncomment when this works (or delete).
-        // TODO 2: Think if this really is the rigth thing to do here.
-        // (void) it->second.service_loop();
+        // TODO: Think if this really is the rigth thing to do here.
+        (void) it->second.service_loop();
     }
 
     return handle_post_hs_connection(it->second, std::move(datagram));
