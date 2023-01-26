@@ -123,8 +123,8 @@ seastar_add_demo (tutorial_examples
 seastar_add_demo (http_client
   SOURCES http_client_demo.cc)
 
-seastar_add_demo (quic_accept_connections
-  SOURCES quic_accept_connections.cc)
+seastar_add_demo (quic_echo_server
+  SOURCES quic_echo_server.cc)
 
-seastar_add_demo (quic_connect
-  SOURCES quic_connect.cc)
+seastar_add_demo (quic_echo_client
+  SOURCES quic_echo_client.cc)
