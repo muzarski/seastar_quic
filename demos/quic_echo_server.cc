@@ -19,14 +19,36 @@
  * Copyright (C) 2015 Cloudius Systems, Ltd.
  */
 
-// Demonstration of ability to accept QUIC connection.
-// TODO: make echo-server out of it when whole functionality is implemented.
+// Demonstration of ability to accept QUIC connection and echo-ing the received data.
 
 #include <seastar/core/app-template.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/future-util.hh>
 #include <seastar/net/api.hh>
 #include <seastar/net/quic.hh>
+#include <seastar/core/sleep.hh>
+
+constexpr static std::uint64_t STREAM_ID = 4;
+
+seastar::future<> handle_connection(seastar::net::quic_accept_result accept_result) {
+    std::cout << "Accepted connection!" << std::endl;
+    auto conn = std::move(accept_result.connection);
+    auto in = conn.input(STREAM_ID);
+    auto out = conn.output(STREAM_ID);
+    return seastar::do_with(std::move(conn), std::move(in), std::move(out), [](auto &conn, auto &in, auto &out) {
+        return seastar::keep_doing([&in, &out]() {
+            return in.read().then([&out](seastar::temporary_buffer<char> buf) {
+                char msg_buf[buf.size() + 1];
+                memcpy(msg_buf, buf.get(), buf.size());
+                msg_buf[buf.size()] = '\0';
+                std::cout << "Received message: " << msg_buf << std::endl;
+                return out.write(std::move(buf)).then([&out]() {
+                    return out.flush();
+                });
+            });
+        });
+    });
+}
 
 seastar::future<> service_loop() {
     // TODO: Either add keys to the repo or generate them here.
@@ -37,12 +59,7 @@ seastar::future<> service_loop() {
                             [](auto &listener) {
                                 return seastar::keep_doing([&listener]() {
                                     return listener.accept().then([](seastar::net::quic_accept_result result) {
-                                        std::cout << "Connection accepted from " << result.remote_address << std::endl;
-                                        auto in = result.connection.input(4);
-                                        return in.read().then([](seastar::temporary_buffer<char> buf) {
-                                            std::string msg = buf.get();
-                                            std::cout << "Received message: " << msg << std::endl;
-                                        });
+                                        (void) handle_connection(std::move(result));
                                     });
                                 });
                             });

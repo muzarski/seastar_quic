@@ -61,9 +61,8 @@ private:
 
 public:
     explicit quic_connected_socket(std::unique_ptr<quic_connected_socket_impl> impl) noexcept : _impl(std::move(impl)) {}
-    quic_connected_socket() noexcept = default;
     input_stream<char> input(std::uint64_t id);
-    output_stream<char> output(std::uint64_t id);
+    output_stream<char> output(std::uint64_t id, size_t buffer_size = 8192);
 };
 
 struct quic_accept_result {

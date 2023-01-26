@@ -344,9 +344,11 @@ private:
 // Maybe there are other, better ways to solve it than making
 // `posix_quic_server_socket_impl` a friend of `quic_connection`.
 class posix_quic_server_socket_impl;
+class quic_client_connection;
+
 
 // Class representing a single connection created by a QUIC server.
-class quic_connection {
+class quic_connection : public enable_lw_shared_from_this<quic_connection> {
 private:
     // TODO: How much should it be? Or should we only read when necessary?
     constexpr static size_t STREAM_READ_QUEUE_SIZE = 10000;
@@ -356,10 +358,16 @@ private:
     std::vector<char>                                                _buffer;
     std::unordered_map<std::uint64_t, queue<temporary_buffer<char>>> _read_queues;
     promise<>                                                        _readable;
-    std::unordered_map<std::uint64_t, promise<>>                     _writable;
+
+    // TODO: Delete those two pointers after refactor, because of differences in implementations of server
+    // and client and the fact that we flush quic packets with a different design I needed to put that here for stream_send.
+    bool _is_server;
+    lw_shared_ptr<quic_client_connection> _client_conn{};
+    lw_shared_ptr<posix_quic_server_socket_impl> _server_conn{};
 
 private:
     friend class posix_quic_server_socket_impl;
+    friend class quic_client_socket;
 
 public:
     // TODO: instead of _readable future and this bool flag use a semaphore (?)
@@ -372,9 +380,17 @@ public:
     quic_connection()
     : _buffer(MAX_DATAGRAM_SIZE) {}
 
-    quic_connection(quiche_conn* connection)
+    quic_connection(quiche_conn* connection, lw_shared_ptr<posix_quic_server_socket_impl> server_conn)
     : _connection(connection)
-    , _buffer(MAX_DATAGRAM_SIZE) {}
+    , _buffer(MAX_DATAGRAM_SIZE)
+    , _is_server(true)
+    , _server_conn(std::move(server_conn)) {}
+
+    quic_connection(quiche_conn* connection, lw_shared_ptr<quic_client_connection> client_conn)
+    : _connection(connection)
+    , _buffer(MAX_DATAGRAM_SIZE)
+    , _is_server(false)
+    , _client_conn{std::move(client_conn)} {}
 
     ~quic_connection() {
         // TODO: Right now, this destructor is more proof-of-concept-like
@@ -389,7 +405,7 @@ public:
     }
 
     future<> service_loop();
-    void write(temporary_buffer<char> tb, std::uint64_t stream_id);
+    future<> write(temporary_buffer<char> tb, std::uint64_t stream_id);
     future<temporary_buffer<char>> read(std::uint64_t stream_id);
 };
 
@@ -440,17 +456,6 @@ future<> quic_connection::service_loop() {
     });
 }
 
-[[maybe_unused]] void quic_connection::write(temporary_buffer<char> tb, std::uint64_t stream_id) {
-    // TODO: Handle this properly.
-    [[maybe_unused]] const auto send_result = quiche_conn_stream_send(
-        _connection,
-        stream_id,
-        reinterpret_cast<const uint8_t*>(tb.get()),
-        tb.size(),
-        0         // Don't close the stream.
-    );
-}
-
 [[maybe_unused]] future<temporary_buffer<char>> quic_connection::read(std::uint64_t stream_id) {
     return _read_queues.try_emplace(stream_id, STREAM_READ_QUEUE_SIZE).first->second.pop_eventually();
 }
@@ -471,6 +476,34 @@ public:
     }
 };
 
+class quiche_data_sink_impl final: public data_sink_impl {
+private:
+    constexpr static size_t BUFFER_SIZE = 65'507;
+    lw_shared_ptr<quic_connection> _conn;
+    std::uint64_t stream_id;
+
+public:
+    quiche_data_sink_impl(lw_shared_ptr<quic_connection> conn, std::uint64_t stream_id) {
+        _conn = std::move(conn);
+        this->stream_id = stream_id;
+    }
+
+    virtual future<> put(net::packet data) override {
+        return _conn->write(temporary_buffer<char>(data.fragment_array()->base, data.fragment_array()->size), stream_id);
+    }
+
+    virtual future<> close() override {
+        // TODO: implement this by sending FIN frame to the endpoint.
+        // Although, here we should wait until all data in the stream is sent - how to do it efficiently?
+        return seastar::make_ready_future();
+    }
+
+    virtual size_t buffer_size() const noexcept override {
+        // TODO: what buffer size should be chosen? Maybe MAX_STREAM_DATA from quiche config?
+        return BUFFER_SIZE;
+    }
+};
+
 class quiche_quic_connected_socket_impl : public quic_connected_socket_impl {
 private:
     lw_shared_ptr<quic_connection> _conn;
@@ -484,14 +517,14 @@ public:
 
     data_sink sink(std::uint64_t id) override {
         // TODO: implement
-        return data_sink();
+        return data_sink(std::make_unique<quiche_data_sink_impl>(_conn, id));
     }
 
 };
 
 // TODO: Try to get rid of the POSIX networking structures
 // if possible.
-class posix_quic_server_socket_impl final : public quic_server_socket_impl {
+class posix_quic_server_socket_impl final : public quic_server_socket_impl, public enable_lw_shared_from_this<posix_quic_server_socket_impl> {
 private:
     // TODO: Check the comments left in the function `quic_retry`.
     // Right now, tokens aren't used properly and passing `socket_address::length()`
@@ -579,6 +612,7 @@ public:
     future<> service_loop();
     virtual future<quic_accept_result> accept() override;
     virtual socket_address local_address() const override;
+    void quic_flush(lw_shared_ptr<quic_connection> connection);
 
 private:
     future<> handle_datagram(udp_datagram&& datagram);
@@ -594,12 +628,40 @@ private:
     connection_id generate_new_cid();
 };
 
+void posix_quic_server_socket_impl::quic_flush(lw_shared_ptr<quic_connection> connection) {
+    quiche_send_info send_info;
+    while (true) {
+        const auto send_result = quiche_conn_send(
+                connection->_connection,
+                reinterpret_cast<uint8_t*>(_buffer.data()),
+                _buffer.size(),
+                &send_info
+        );
+
+        if (send_result == QUICHE_ERR_DONE) {
+            // TODO: I would delete this print, it only clutters the output.
+            // fmt::print("Done writing\n");
+            break;
+        }
+
+        if (send_result < 0) {
+            fmt::print(stderr, "Failed to create a packet. Return value: {}\n", send_result);
+            break;
+        }
+
+        send_payload payload(_buffer.data(), send_result, send_info.to, send_info.to_len);
+        _send_queue = _send_queue.then(
+                [this, payload = std::move(payload)]() mutable {
+                    return _udp_channel.send(payload.dst, std::move(payload.buffer));
+                }
+        );
+    }
+}
+
 future<> posix_quic_server_socket_impl::service_loop() {
     // TODO: Consider changing this to seastar::repeat and passing a stop toket to it
     // once the destructor of the class has been called.
     return keep_doing([this] {
-        quiche_send_info send_info;
-
         // TODO: Change this to something more efficient.
         // If I remember correctly, quiche has some function
         // returning an iterator over the connections that
@@ -609,33 +671,7 @@ future<> posix_quic_server_socket_impl::service_loop() {
                 connection->_readable.set_value();
                 connection->_read_future_resolved = true;
             }
-
-            while (true) {
-                const auto send_result = quiche_conn_send(
-                    connection->_connection,
-                    reinterpret_cast<uint8_t*>(_buffer.data()),
-                    _buffer.size(),
-                    &send_info
-                );
-
-                if (send_result == QUICHE_ERR_DONE) {
-                    // TODO: I would delete this print, it only clutters the output.
-                    // fmt::print("Done writing\n");
-                    break;
-                }
-
-                if (send_result < 0) {
-                    fmt::print(stderr, "Failed to create a packet. Return value: {}\n", send_result);
-                    break;
-                }
-
-                send_payload payload(_buffer.data(), send_result, send_info.to, send_info.to_len);
-                _send_queue = _send_queue.then(
-                    [this, payload = std::move(payload)]() mutable {
-                        return _udp_channel.send(payload.dst, std::move(payload.buffer));
-                    }
-                );
-            }
+            quic_flush(connection);
         }
 
         return _udp_channel.receive().then([this](udp_datagram datagram) {
@@ -810,7 +846,7 @@ future<> posix_quic_server_socket_impl::handle_pre_hs_connection(quic_header_inf
         return make_ready_future<>();
     }
 
-    auto [it, succeeded] = _connections.emplace(key, make_lw_shared<quic_connection>(connection));
+    auto [it, succeeded] = _connections.emplace(key, make_lw_shared<quic_connection>(connection, this->shared_from_this()));
     if (!succeeded) {
         fmt::print("Emplacing a connection has failed.\n");
         // TODO: Check if this can cause a double-free.
@@ -941,6 +977,7 @@ private:
     promise<quic_connected_socket>          _connected_promise;
     quiche_configuration                    _config;
     lw_shared_ptr<quic_client_connection>   _connection;
+    lw_shared_ptr<quic_connection>          _conn; // TODO: merge with the quic_client_connection
     future<>                                _receive_fiber;
     bool                                    _promise_resolved;
 
@@ -1008,6 +1045,7 @@ future<quic_connected_socket> quic_client_socket::connect(socket_address sa) {
     }
 
     _connection = make_lw_shared<quic_client_connection>(connection_ptr, this->shared_from_this(), la, sa);
+    _conn = make_lw_shared<quic_connection>(connection_ptr, _connection);
 
     // TODO: Something must clean this up afterwards, most likely `quic_connected_socket`.
     _receive_fiber = receive_loop();
@@ -1038,8 +1076,13 @@ future<> quic_client_socket::receive() {
 
         if (_connection->is_established() && !_promise_resolved) {
             _promise_resolved = true;
-            // TODO: pass the `quic_connection` to `quic_connected_socket`.
-            _connected_promise.set_value();
+            _connected_promise.set_value(quic_connected_socket(std::make_unique<quiche_quic_connected_socket_impl>(_conn)));
+            (void) _conn->service_loop();
+        }
+
+        if (quiche_conn_is_readable(_conn->_connection) && !_conn->_read_future_resolved) {
+            _conn->_readable.set_value();
+            _conn->_read_future_resolved = true;
         }
 
         return _connection->quic_flush();
@@ -1115,6 +1158,31 @@ bool quic_client_connection::is_established() {
 bool quic_client_connection::is_closed() {
     return quiche_conn_is_closed(_connection);
 }
+
+// TODO: I think that this future should be resolved when stream is writable with necessary amount of bytes.
+// Right now it returns when flushed and we don't do any flow control for the stream.
+[[maybe_unused]] future<> quic_connection::write(temporary_buffer<char> tb, std::uint64_t stream_id) {
+    // TODO: Handle this properly.
+    const auto send_result = quiche_conn_stream_send(
+            _connection,
+            stream_id,
+            reinterpret_cast<const uint8_t*>(tb.get()),
+            tb.size(),
+            false         // Don't close the stream.
+            );
+    // TODO: Handle errors
+    if (send_result < 0) {
+        fmt::print("Error while sending via stream: {}", send_result);
+    }
+
+    // TODO: Flush in one way after a refactor.
+    if (_is_server) {
+        _server_conn->quic_flush(this->shared_from_this());
+        return seastar::make_ready_future();
+    } else {
+        return _client_conn->quic_flush();
+    }
+}
 } // anonymous namespace
 
 quic_server_socket quic_listen(socket_address sa, const std::string& cert_file,
@@ -1144,8 +1212,9 @@ input_stream<char> quic_connected_socket::input(std::uint64_t id) {
     return input_stream<char>(_impl->source(id));
 }
 
-output_stream<char> quic_connected_socket::output(std::uint64_t id) {
-    // TODO: implement
-    return {};
+output_stream<char> quic_connected_socket::output(std::uint64_t id, size_t buffer_size) {
+    output_stream_options opts;
+    opts.batch_flushes = true;
+    return output_stream<char>(_impl->sink(id), buffer_size);
 }
 } // namespace seastar::net
