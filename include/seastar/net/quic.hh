@@ -92,7 +92,7 @@ public:
         return _impl->accept();
     }
 
-    socket_address local_address() const noexcept {
+    [[nodiscard]] socket_address local_address() const noexcept {
         return _impl->local_address();
     }
 };
@@ -104,7 +104,7 @@ quic_server_socket quic_listen(const std::string& cert_file, const std::string& 
 quic_server_socket quic_listen(socket_address sa, const std::string& cert_file, const std::string& cert_key,
                                const quic_connection_config& quic_config = quic_connection_config());
 
-// Initiate connection to the server, provide certs, choose, version etc.
+// Initiate connection to the server, choose version etc.
 future<quic_connected_socket> 
 quic_connect(socket_address sa, const quic_connection_config& quic_config = quic_connection_config());
 
