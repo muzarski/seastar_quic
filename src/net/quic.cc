@@ -526,7 +526,7 @@ void quic_connection<Socket>::send_outstanding_data_in_streams_if_possible() {
 
             if (written < 0) {
                 // TODO: Handle quiche error.
-                break;
+                fmt::print("Writing to a stream has failed with message: {}\n", written);
             }
 
             size_t actually_written = written > 0 ? written : 0;
@@ -611,6 +611,7 @@ template <typename Socket>
 
     if (written < 0) {
         // TODO: Handle quiche error.
+        fmt::print("Writing to a stream has failed with message: {}\n", written);
     }
 
     size_t actually_written = written > 0 ? written : 0;
