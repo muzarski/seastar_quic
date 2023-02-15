@@ -354,21 +354,25 @@ private:
     constexpr static size_t STREAM_READ_QUEUE_SIZE = 10000;
 
 private:
-    quiche_conn*                                                     _connection;
-    std::vector<char>                                                _buffer;
-    std::unordered_map<std::uint64_t, queue<temporary_buffer<char>>> _read_queues;
-    promise<>                                                        _readable;
-    lw_shared_ptr<Socket>                                            _socket;
-    socket_address                                                   _local_address;
-    socket_address                                                   _peer_address;
-    timer<std::chrono::steady_clock>                                 _timeout_timer;
-    future<>                                                         _stream_recv_fiber;
+    quiche_conn*                                                          _connection;
+    std::vector<char>                                                     _buffer;
+    std::unordered_map<std::uint64_t, queue<temporary_buffer<char>>>      _read_queues;
+    std::unordered_map<std::uint64_t, std::deque<temporary_buffer<char>>> _write_queues;
+    std::unordered_map<std::uint64_t, promise<>>                          _writable_promises;
+    promise<>                                                             _readable;
+    lw_shared_ptr<Socket>                                                 _socket;
+    socket_address                                                        _local_address;
+    socket_address                                                        _peer_address;
+    timer<std::chrono::steady_clock>                                      _timeout_timer;
+    future<>                                                              _stream_recv_fiber;
 
 public:
-    bool                                                             _read_future_resolved = false;
+    bool                                                                  _read_future_resolved = false;
 
 private:
     future<> stream_recv_loop();
+    future<> wait_send_available(std::uint64_t stream_id);
+    void send_outstanding_data_in_streams_if_possible();
 
 public:
     quic_connection(quiche_conn* connection, const lw_shared_ptr<Socket>& socket,
@@ -444,35 +448,37 @@ future<> quic_connection<Socket>::stream_recv_loop() {
             std::uint64_t stream_id;
             auto iter = quiche_conn_readable(_connection);
             while (quiche_stream_iter_next(iter, &stream_id)) {
-                bool fin = false;
-                const auto recv_result = quiche_conn_stream_recv(
-                        _connection,
-                        stream_id,
-                        reinterpret_cast<uint8_t*>(_buffer.data()),
-                        _buffer.size(),
-                        &fin
-                );
+                while(quiche_conn_stream_readable(_connection, stream_id)) {
+                    bool fin = false;
+                    const auto recv_result = quiche_conn_stream_recv(
+                            _connection,
+                            stream_id,
+                            reinterpret_cast<uint8_t*>(_buffer.data()),
+                            _buffer.size(),
+                            &fin
+                    );
 
-                if (recv_result < 0) {
-                    fmt::print("Reading from a stream has failed with message: {}\n", recv_result);
-                    // TODO: Handle this properly.
-                } else {
-                    temporary_buffer<char> message(_buffer.data(), recv_result);
-                    // TODO: wrap this in some kind of `not_full` future.
-                    // (or just read only when necessary)
-                    auto pushed = _read_queues.try_emplace(stream_id, STREAM_READ_QUEUE_SIZE).first->second.push(std::move(message));
-                    if (!pushed) {
-                        fmt::print("The read queue is full. Dropping the message.\n");
-                    }
-
-                    /* TODO: Handle the message properly when fin == true.
-                            Right now we only send an empty FIN message to the endpoint. */
-                    if (fin) {
-                        quiche_conn_stream_send(_connection, stream_id, nullptr, 0, true);
-                        // Push the empty buffer (interpreted as EOF).
-                        pushed = _read_queues.try_emplace(stream_id, STREAM_READ_QUEUE_SIZE).first->second.push({});
+                    if (recv_result < 0) {
+                        fmt::print("Reading from a stream has failed with message: {}\n", recv_result);
+                        // TODO: Handle this properly.
+                    } else {
+                        temporary_buffer<char> message(_buffer.data(), recv_result);
+                        // TODO: wrap this in some kind of `not_full` future.
+                        // (or just read only when necessary)
+                        auto pushed = _read_queues.try_emplace(stream_id, STREAM_READ_QUEUE_SIZE).first->second.push(std::move(message));
                         if (!pushed) {
                             fmt::print("The read queue is full. Dropping the message.\n");
+                        }
+
+                        /* TODO: Handle the message properly when fin == true.
+                                Right now we only send an empty FIN message to the endpoint. */
+                        if (fin) {
+                            quiche_conn_stream_send(_connection, stream_id, nullptr, 0, true);
+                            // Push the empty buffer (interpreted as EOF).
+                            pushed = _read_queues.try_emplace(stream_id, STREAM_READ_QUEUE_SIZE).first->second.push({});
+                            if (!pushed) {
+                                fmt::print("The read queue is full. Dropping the message.\n");
+                            }
                         }
                     }
                 }
@@ -486,6 +492,61 @@ future<> quic_connection<Socket>::stream_recv_loop() {
     });
 }
 
+template <typename Socket>
+future<> quic_connection<Socket>::wait_send_available(std::uint64_t stream_id) {
+    auto capacity = quiche_conn_stream_capacity(_connection, stream_id);
+    if (capacity > 0) {
+        return make_ready_future<>();
+    }
+    auto inserted_promise = _writable_promises.try_emplace(stream_id, promise<>());
+    return inserted_promise.first->second.get_future();
+}
+
+template <typename Socket>
+void quic_connection<Socket>::send_outstanding_data_in_streams_if_possible() {
+    quiche_stream_iter* iter = quiche_conn_writable(_connection);
+    std::uint64_t stream_id;
+    while (quiche_stream_iter_next(iter, &stream_id)) {
+        auto queue_iter = _write_queues.find(stream_id);
+        if (queue_iter == _write_queues.end()) {
+            continue;
+        }
+        auto& queue = queue_iter->second;
+        while (!queue.empty()) {
+            auto tb = std::move(queue.front());
+            queue.pop_front();
+
+            const auto written = quiche_conn_stream_send(
+                    _connection,
+                    stream_id,
+                    reinterpret_cast<const uint8_t*>(tb.get()),
+                    tb.size(),
+                    false
+            );
+
+            if (written < 0) {
+                // TODO: Handle quiche error.
+                break;
+            }
+
+            size_t actually_written = written > 0 ? written : 0;
+            if (actually_written != tb.size()) {
+                tb.trim_front(actually_written);
+                queue.push_front(std::move(tb));
+                break;
+            }
+        }
+
+        auto stream_capacity = quiche_conn_stream_capacity(_connection, stream_id);
+        if (stream_capacity > 0) {
+            auto stream_promise = _writable_promises.find(stream_id);
+            if (stream_promise != _writable_promises.end()) {
+                stream_promise->second.set_value();
+                _writable_promises.erase(stream_promise);
+            }
+        }
+    }
+}
 
 template <typename Socket>
 future<> quic_connection<Socket>::init() {
@@ -539,20 +600,28 @@ bool quic_connection<Socket>::is_closed() {
 // Right now it returns when flushed and we don't do any flow control for the stream.
 template <typename Socket>
 [[maybe_unused]] future<> quic_connection<Socket>::write(temporary_buffer<char> tb, std::uint64_t stream_id) {
-    // TODO: Handle this properly.
-    const auto send_result = quiche_conn_stream_send(
+
+    const auto written = quiche_conn_stream_send(
             _connection,
             stream_id,
             reinterpret_cast<const uint8_t*>(tb.get()),
             tb.size(),
-            false         // Don't close the stream.
+            false
     );
-    // TODO: Handle errors
-    if (send_result < 0) {
-        fmt::print("Error while sending via stream: {}", send_result);
+
+    if (written < 0) {
+        // TODO: Handle quiche error.
     }
 
-    return quic_flush();
+    size_t actually_written = written > 0 ? written : 0;
+
+    if (actually_written != tb.size()) {
+        tb.trim_front(actually_written);
+        _write_queues.try_emplace(stream_id).first->second.push_back(std::move(tb));
+    }
+
+    (void) quic_flush();
+    return wait_send_available(stream_id);
 }
 
 
@@ -780,6 +849,7 @@ future<> quic_server_socket_quiche_impl::service_loop() {
                 connection->_readable.set_value();
                 connection->_read_future_resolved = true;
             }
+            connection->send_outstanding_data_in_streams_if_possible();
         }
 
         return _channel_manager->read().then([this] (udp_datagram datagram) {
@@ -1150,6 +1220,8 @@ future<> quic_client_socket::receive() {
             _connection->_readable.set_value();
             _connection->_read_future_resolved = true;
         }
+
+        _connection->send_outstanding_data_in_streams_if_possible();
 
         return _connection->quic_flush();
     });
