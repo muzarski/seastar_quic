@@ -108,4 +108,7 @@ quic_server_socket quic_listen(socket_address sa, const std::string& cert_file, 
 future<quic_connected_socket> 
 quic_connect(socket_address sa, const quic_connection_config& quic_config = quic_connection_config());
 
+// Quiche raw logs
+void quic_enable_logging();
+
 } // namespace seastar::net
