@@ -1227,6 +1227,10 @@ future<> quic_client_socket::receive() {
     });
 }
 
+void quiche_log_printer(const char* line, void* args) {
+    std::cout << line << std::endl;
+}
+
 } // anonymous namespace
 
 quic_server_socket quic_listen(socket_address sa, const std::string& cert_file,
@@ -1260,6 +1264,10 @@ output_stream<char> quic_connected_socket::output(std::uint64_t id, size_t buffe
     output_stream_options opts;
     opts.batch_flushes = true;
     return {_impl->sink(id), buffer_size};
+}
+
+void quic_enable_logging() {
+    quiche_enable_debug_logging(quiche_log_printer, nullptr);
 }
 
 } // namespace seastar::net
