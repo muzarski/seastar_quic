@@ -128,3 +128,9 @@ seastar_add_demo (quic_echo_server
 
 seastar_add_demo (quic_echo_client
   SOURCES quic_echo_client.cc)
+
+seastar_add_demo (quic_receive_big_chunk_of_data
+        SOURCES quic_receive_big_chunk_of_data.cc)
+
+seastar_add_demo (quic_send_big_chunk_of_data
+        SOURCES quic_send_big_chunk_of_data.cc)
