@@ -42,10 +42,10 @@ struct quic_connection_config {
     uint64_t            initial_max_stream_data_uni         =  1'000'000;
     uint64_t            initial_max_streams_bidi            =      1'000;
     uint64_t            initial_max_streams_uni             =      1'000;
-    bool                disable_active_migration            =       true;
+    bool                disable_active_migration            =      false;
     quic_cc_algorithm   congestion_control_algorithm        = quic_cc_algorithm::RENO;
-    uint64_t            max_stream_window                   =     65'000;
-    uint64_t            max_connection_window               =     65'000;
+    uint64_t            max_stream_window                   = 16'000'000;
+    uint64_t            max_connection_window               = 24'000'000;
 };
 
 class quic_connected_socket_impl {
