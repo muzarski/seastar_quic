@@ -483,6 +483,8 @@ future<> quic_connection<Socket>::stream_recv_loop() {
                     }
                 }
             }
+            quiche_stream_iter_free(iter);
+
             if (!quiche_conn_is_readable(_connection)) {
                 _readable = promise<>();
                 _read_future_resolved = false;
@@ -546,6 +548,7 @@ void quic_connection<Socket>::send_outstanding_data_in_streams_if_possible() {
             }
         }
     }
+    quiche_stream_iter_free(iter);
 }
 
 template <typename Socket>
