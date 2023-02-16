@@ -41,12 +41,13 @@
 #include <seastar/core/scheduling.hh>
 #include <seastar/util/backtrace.hh>
 #include <seastar/util/log.hh>
+#include <seastar/net/quic.hh>
 
 namespace bi = boost::intrusive;
 
 namespace seastar {
 
-namespace rpc {
+    namespace rpc {
 
 /// \defgroup rpc rpc - remote procedure call framework
 ///
@@ -61,27 +62,27 @@ namespace rpc {
 /// The entry point for setting up an rpc protocol is
 /// seastar::rpc::protocol.
 
-using id_type = int64_t;
+        using id_type = int64_t;
 
-using rpc_semaphore = basic_semaphore<semaphore_default_exception_factory, rpc_clock_type>;
-using resource_permit = semaphore_units<semaphore_default_exception_factory, rpc_clock_type>;
+        using rpc_semaphore = basic_semaphore<semaphore_default_exception_factory, rpc_clock_type>;
+        using resource_permit = semaphore_units<semaphore_default_exception_factory, rpc_clock_type>;
 
-static constexpr char rpc_magic[] = "SSTARRPC";
+        static constexpr char rpc_magic[] = "SSTARRPC";
 
 /// \addtogroup rpc
 /// @{
 
 /// Specifies resource isolation for a connection.
-struct isolation_config {
-    /// Specifies a scheduling group under which the connection (and all its
-    /// verb handlers) will execute.
-    scheduling_group sched_group = current_scheduling_group();
-};
+        struct isolation_config {
+            /// Specifies a scheduling group under which the connection (and all its
+            /// verb handlers) will execute.
+            scheduling_group sched_group = current_scheduling_group();
+        };
 
 /// Default isolation configuration - run everything in the default scheduling group.
 ///
 /// In the scheduling_group that the protocol::server was created in.
-isolation_config default_isolate_connection(sstring isolation_cookie);
+        isolation_config default_isolate_connection(sstring isolation_cookie);
 
 /// \brief Resource limits for an RPC server
 ///
@@ -94,30 +95,30 @@ isolation_config default_isolate_connection(sstring isolation_cookie);
 ///     sum(req_mem) <= max_memory
 ///
 /// \see server
-struct resource_limits {
-    size_t basic_request_size = 0; ///< Minimum request footprint in memory
-    unsigned bloat_factor = 1;     ///< Serialized size multiplied by this to estimate memory used by request
-    size_t max_memory = rpc_semaphore::max_counter(); ///< Maximum amount of memory that may be consumed by all requests
-    /// Configures isolation for a connection based on its isolation cookie. May throw,
-    /// in which case the connection will be terminated.
-    using syncronous_isolation_function = std::function<isolation_config (sstring isolation_cookie)>;
-    using asyncronous_isolation_function = std::function<future<isolation_config> (sstring isolation_cookie)>;
-    using isolation_function_alternatives = std::variant<syncronous_isolation_function, asyncronous_isolation_function>;
-    isolation_function_alternatives isolate_connection = default_isolate_connection;
-};
+        struct resource_limits {
+            size_t basic_request_size = 0; ///< Minimum request footprint in memory
+            unsigned bloat_factor = 1;     ///< Serialized size multiplied by this to estimate memory used by request
+            size_t max_memory = rpc_semaphore::max_counter(); ///< Maximum amount of memory that may be consumed by all requests
+            /// Configures isolation for a connection based on its isolation cookie. May throw,
+            /// in which case the connection will be terminated.
+            using syncronous_isolation_function = std::function<isolation_config (sstring isolation_cookie)>;
+            using asyncronous_isolation_function = std::function<future<isolation_config> (sstring isolation_cookie)>;
+            using isolation_function_alternatives = std::variant<syncronous_isolation_function, asyncronous_isolation_function>;
+            isolation_function_alternatives isolate_connection = default_isolate_connection;
+        };
 
-struct client_options {
-    std::optional<net::tcp_keepalive_params> keepalive;
-    bool tcp_nodelay = true;
-    bool reuseaddr = false;
-    compressor::factory* compressor_factory = nullptr;
-    bool send_timeout_data = true;
-    connection_id stream_parent = invalid_connection_id;
-    /// Configures how this connection is isolated from other connection on the same server.
-    ///
-    /// \see resource_limits::isolate_connection
-    sstring isolation_cookie;
-};
+        struct client_options {
+            std::optional<net::tcp_keepalive_params> keepalive;
+            bool tcp_nodelay = true;
+            bool reuseaddr = false;
+            compressor::factory* compressor_factory = nullptr;
+            bool send_timeout_data = true;
+            connection_id stream_parent = invalid_connection_id;
+            /// Configures how this connection is isolated from other connection on the same server.
+            ///
+            /// \see resource_limits::isolate_connection
+            sstring isolation_cookie;
+        };
 
 /// @}
 
@@ -131,520 +132,520 @@ struct client_options {
 // Different servers on all shards logically belonging to the same service should
 // belong to the same streaming domain. Only one server on each shard can belong to
 // a particulr streaming domain.
-class streaming_domain_type {
-    uint64_t _id;
-public:
-    explicit streaming_domain_type(uint64_t id) : _id(id) {}
-    bool operator==(const streaming_domain_type& o) const {
-        return _id == o._id;
-    }
-    friend struct std::hash<streaming_domain_type>;
-    friend std::ostream& operator<<(std::ostream&, const streaming_domain_type&);
-};
+        class streaming_domain_type {
+            uint64_t _id;
+        public:
+            explicit streaming_domain_type(uint64_t id) : _id(id) {}
+            bool operator==(const streaming_domain_type& o) const {
+                return _id == o._id;
+            }
+            friend struct std::hash<streaming_domain_type>;
+            friend std::ostream& operator<<(std::ostream&, const streaming_domain_type&);
+        };
 
 /// \addtogroup rpc
 /// @{
 
-class server;
+        class server;
 
-struct server_options {
-    compressor::factory* compressor_factory = nullptr;
-    bool tcp_nodelay = true;
-    std::optional<streaming_domain_type> streaming_domain;
-    server_socket::load_balancing_algorithm load_balancing_algorithm = server_socket::load_balancing_algorithm::default_;
-    // optional filter function. If set, will be called with remote 
-    // (connecting) address.    
-    // Returning false will refuse the incoming connection. 
-    // Returning true will allow the mechanism to proceed.
-    std::function<bool(const socket_address&)> filter_connection = {};
-};
+        struct server_options {
+            compressor::factory* compressor_factory = nullptr;
+            bool tcp_nodelay = true;
+            std::optional<streaming_domain_type> streaming_domain;
+            server_socket::load_balancing_algorithm load_balancing_algorithm = server_socket::load_balancing_algorithm::default_;
+            // optional filter function. If set, will be called with remote
+            // (connecting) address.
+            // Returning false will refuse the incoming connection.
+            // Returning true will allow the mechanism to proceed.
+            std::function<bool(const socket_address&)> filter_connection = {};
+        };
 
 /// @}
 
-inline
-size_t
-estimate_request_size(const resource_limits& lim, size_t serialized_size) {
-    return lim.basic_request_size + serialized_size * lim.bloat_factor;
-}
+        inline
+        size_t
+        estimate_request_size(const resource_limits& lim, size_t serialized_size) {
+            return lim.basic_request_size + serialized_size * lim.bloat_factor;
+        }
 
-struct negotiation_frame {
-    char magic[sizeof(rpc_magic) - 1];
-    uint32_t len; // additional negotiation data length; multiple negotiation_frame_feature_record structs
-};
+        struct negotiation_frame {
+            char magic[sizeof(rpc_magic) - 1];
+            uint32_t len; // additional negotiation data length; multiple negotiation_frame_feature_record structs
+        };
 
-enum class protocol_features : uint32_t {
-    COMPRESS = 0,
-    TIMEOUT = 1,
-    CONNECTION_ID = 2,
-    STREAM_PARENT = 3,
-    ISOLATION = 4,
-};
+        enum class protocol_features : uint32_t {
+            COMPRESS = 0,
+            TIMEOUT = 1,
+            CONNECTION_ID = 2,
+            STREAM_PARENT = 3,
+            ISOLATION = 4,
+        };
 
 // internal representation of feature data
-using feature_map = std::map<protocol_features, sstring>;
+        using feature_map = std::map<protocol_features, sstring>;
 
 // An rpc signature, in the form signature<Ret (In0, In1, In2)>.
-template <typename Function>
-struct signature;
+        template <typename Function>
+        struct signature;
 
-class logger {
-    std::function<void(const sstring&)> _logger;
-    ::seastar::logger* _seastar_logger = nullptr;
+        class logger {
+            std::function<void(const sstring&)> _logger;
+            ::seastar::logger* _seastar_logger = nullptr;
 
-    // _seastar_logger will always be used first if it's available
-    void log(const sstring& str) const {
-        if (_seastar_logger) {
-            // default level for log messages is `info`
-            _seastar_logger->info("{}", str);
-        } else if (_logger) {
-            _logger(str);
-        }
-    }
-
-    // _seastar_logger will always be used first if it's available
-    template <typename... Args>
-    void log(log_level level, const char* fmt, Args&&... args) const {
-        if (_seastar_logger) {
-            _seastar_logger->log(level, fmt, std::forward<Args>(args)...);
-        // If the log level is at least `info`, fall back to legacy logging without explicit level.
-        // Ignore less severe levels in order not to spam user's log with messages during transition,
-        // i.e. when the user still only defines a level-less logger.
-        } else if (_logger && level <= log_level::info) {
-            _logger(format(fmt, std::forward<Args>(args)...));
-        }
-    }
-
-public:
-    void set(std::function<void(const sstring&)> l) {
-        _logger = std::move(l);
-    }
-
-    void set(::seastar::logger* logger) {
-        _seastar_logger = logger;
-    }
-
-    void operator()(const client_info& info, id_type msg_id, const sstring& str) const;
-    void operator()(const client_info& info, id_type msg_id, log_level level, std::string_view str) const;
-
-    void operator()(const client_info& info, const sstring& str) const;
-    void operator()(const client_info& info, log_level level, std::string_view str) const;
-
-    void operator()(const socket_address& addr, const sstring& str) const;
-    void operator()(const socket_address& addr, log_level level, std::string_view str) const;
-};
-
-class connection {
-protected:
-    connected_socket _fd;
-    input_stream<char> _read_buf;
-    output_stream<char> _write_buf;
-    bool _error = false;
-    bool _connected = false;
-    std::optional<shared_promise<>> _negotiated = shared_promise<>();
-    promise<> _stopped;
-    stats _stats;
-    const logger& _logger;
-    // The owner of the pointer below is an instance of rpc::protocol<typename Serializer> class.
-    // The type of the pointer is erased here, but the original type is Serializer
-    void* _serializer;
-    struct outgoing_entry : public bi::list_base_hook<bi::link_mode<bi::auto_unlink>> {
-        timer<rpc_clock_type> t;
-        snd_buf buf;
-        promise<> done;
-        cancellable* pcancel = nullptr;
-        outgoing_entry(snd_buf b) : buf(std::move(b)) {}
-
-        outgoing_entry(outgoing_entry&&) = delete;
-        outgoing_entry(const outgoing_entry&) = delete;
-
-        void uncancellable() {
-            t.cancel();
-            if (pcancel) {
-                pcancel->cancel_send = std::function<void()>();
+            // _seastar_logger will always be used first if it's available
+            void log(const sstring& str) const {
+                if (_seastar_logger) {
+                    // default level for log messages is `info`
+                    _seastar_logger->info("{}", str);
+                } else if (_logger) {
+                    _logger(str);
+                }
             }
-        }
 
-        ~outgoing_entry() {
-            if (pcancel) {
-                pcancel->cancel_send = std::function<void()>();
-                pcancel->send_back_pointer = nullptr;
+            // _seastar_logger will always be used first if it's available
+            template <typename... Args>
+            void log(log_level level, const char* fmt, Args&&... args) const {
+                if (_seastar_logger) {
+                    _seastar_logger->log(level, fmt, std::forward<Args>(args)...);
+                    // If the log level is at least `info`, fall back to legacy logging without explicit level.
+                    // Ignore less severe levels in order not to spam user's log with messages during transition,
+                    // i.e. when the user still only defines a level-less logger.
+                } else if (_logger && level <= log_level::info) {
+                    _logger(format(fmt, std::forward<Args>(args)...));
+                }
             }
-        }
 
-        using container_t = bi::list<outgoing_entry, bi::constant_time_size<false>>;
-    };
-    void withdraw(outgoing_entry::container_t::iterator it, std::exception_ptr ex = nullptr);
-    future<> _outgoing_queue_ready = _negotiated->get_shared_future();
-    outgoing_entry::container_t _outgoing_queue;
-    size_t _outgoing_queue_size = 0;
-    std::unique_ptr<compressor> _compressor;
-    bool _propagate_timeout = false;
-    bool _timeout_negotiated = false;
-    // stream related fields
-    bool _is_stream = false;
-    connection_id _id = invalid_connection_id;
+        public:
+            void set(std::function<void(const sstring&)> l) {
+                _logger = std::move(l);
+            }
 
-    std::unordered_map<connection_id, xshard_connection_ptr> _streams;
-    queue<rcv_buf> _stream_queue = queue<rcv_buf>(max_queued_stream_buffers);
-    semaphore _stream_sem = semaphore(max_stream_buffers_memory);
-    bool _sink_closed = true;
-    bool _source_closed = true;
-    // the future holds if sink is already closed
-    // if it is not ready it means the sink is been closed
-    future<bool> _sink_closed_future = make_ready_future<bool>(false);
+            void set(::seastar::logger* logger) {
+                _seastar_logger = logger;
+            }
 
-    size_t outgoing_queue_length() const noexcept {
-        return _outgoing_queue_size;
-    }
+            void operator()(const client_info& info, id_type msg_id, const sstring& str) const;
+            void operator()(const client_info& info, id_type msg_id, log_level level, std::string_view str) const;
 
-    void set_negotiated() noexcept;
+            void operator()(const client_info& info, const sstring& str) const;
+            void operator()(const client_info& info, log_level level, std::string_view str) const;
 
-    bool is_stream() const noexcept {
-        return _is_stream;
-    }
+            void operator()(const socket_address& addr, const sstring& str) const;
+            void operator()(const socket_address& addr, log_level level, std::string_view str) const;
+        };
 
-    snd_buf compress(snd_buf buf);
-    future<> send_buffer(snd_buf buf);
+        class connection {
+        protected:
+            net::quic_connected_socket _fd;
+            input_stream<char> _read_buf;
+            output_stream<char> _write_buf;
+            bool _error = false;
+            bool _connected = false;
+            std::optional<shared_promise<>> _negotiated = shared_promise<>();
+            promise<> _stopped;
+            stats _stats;
+            const logger& _logger;
+            // The owner of the pointer below is an instance of rpc::protocol<typename Serializer> class.
+            // The type of the pointer is erased here, but the original type is Serializer
+            void* _serializer;
+            struct outgoing_entry : public bi::list_base_hook<bi::link_mode<bi::auto_unlink>> {
+                timer<rpc_clock_type> t;
+                snd_buf buf;
+                promise<> done;
+                cancellable* pcancel = nullptr;
+                outgoing_entry(snd_buf b) : buf(std::move(b)) {}
 
-    future<> send_entry(outgoing_entry& d);
-    future<> stop_send_loop(std::exception_ptr ex);
-    future<std::optional<rcv_buf>>  read_stream_frame_compressed(input_stream<char>& in);
-    bool stream_check_twoway_closed() const noexcept {
-        return _sink_closed && _source_closed;
-    }
-    future<> stream_close();
-    future<> stream_process_incoming(rcv_buf&&);
-    future<> handle_stream_frame();
+                outgoing_entry(outgoing_entry&&) = delete;
+                outgoing_entry(const outgoing_entry&) = delete;
 
-public:
-    connection(connected_socket&& fd, const logger& l, void* s, connection_id id = invalid_connection_id) : connection(l, s, id) {
-        set_socket(std::move(fd));
-    }
-    connection(const logger& l, void* s, connection_id id = invalid_connection_id) : _logger(l), _serializer(s), _id(id) {}
-    virtual ~connection() {}
-    void set_socket(connected_socket&& fd);
-    future<> send_negotiation_frame(feature_map features);
-    // functions below are public because they are used by external heavily templated functions
-    // and I am not smart enough to know how to define them as friends
-    future<> send(snd_buf buf, std::optional<rpc_clock_type::time_point> timeout = {}, cancellable* cancel = nullptr);
-    bool error() const noexcept { return _error; }
-    void abort();
-    future<> stop() noexcept;
-    future<> stream_receive(circular_buffer<foreign_ptr<std::unique_ptr<rcv_buf>>>& bufs);
-    future<> close_sink() {
-        _sink_closed = true;
-        if (stream_check_twoway_closed()) {
-            return stream_close();
-        }
-        return make_ready_future();
-    }
-    bool sink_closed() const noexcept {
-        return _sink_closed;
-    }
-    future<> close_source() {
-        _source_closed = true;
-        if (stream_check_twoway_closed()) {
-            return stream_close();
-        }
-        return make_ready_future();
-    }
-    connection_id get_connection_id() const noexcept {
-        return _id;
-    }
-    xshard_connection_ptr get_stream(connection_id id) const;
-    void register_stream(connection_id id, xshard_connection_ptr c);
-    virtual socket_address peer_address() const = 0;
+                void uncancellable() {
+                    t.cancel();
+                    if (pcancel) {
+                        pcancel->cancel_send = std::function<void()>();
+                    }
+                }
 
-    const logger& get_logger() const noexcept {
-        return _logger;
-    }
+                ~outgoing_entry() {
+                    if (pcancel) {
+                        pcancel->cancel_send = std::function<void()>();
+                        pcancel->send_back_pointer = nullptr;
+                    }
+                }
 
-    template<typename Serializer>
-    Serializer& serializer() {
-        return *static_cast<Serializer*>(_serializer);
-    }
+                using container_t = bi::list<outgoing_entry, bi::constant_time_size<false>>;
+            };
+            void withdraw(outgoing_entry::container_t::iterator it, std::exception_ptr ex = nullptr);
+            future<> _outgoing_queue_ready = _negotiated->get_shared_future();
+            outgoing_entry::container_t _outgoing_queue;
+            size_t _outgoing_queue_size = 0;
+            std::unique_ptr<compressor> _compressor;
+            bool _propagate_timeout = false;
+            bool _timeout_negotiated = false;
+            // stream related fields
+            bool _is_stream = false;
+            connection_id _id = invalid_connection_id;
 
-    template <typename FrameType>
-    typename FrameType::return_type read_frame(socket_address info, input_stream<char>& in);
+            std::unordered_map<connection_id, xshard_connection_ptr> _streams;
+            queue<rcv_buf> _stream_queue = queue<rcv_buf>(max_queued_stream_buffers);
+            semaphore _stream_sem = semaphore(max_stream_buffers_memory);
+            bool _sink_closed = true;
+            bool _source_closed = true;
+            // the future holds if sink is already closed
+            // if it is not ready it means the sink is been closed
+            future<bool> _sink_closed_future = make_ready_future<bool>(false);
 
-    template <typename FrameType>
-    typename FrameType::return_type read_frame_compressed(socket_address info, std::unique_ptr<compressor>& compressor, input_stream<char>& in);
-    friend class client;
-    template<typename Serializer, typename... Out>
-    friend class sink_impl;
-    template<typename Serializer, typename... In>
-    friend class source_impl;
+            size_t outgoing_queue_length() const noexcept {
+                return _outgoing_queue_size;
+            }
 
-    void suspend_for_testing(promise<>& p) {
-        _outgoing_queue_ready.get();
-        auto dummy = std::make_unique<outgoing_entry>(snd_buf());
-        _outgoing_queue.push_back(*dummy);
-        _outgoing_queue_ready = dummy->done.get_future();
-        (void)p.get_future().then([dummy = std::move(dummy)] { dummy->done.set_value(); });
-    }
-};
+            void set_negotiated() noexcept;
 
-struct deferred_snd_buf {
-    promise<> pr;
-    snd_buf data;
-};
+            bool is_stream() const noexcept {
+                return _is_stream;
+            }
 
-// send data Out...
-template<typename Serializer, typename... Out>
-class sink_impl : public sink<Out...>::impl {
-    // Used on the shard *this lives on.
-    alignas (cache_line_size) uint64_t _next_seq_num = 1;
+            snd_buf compress(snd_buf buf);
+            future<> send_buffer(snd_buf buf);
 
-    // Used on the shard the _conn lives on.
-    struct alignas (cache_line_size) {
-        uint64_t last_seq_num = 0;
-        std::map<uint64_t, deferred_snd_buf> out_of_order_bufs;
-    } _remote_state;
-public:
-    sink_impl(xshard_connection_ptr con) : sink<Out...>::impl(std::move(con)) { this->_con->get()->_sink_closed = false; }
-    future<> operator()(const Out&... args) override;
-    future<> close() override;
-    future<> flush() override;
-    ~sink_impl() override;
-};
+            future<> send_entry(outgoing_entry& d);
+            future<> stop_send_loop(std::exception_ptr ex);
+            future<std::optional<rcv_buf>>  read_stream_frame_compressed(input_stream<char>& in);
+            bool stream_check_twoway_closed() const noexcept {
+                return _sink_closed && _source_closed;
+            }
+            future<> stream_close();
+            future<> stream_process_incoming(rcv_buf&&);
+            future<> handle_stream_frame();
 
-// receive data In...
-template<typename Serializer, typename... In>
-class source_impl : public source<In...>::impl {
-public:
-    source_impl(xshard_connection_ptr con) : source<In...>::impl(std::move(con)) { this->_con->get()->_source_closed = false; }
-    future<std::optional<std::tuple<In...>>> operator()() override;
-};
+        public:
+            connection(net::quic_connected_socket&& fd, const logger& l, void* s, connection_id id = invalid_connection_id) : connection(l, s, id) {
+                set_socket(std::move(fd));
+            }
+            connection(const logger& l, void* s, connection_id id = invalid_connection_id) : _logger(l), _serializer(s), _id(id) {}
+            virtual ~connection() {}
+            void set_socket(net::quic_connected_socket&& fd);
+            future<> send_negotiation_frame(feature_map features);
+            // functions below are public because they are used by external heavily templated functions
+            // and I am not smart enough to know how to define them as friends
+            future<> send(snd_buf buf, std::optional<rpc_clock_type::time_point> timeout = {}, cancellable* cancel = nullptr);
+            bool error() const noexcept { return _error; }
+            void abort();
+            future<> stop() noexcept;
+            future<> stream_receive(circular_buffer<foreign_ptr<std::unique_ptr<rcv_buf>>>& bufs);
+            future<> close_sink() {
+                _sink_closed = true;
+                if (stream_check_twoway_closed()) {
+                    return stream_close();
+                }
+                return make_ready_future();
+            }
+            bool sink_closed() const noexcept {
+                return _sink_closed;
+            }
+            future<> close_source() {
+                _source_closed = true;
+                if (stream_check_twoway_closed()) {
+                    return stream_close();
+                }
+                return make_ready_future();
+            }
+            connection_id get_connection_id() const noexcept {
+                return _id;
+            }
+            xshard_connection_ptr get_stream(connection_id id) const;
+            void register_stream(connection_id id, xshard_connection_ptr c);
+            virtual socket_address peer_address() const = 0;
 
-class client : public rpc::connection, public weakly_referencable<client> {
-    socket _socket;
-    id_type _message_id = 1;
-    struct reply_handler_base {
-        timer<rpc_clock_type> t;
-        cancellable* pcancel = nullptr;
-        virtual void operator()(client&, id_type, rcv_buf data) = 0;
-        virtual void timeout() {}
-        virtual void cancel() {}
-        virtual ~reply_handler_base() {
-            if (pcancel) {
-                pcancel->cancel_wait = std::function<void()>();
-                pcancel->wait_back_pointer = nullptr;
+            const logger& get_logger() const noexcept {
+                return _logger;
+            }
+
+            template<typename Serializer>
+            Serializer& serializer() {
+                return *static_cast<Serializer*>(_serializer);
+            }
+
+            template <typename FrameType>
+            typename FrameType::return_type read_frame(socket_address info, input_stream<char>& in);
+
+            template <typename FrameType>
+            typename FrameType::return_type read_frame_compressed(socket_address info, std::unique_ptr<compressor>& compressor, input_stream<char>& in);
+            friend class client;
+            template<typename Serializer, typename... Out>
+            friend class sink_impl;
+            template<typename Serializer, typename... In>
+            friend class source_impl;
+
+            void suspend_for_testing(promise<>& p) {
+                _outgoing_queue_ready.get();
+                auto dummy = std::make_unique<outgoing_entry>(snd_buf());
+                _outgoing_queue.push_back(*dummy);
+                _outgoing_queue_ready = dummy->done.get_future();
+                (void)p.get_future().then([dummy = std::move(dummy)] { dummy->done.set_value(); });
             }
         };
-    };
-public:
-    template<typename Reply, typename Func>
-    struct reply_handler final : reply_handler_base {
-        Func func;
-        Reply reply;
-        reply_handler(Func&& f) : func(std::move(f)) {}
-        virtual void operator()(client& client, id_type msg_id, rcv_buf data) override {
-            return func(reply, client, msg_id, std::move(data));
-        }
-        virtual void timeout() override {
-            reply.done = true;
-            reply.p.set_exception(timeout_error());
-        }
-        virtual void cancel() override {
-            reply.done = true;
-            reply.p.set_exception(canceled_error());
-        }
-        virtual ~reply_handler() {}
-    };
-private:
-    std::unordered_map<id_type, std::unique_ptr<reply_handler_base>> _outstanding;
-    socket_address _server_addr, _local_addr;
-    client_options _options;
-    weak_ptr<client> _parent; // for stream clients
 
-private:
-    future<> negotiate_protocol(input_stream<char>& in);
-    void negotiate(feature_map server_features);
-    future<std::tuple<int64_t, std::optional<rcv_buf>>>
-    read_response_frame(input_stream<char>& in);
-    future<std::tuple<int64_t, std::optional<rcv_buf>>>
-    read_response_frame_compressed(input_stream<char>& in);
-public:
-    /**
-     * Create client object which will attempt to connect to the remote address.
-     *
-     * @param l \ref seastar::logger to use for logging error messages
-     * @param s an optional connection serializer
-     * @param addr the remote address identifying this client
-     * @param local the local address of this client
-     */
-    client(const logger& l, void* s, const socket_address& addr, const socket_address& local = {});
-    client(const logger& l, void* s, client_options options, const socket_address& addr, const socket_address& local = {});
+        struct deferred_snd_buf {
+            promise<> pr;
+            snd_buf data;
+        };
 
-     /**
-     * Create client object which will attempt to connect to the remote address using the
-     * specified seastar::socket.
-     *
-     * @param l \ref seastar::logger to use for logging error messages
-     * @param s an optional connection serializer
-     * @param addr the remote address identifying this client
-     * @param local the local address of this client
-     * @param socket the socket object use to connect to the remote address
-     */
-    client(const logger& l, void* s, socket socket, const socket_address& addr, const socket_address& local = {});
-    client(const logger& l, void* s, client_options options, socket socket, const socket_address& addr, const socket_address& local = {});
+// send data Out...
+        template<typename Serializer, typename... Out>
+        class sink_impl : public sink<Out...>::impl {
+            // Used on the shard *this lives on.
+            alignas (cache_line_size) uint64_t _next_seq_num = 1;
 
-    stats get_stats() const;
-    stats& get_stats_internal() {
-        return _stats;
-    }
-    auto next_message_id() { return _message_id++; }
-    void wait_for_reply(id_type id, std::unique_ptr<reply_handler_base>&& h, std::optional<rpc_clock_type::time_point> timeout, cancellable* cancel);
-    void wait_timed_out(id_type id);
-    future<> stop() noexcept;
-    void abort_all_streams();
-    void deregister_this_stream();
-    socket_address peer_address() const override {
-        return _server_addr;
-    }
-    future<> await_connection() {
-        if (!_negotiated) {
-            return make_ready_future<>();
-        } else {
-            return _negotiated->get_shared_future();
-        }
-    }
-    template<typename Serializer, typename... Out>
-    future<sink<Out...>> make_stream_sink(socket socket) {
-        return await_connection().then([this, socket = std::move(socket)] () mutable {
-            if (!this->get_connection_id()) {
-                return make_exception_future<sink<Out...>>(std::runtime_error("Streaming is not supported by the server"));
+            // Used on the shard the _conn lives on.
+            struct alignas (cache_line_size) {
+                uint64_t last_seq_num = 0;
+                std::map<uint64_t, deferred_snd_buf> out_of_order_bufs;
+            } _remote_state;
+        public:
+            sink_impl(xshard_connection_ptr con) : sink<Out...>::impl(std::move(con)) { this->_con->get()->_sink_closed = false; }
+            future<> operator()(const Out&... args) override;
+            future<> close() override;
+            future<> flush() override;
+            ~sink_impl() override;
+        };
+
+// receive data In...
+        template<typename Serializer, typename... In>
+        class source_impl : public source<In...>::impl {
+        public:
+            source_impl(xshard_connection_ptr con) : source<In...>::impl(std::move(con)) { this->_con->get()->_source_closed = false; }
+            future<std::optional<std::tuple<In...>>> operator()() override;
+        };
+
+        class client : public rpc::connection, public weakly_referencable<client> {
+            q_socket _socket;
+            id_type _message_id = 1;
+            struct reply_handler_base {
+                timer<rpc_clock_type> t;
+                cancellable* pcancel = nullptr;
+                virtual void operator()(client&, id_type, rcv_buf data) = 0;
+                virtual void timeout() {}
+                virtual void cancel() {}
+                virtual ~reply_handler_base() {
+                    if (pcancel) {
+                        pcancel->cancel_wait = std::function<void()>();
+                        pcancel->wait_back_pointer = nullptr;
+                    }
+                };
+            };
+        public:
+            template<typename Reply, typename Func>
+            struct reply_handler final : reply_handler_base {
+                Func func;
+                Reply reply;
+                reply_handler(Func&& f) : func(std::move(f)) {}
+                virtual void operator()(client& client, id_type msg_id, rcv_buf data) override {
+                    return func(reply, client, msg_id, std::move(data));
+                }
+                virtual void timeout() override {
+                    reply.done = true;
+                    reply.p.set_exception(timeout_error());
+                }
+                virtual void cancel() override {
+                    reply.done = true;
+                    reply.p.set_exception(canceled_error());
+                }
+                virtual ~reply_handler() {}
+            };
+        private:
+            std::unordered_map<id_type, std::unique_ptr<reply_handler_base>> _outstanding;
+            socket_address _server_addr, _local_addr;
+            client_options _options;
+            weak_ptr<client> _parent; // for stream clients
+
+        private:
+            future<> negotiate_protocol(input_stream<char>& in);
+            void negotiate(feature_map server_features);
+            future<std::tuple<int64_t, std::optional<rcv_buf>>>
+            read_response_frame(input_stream<char>& in);
+            future<std::tuple<int64_t, std::optional<rcv_buf>>>
+            read_response_frame_compressed(input_stream<char>& in);
+        public:
+            /**
+             * Create client object which will attempt to connect to the remote address.
+             *
+             * @param l \ref seastar::logger to use for logging error messages
+             * @param s an optional connection serializer
+             * @param addr the remote address identifying this client
+             * @param local the local address of this client
+             */
+            client(const logger& l, void* s, const socket_address& addr, const socket_address& local = {});
+            client(const logger& l, void* s, client_options options, const socket_address& addr, const socket_address& local = {});
+
+            /**
+            * Create client object which will attempt to connect to the remote address using the
+            * specified seastar::socket.
+            *
+            * @param l \ref seastar::logger to use for logging error messages
+            * @param s an optional connection serializer
+            * @param addr the remote address identifying this client
+            * @param local the local address of this client
+            * @param socket the socket object use to connect to the remote address
+            */
+            client(const logger& l, void* s, q_socket socket, const socket_address& addr, const socket_address& local = {});
+            client(const logger& l, void* s, client_options options, q_socket socket, const socket_address& addr, const socket_address& local = {});
+
+            stats get_stats() const;
+            stats& get_stats_internal() {
+                return _stats;
             }
-            client_options o = _options;
-            o.stream_parent = this->get_connection_id();
-            o.send_timeout_data = false;
-            auto c = make_shared<client>(_logger, _serializer, o, std::move(socket), _server_addr, _local_addr);
-            c->_parent = this->weak_from_this();
-            c->_is_stream = true;
-            return c->await_connection().then([c, this] {
-                xshard_connection_ptr s = make_lw_shared(make_foreign(static_pointer_cast<rpc::connection>(c)));
-                this->register_stream(c->get_connection_id(), s);
-                return sink<Out...>(make_shared<sink_impl<Serializer, Out...>>(std::move(s)));
-            }).handle_exception([c] (std::exception_ptr eptr) {
-                // If await_connection fails we need to stop the client
-                // before destroying it.
-                return c->stop().then([eptr, c] {
-                    return make_exception_future<sink<Out...>>(eptr);
+            auto next_message_id() { return _message_id++; }
+            void wait_for_reply(id_type id, std::unique_ptr<reply_handler_base>&& h, std::optional<rpc_clock_type::time_point> timeout, cancellable* cancel);
+            void wait_timed_out(id_type id);
+            future<> stop() noexcept;
+            void abort_all_streams();
+            void deregister_this_stream();
+            socket_address peer_address() const override {
+                return _server_addr;
+            }
+            future<> await_connection() {
+                if (!_negotiated) {
+                    return make_ready_future<>();
+                } else {
+                    return _negotiated->get_shared_future();
+                }
+            }
+            template<typename Serializer, typename... Out>
+            future<sink<Out...>> make_stream_sink(q_socket socket) {
+                return await_connection().then([this, socket = std::move(socket)] () mutable {
+                    if (!this->get_connection_id()) {
+                        return make_exception_future<sink<Out...>>(std::runtime_error("Streaming is not supported by the server"));
+                    }
+                    client_options o = _options;
+                    o.stream_parent = this->get_connection_id();
+                    o.send_timeout_data = false;
+                    auto c = make_shared<client>(_logger, _serializer, o, std::move(socket), _server_addr, _local_addr);
+                    c->_parent = this->weak_from_this();
+                    c->_is_stream = true;
+                    return c->await_connection().then([c, this] {
+                        xshard_connection_ptr s = make_lw_shared(make_foreign(static_pointer_cast<rpc::connection>(c)));
+                        this->register_stream(c->get_connection_id(), s);
+                        return sink<Out...>(make_shared<sink_impl<Serializer, Out...>>(std::move(s)));
+                    }).handle_exception([c] (std::exception_ptr eptr) {
+                        // If await_connection fails we need to stop the client
+                        // before destroying it.
+                        return c->stop().then([eptr, c] {
+                            return make_exception_future<sink<Out...>>(eptr);
+                        });
+                    });
                 });
-            });
-        });
-    }
-    template<typename Serializer, typename... Out>
-    future<sink<Out...>> make_stream_sink() {
-        return make_stream_sink<Serializer, Out...>(make_socket());
-    }
-};
-
-class protocol_base;
-
-class server {
-private:
-    static thread_local std::unordered_map<streaming_domain_type, server*> _servers;
-
-public:
-    class connection : public rpc::connection, public enable_shared_from_this<connection> {
-        server& _server;
-        client_info _info;
-        connection_id _parent_id = invalid_connection_id;
-        std::optional<isolation_config> _isolation_config;
-    private:
-        future<> negotiate_protocol(input_stream<char>& in);
-        future<std::tuple<std::optional<uint64_t>, uint64_t, int64_t, std::optional<rcv_buf>>>
-        read_request_frame_compressed(input_stream<char>& in);
-        future<feature_map> negotiate(feature_map requested);
-        future<> send_unknown_verb_reply(std::optional<rpc_clock_type::time_point> timeout, int64_t msg_id, uint64_t type);
-    public:
-        connection(server& s, connected_socket&& fd, socket_address&& addr, const logger& l, void* seralizer, connection_id id);
-        future<> process();
-        future<> respond(int64_t msg_id, snd_buf&& data, std::optional<rpc_clock_type::time_point> timeout);
-        client_info& info() { return _info; }
-        const client_info& info() const { return _info; }
-        stats get_stats() const {
-            stats res = _stats;
-            res.pending = outgoing_queue_length();
-            return res;
-        }
-
-        stats& get_stats_internal() {
-            return _stats;
-        }
-        socket_address peer_address() const override {
-            return _info.addr;
-        }
-        // Resources will be released when this goes out of scope
-        future<resource_permit> wait_for_resources(size_t memory_consumed,  std::optional<rpc_clock_type::time_point> timeout) {
-            if (timeout) {
-                return get_units(_server._resources_available, memory_consumed, *timeout);
-            } else {
-                return get_units(_server._resources_available, memory_consumed);
             }
-        }
-        size_t estimate_request_size(size_t serialized_size) {
-            return rpc::estimate_request_size(_server._limits, serialized_size);
-        }
-        size_t max_request_size() const {
-            return _server._limits.max_memory;
-        }
-        server& get_server() {
-            return _server;
-        }
-        future<> deregister_this_stream();
-    };
-private:
-    protocol_base* _proto;
-    server_socket _ss;
-    resource_limits _limits;
-    rpc_semaphore _resources_available;
-    std::unordered_map<connection_id, shared_ptr<connection>> _conns;
-    promise<> _ss_stopped;
-    gate _reply_gate;
-    server_options _options;
-    uint64_t _next_client_id = 1;
+            template<typename Serializer, typename... Out>
+            future<sink<Out...>> make_stream_sink() {
+                return make_stream_sink<Serializer, Out...>(make_socket());
+            }
+        };
 
-public:
-    server(protocol_base* proto, const socket_address& addr, resource_limits memory_limit = resource_limits());
-    server(protocol_base* proto, server_options opts, const socket_address& addr, resource_limits memory_limit = resource_limits());
-    server(protocol_base* proto, server_socket, resource_limits memory_limit = resource_limits(), server_options opts = server_options{});
-    server(protocol_base* proto, server_options opts, server_socket, resource_limits memory_limit = resource_limits());
-    void accept();
-    future<> stop();
-    template<typename Func>
-    void foreach_connection(Func&& f) {
-        for (auto c : _conns) {
-            f(*c.second);
-        }
-    }
-    gate& reply_gate() {
-        return _reply_gate;
-    }
-    friend connection;
-    friend client;
-};
+        class protocol_base;
 
-using rpc_handler_func = std::function<future<> (shared_ptr<server::connection>, std::optional<rpc_clock_type::time_point> timeout, int64_t msgid,
-                                                 rcv_buf data)>;
+        class server {
+        private:
+            static thread_local std::unordered_map<streaming_domain_type, server*> _servers;
 
-struct rpc_handler {
-    scheduling_group sg;
-    rpc_handler_func func;
-    gate use_gate;
-};
+        public:
+            class connection : public rpc::connection, public enable_shared_from_this<connection> {
+                server& _server;
+                client_info _info;
+                connection_id _parent_id = invalid_connection_id;
+                std::optional<isolation_config> _isolation_config;
+            private:
+                future<> negotiate_protocol(input_stream<char>& in);
+                future<std::tuple<std::optional<uint64_t>, uint64_t, int64_t, std::optional<rcv_buf>>>
+                read_request_frame_compressed(input_stream<char>& in);
+                future<feature_map> negotiate(feature_map requested);
+                future<> send_unknown_verb_reply(std::optional<rpc_clock_type::time_point> timeout, int64_t msg_id, uint64_t type);
+            public:
+                connection(server& s, net::quic_connected_socket&& fd, socket_address&& addr, const logger& l, void* seralizer, connection_id id);
+                future<> process();
+                future<> respond(int64_t msg_id, snd_buf&& data, std::optional<rpc_clock_type::time_point> timeout);
+                client_info& info() { return _info; }
+                const client_info& info() const { return _info; }
+                stats get_stats() const {
+                    stats res = _stats;
+                    res.pending = outgoing_queue_length();
+                    return res;
+                }
 
-class protocol_base {
-public:
-    virtual ~protocol_base() {};
-    virtual shared_ptr<server::connection> make_server_connection(rpc::server& server, connected_socket fd, socket_address addr, connection_id id) = 0;
-protected:
-    friend class server;
+                stats& get_stats_internal() {
+                    return _stats;
+                }
+                socket_address peer_address() const override {
+                    return _info.addr;
+                }
+                // Resources will be released when this goes out of scope
+                future<resource_permit> wait_for_resources(size_t memory_consumed,  std::optional<rpc_clock_type::time_point> timeout) {
+                    if (timeout) {
+                        return get_units(_server._resources_available, memory_consumed, *timeout);
+                    } else {
+                        return get_units(_server._resources_available, memory_consumed);
+                    }
+                }
+                size_t estimate_request_size(size_t serialized_size) {
+                    return rpc::estimate_request_size(_server._limits, serialized_size);
+                }
+                size_t max_request_size() const {
+                    return _server._limits.max_memory;
+                }
+                server& get_server() {
+                    return _server;
+                }
+                future<> deregister_this_stream();
+            };
+        private:
+            protocol_base* _proto;
+            net::quic_server_socket _ss;
+            resource_limits _limits;
+            rpc_semaphore _resources_available;
+            std::unordered_map<connection_id, shared_ptr<connection>> _conns;
+            promise<> _ss_stopped;
+            gate _reply_gate;
+            server_options _options;
+            uint64_t _next_client_id = 1;
 
-    virtual rpc_handler* get_handler(uint64_t msg_id) = 0;
-    virtual void put_handler(rpc_handler*) = 0;
-};
+        public:
+            server(protocol_base* proto, const socket_address& addr, resource_limits memory_limit = resource_limits());
+            server(protocol_base* proto, server_options opts, const socket_address& addr, resource_limits memory_limit = resource_limits());
+            server(protocol_base* proto,  net::quic_server_socket, resource_limits memory_limit = resource_limits(), server_options opts = server_options{});
+            server(protocol_base* proto, server_options opts,  net::quic_server_socket, resource_limits memory_limit = resource_limits());
+            void accept();
+            future<> stop();
+            template<typename Func>
+            void foreach_connection(Func&& f) {
+                for (auto c : _conns) {
+                    f(*c.second);
+                }
+            }
+            gate& reply_gate() {
+                return _reply_gate;
+            }
+            friend connection;
+            friend client;
+        };
+
+        using rpc_handler_func = std::function<future<> (shared_ptr<server::connection>, std::optional<rpc_clock_type::time_point> timeout, int64_t msgid,
+                                                         rcv_buf data)>;
+
+        struct rpc_handler {
+            scheduling_group sg;
+            rpc_handler_func func;
+            gate use_gate;
+        };
+
+        class protocol_base {
+        public:
+            virtual ~protocol_base() {};
+            virtual shared_ptr<server::connection> make_server_connection(rpc::server& server, net::quic_connected_socket fd, socket_address addr, connection_id id) = 0;
+        protected:
+            friend class server;
+
+            virtual rpc_handler* get_handler(uint64_t msg_id) = 0;
+            virtual void put_handler(rpc_handler*) = 0;
+        };
 
 /// \addtogroup rpc
 /// @{
@@ -738,167 +739,167 @@ protected:
 ///
 /// \tparam Serializer the serializer for the protocol.
 /// \tparam MsgType the type to be used as the message id or verb id.
-template<typename Serializer, typename MsgType = uint32_t>
-class protocol final : public protocol_base {
-public:
-    /// Represents the listening port and all accepted connections.
-    class server : public rpc::server {
-    public:
-        server(protocol& proto, const socket_address& addr, resource_limits memory_limit = resource_limits()) :
-            rpc::server(&proto, addr, memory_limit) {}
-        server(protocol& proto, server_options opts, const socket_address& addr, resource_limits memory_limit = resource_limits()) :
-            rpc::server(&proto, opts, addr, memory_limit) {}
-        server(protocol& proto, server_socket socket, resource_limits memory_limit = resource_limits(), server_options = server_options{}) :
-            rpc::server(&proto, std::move(socket), memory_limit) {}
-        server(protocol& proto, server_options opts, server_socket socket, resource_limits memory_limit = resource_limits()) :
-            rpc::server(&proto, opts, std::move(socket), memory_limit) {}
-    };
-    /// Represents a client side connection.
-    class client : public rpc::client {
-    public:
-        /*
-         * Create client object which will attempt to connect to the remote address.
-         *
-         * @param addr the remote address identifying this client
-         * @param local the local address of this client
-         */
-        client(protocol& p, const socket_address& addr, const socket_address& local = {}) :
-            rpc::client(p.get_logger(), &p._serializer, addr, local) {}
-        client(protocol& p, client_options options, const socket_address& addr, const socket_address& local = {}) :
-            rpc::client(p.get_logger(), &p._serializer, options, addr, local) {}
+        template<typename Serializer, typename MsgType = uint32_t>
+        class protocol final : public protocol_base {
+        public:
+            /// Represents the listening port and all accepted connections.
+            class server : public rpc::server {
+            public:
+                server(protocol& proto, const socket_address& addr, resource_limits memory_limit = resource_limits()) :
+                        rpc::server(&proto, addr, memory_limit) {}
+                server(protocol& proto, server_options opts, const socket_address& addr, resource_limits memory_limit = resource_limits()) :
+                        rpc::server(&proto, opts, addr, memory_limit) {}
+                server(protocol& proto, net::quic_server_socket socket, resource_limits memory_limit = resource_limits(), server_options = server_options{}) :
+                        rpc::server(&proto, std::move(socket), memory_limit) {}
+                server(protocol& proto, server_options opts, net::quic_server_socket socket, resource_limits memory_limit = resource_limits()) :
+                        rpc::server(&proto, opts, std::move(socket), memory_limit) {}
+            };
+            /// Represents a client side connection.
+            class client : public rpc::client {
+            public:
+                /*
+                 * Create client object which will attempt to connect to the remote address.
+                 *
+                 * @param addr the remote address identifying this client
+                 * @param local the local address of this client
+                 */
+                client(protocol& p, const socket_address& addr, const socket_address& local = {}) :
+                        rpc::client(p.get_logger(), &p._serializer, addr, local) {}
+                client(protocol& p, client_options options, const socket_address& addr, const socket_address& local = {}) :
+                        rpc::client(p.get_logger(), &p._serializer, options, addr, local) {}
 
-        /**
-         * Create client object which will attempt to connect to the remote address using the
-         * specified seastar::socket.
-         *
-         * @param addr the remote address identifying this client
-         * @param local the local address of this client
-         * @param socket the socket object use to connect to the remote address
-         */
-        client(protocol& p, socket socket, const socket_address& addr, const socket_address& local = {}) :
-            rpc::client(p.get_logger(), &p._serializer, std::move(socket), addr, local) {}
-        client(protocol& p, client_options options, socket socket, const socket_address& addr, const socket_address& local = {}) :
-            rpc::client(p.get_logger(), &p._serializer, options, std::move(socket), addr, local) {}
-    };
+                /**
+                 * Create client object which will attempt to connect to the remote address using the
+                 * specified seastar::socket.
+                 *
+                 * @param addr the remote address identifying this client
+                 * @param local the local address of this client
+                 * @param socket the socket object use to connect to the remote address
+                 */
+                client(protocol& p, q_socket socket, const socket_address& addr, const socket_address& local = {}) :
+                        rpc::client(p.get_logger(), &p._serializer, std::move(socket), addr, local) {}
+                client(protocol& p, client_options options, q_socket socket, const socket_address& addr, const socket_address& local = {}) :
+                        rpc::client(p.get_logger(), &p._serializer, options, std::move(socket), addr, local) {}
+            };
 
-    friend server;
-private:
-    std::unordered_map<MsgType, rpc_handler> _handlers;
-    Serializer _serializer;
-    logger _logger;
+            friend server;
+        private:
+            std::unordered_map<MsgType, rpc_handler> _handlers;
+            Serializer _serializer;
+            logger _logger;
 
-public:
-    protocol(Serializer&& serializer) : _serializer(std::forward<Serializer>(serializer)) {}
+        public:
+            protocol(Serializer&& serializer) : _serializer(std::forward<Serializer>(serializer)) {}
 
-    /// Creates a callable that can be used to invoke the verb on the remote.
-    ///
-    /// \tparam Func The signature of the verb. Has to be either the same or
-    ///     compatible with the one passed to register_handler on the server.
-    /// \param t the verb to invoke on the remote.
-    ///
-    /// \returns a callable whose signature is derived from Func as follows:
-    ///     given `Func == Ret(Args...)` the returned callable has the following
-    ///     signature: `future<Ret>(protocol::client&, Args...)`.
-    template<typename Func>
-    auto make_client(MsgType t);
+            /// Creates a callable that can be used to invoke the verb on the remote.
+            ///
+            /// \tparam Func The signature of the verb. Has to be either the same or
+            ///     compatible with the one passed to register_handler on the server.
+            /// \param t the verb to invoke on the remote.
+            ///
+            /// \returns a callable whose signature is derived from Func as follows:
+            ///     given `Func == Ret(Args...)` the returned callable has the following
+            ///     signature: `future<Ret>(protocol::client&, Args...)`.
+            template<typename Func>
+            auto make_client(MsgType t);
 
-    /// Register a handler to be called when this verb is invoked.
-    ///
-    /// \tparam Func the type of the handler for the verb. This determines the
-    ///     signature of the verb.
-    /// \param t the verb to register the handler for.
-    /// \param func the callable to be called when the verb is invoked by the
-    ///     remote.
-    ///
-    /// \returns a client, a callable that can be used to invoke the verb. See
-    ///     make_client(). The client can be discarded, in fact this is what
-    ///     most callers will do as real clients will live on a remote node, not
-    ///     on the one where handlers are registered.
-    template<typename Func>
-    auto register_handler(MsgType t, Func&& func);
+            /// Register a handler to be called when this verb is invoked.
+            ///
+            /// \tparam Func the type of the handler for the verb. This determines the
+            ///     signature of the verb.
+            /// \param t the verb to register the handler for.
+            /// \param func the callable to be called when the verb is invoked by the
+            ///     remote.
+            ///
+            /// \returns a client, a callable that can be used to invoke the verb. See
+            ///     make_client(). The client can be discarded, in fact this is what
+            ///     most callers will do as real clients will live on a remote node, not
+            ///     on the one where handlers are registered.
+            template<typename Func>
+            auto register_handler(MsgType t, Func&& func);
 
-    /// Register a handler to be called when this verb is invoked.
-    ///
-    /// \tparam Func the type of the handler for the verb. This determines the
-    ///     signature of the verb.
-    /// \param t the verb to register the handler for.
-    /// \param sg the scheduling group that will be used to invoke the handler
-    ///     in. This can be used to execute different verbs in different
-    ///     scheduling groups. Note that there is a newer mechanism to determine
-    ///     the scheduling groups a handler will run it per invocation, see
-    ///     isolation_config.
-    /// \param func the callable to be called when the verb is invoked by the
-    ///     remote.
-    ///
-    /// \returns a client, a callable that can be used to invoke the verb. See
-    ///     make_client(). The client can be discarded, in fact this is what
-    ///     most callers will do as real clients will live on a remote node, not
-    ///     on the one where handlers are registered.
-    template <typename Func>
-    auto register_handler(MsgType t, scheduling_group sg, Func&& func);
+            /// Register a handler to be called when this verb is invoked.
+            ///
+            /// \tparam Func the type of the handler for the verb. This determines the
+            ///     signature of the verb.
+            /// \param t the verb to register the handler for.
+            /// \param sg the scheduling group that will be used to invoke the handler
+            ///     in. This can be used to execute different verbs in different
+            ///     scheduling groups. Note that there is a newer mechanism to determine
+            ///     the scheduling groups a handler will run it per invocation, see
+            ///     isolation_config.
+            /// \param func the callable to be called when the verb is invoked by the
+            ///     remote.
+            ///
+            /// \returns a client, a callable that can be used to invoke the verb. See
+            ///     make_client(). The client can be discarded, in fact this is what
+            ///     most callers will do as real clients will live on a remote node, not
+            ///     on the one where handlers are registered.
+            template <typename Func>
+            auto register_handler(MsgType t, scheduling_group sg, Func&& func);
 
-    /// Unregister the handler for the verb.
-    ///
-    /// Waits for all currently running handlers, then unregisters the handler.
-    /// Future attempts to invoke the verb will fail. This becomes effective
-    /// immediately after calling this function.
-    ///
-    /// \param t the verb to unregister the handler for.
-    ///
-    /// \returns a future that becomes available once all currently running
-    ///     handlers finished.
-    future<> unregister_handler(MsgType t);
+            /// Unregister the handler for the verb.
+            ///
+            /// Waits for all currently running handlers, then unregisters the handler.
+            /// Future attempts to invoke the verb will fail. This becomes effective
+            /// immediately after calling this function.
+            ///
+            /// \param t the verb to unregister the handler for.
+            ///
+            /// \returns a future that becomes available once all currently running
+            ///     handlers finished.
+            future<> unregister_handler(MsgType t);
 
-    /// Set a logger function to be used to log messages.
-    ///
-    /// \deprecated use the logger overload set_logger(::seastar::logger*)
-    /// instead.
-    [[deprecated("Use set_logger(::seastar::logger*) instead")]]
-    void set_logger(std::function<void(const sstring&)> logger) {
-        _logger.set(std::move(logger));
-    }
+            /// Set a logger function to be used to log messages.
+            ///
+            /// \deprecated use the logger overload set_logger(::seastar::logger*)
+            /// instead.
+            [[deprecated("Use set_logger(::seastar::logger*) instead")]]
+            void set_logger(std::function<void(const sstring&)> logger) {
+                _logger.set(std::move(logger));
+            }
 
-    /// Set a logger to be used to log messages.
-    void set_logger(::seastar::logger* logger) {
-        _logger.set(logger);
-    }
+            /// Set a logger to be used to log messages.
+            void set_logger(::seastar::logger* logger) {
+                _logger.set(logger);
+            }
 
-    const logger& get_logger() const {
-        return _logger;
-    }
+            const logger& get_logger() const {
+                return _logger;
+            }
 
-    shared_ptr<rpc::server::connection> make_server_connection(rpc::server& server, connected_socket fd, socket_address addr, connection_id id) override {
-        return make_shared<rpc::server::connection>(server, std::move(fd), std::move(addr), _logger, &_serializer, id);
-    }
+            shared_ptr<rpc::server::connection> make_server_connection(rpc::server& server, net::quic_connected_socket fd, socket_address addr, connection_id id) override {
+                return make_shared<rpc::server::connection>(server, std::move(fd), std::move(addr), _logger, &_serializer, id);
+            }
 
-    bool has_handler(MsgType msg_id);
+            bool has_handler(MsgType msg_id);
 
-    /// Checks if any there are handlers registered.
-    /// Debugging helper, should only be used for debugging and not relied on.
-    ///
-    /// \returns true if there are, false if there are no registered handlers.
-    bool has_handlers() const noexcept {
-        return !_handlers.empty();
-    }
+            /// Checks if any there are handlers registered.
+            /// Debugging helper, should only be used for debugging and not relied on.
+            ///
+            /// \returns true if there are, false if there are no registered handlers.
+            bool has_handlers() const noexcept {
+                return !_handlers.empty();
+            }
 
-private:
-    rpc_handler* get_handler(uint64_t msg_id) override;
-    void put_handler(rpc_handler*) override;
+        private:
+            rpc_handler* get_handler(uint64_t msg_id) override;
+            void put_handler(rpc_handler*) override;
 
-    template<typename Ret, typename... In>
-    auto make_client(signature<Ret(In...)> sig, MsgType t);
+            template<typename Ret, typename... In>
+            auto make_client(signature<Ret(In...)> sig, MsgType t);
 
-    void register_receiver(MsgType t, rpc_handler&& handler) {
-        auto r = _handlers.emplace(t, std::move(handler));
-        if (!r.second) {
-            throw_with_backtrace<std::runtime_error>("registered handler already exists");
-        }
-    }
-};
+            void register_receiver(MsgType t, rpc_handler&& handler) {
+                auto r = _handlers.emplace(t, std::move(handler));
+                if (!r.second) {
+                    throw_with_backtrace<std::runtime_error>("registered handler already exists");
+                }
+            }
+        };
 
 /// @}
 
-}
+    }
 
 }
 
