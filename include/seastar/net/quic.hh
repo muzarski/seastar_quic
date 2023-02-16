@@ -53,6 +53,7 @@ public:
     virtual ~quic_connected_socket_impl() {}
     virtual data_source source(std::uint64_t id) = 0;
     virtual data_sink sink(std::uint64_t id) = 0;
+    virtual future<> close() = 0;
 };
 
 class quic_connected_socket {
@@ -63,6 +64,7 @@ public:
     explicit quic_connected_socket(std::unique_ptr<quic_connected_socket_impl> impl) noexcept : _impl(std::move(impl)) {}
     input_stream<char> input(std::uint64_t id);
     output_stream<char> output(std::uint64_t id, size_t buffer_size = 8192);
+    future<> close();
 };
 
 struct quic_accept_result {
