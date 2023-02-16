@@ -43,6 +43,10 @@ seastar::future<> service_loop() {
                 return seastar::do_with(std::move(conn), std::move(out),
                                         [](auto &conn, auto &out) {
                                             return out.write(buf, HUNDRED_MEGABYTES).then([]() {
+                                                // TODO: when flush is implemented, then flush
+                                                // right now, not all the data is being sent
+                                                // because the app is able to send again before the whole
+                                                // buffer is actually sent, and the program ends.
                                                 std::cout << "Able to send again!" << std::endl;
                                             });
                                         });
