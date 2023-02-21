@@ -58,6 +58,13 @@ constexpr size_t MAX_DATAGRAM_SIZE = 65'507;
 //==============================
 
 
+class user_closed_connection_exception : public std::exception {
+    [[nodiscard]] const char* what() const noexcept override {
+        return "User closed the connection.";
+    }
+};
+
+
 class quiche_configuration final {
 private:
     // TODO: For the time being, store these statically to make development easier.
@@ -277,15 +284,11 @@ public:
     }
 
     future<> send(send_payload&& payload) {
-        return _write_queue.not_full().then([this, payload = std::move(payload)]() mutable {
-            _write_queue.push(std::move(payload));
-        });
+        return _write_queue.push_eventually(std::move(payload));
     }
 
     future<udp_datagram> read() {
-        return _read_queue.not_empty().then([this]() {
-            return make_ready_future<udp_datagram>(_read_queue.pop());
-        });
+        return _read_queue.pop_eventually();
     }
 
     void init() {
@@ -295,31 +298,32 @@ public:
 
     future<> close() {
         _closed = true;
-        _channel.close();
-        return make_ready_future<>();
-        return _read_fiber.then([this] () {
-            return _write_fiber.then([this] () {
+        _channel.shutdown_input();
+        return _read_fiber.handle_exception([this] (const std::exception_ptr &e) {
+            return _write_fiber.handle_exception([this] (const std::exception_ptr &e) {
                 _channel.close();
                 return make_ready_future<>();
             });
         });
     }
+    
+    void abort_queues(std::exception_ptr &&ex) {
+        _write_queue.abort(ex);
+        _read_queue.abort(ex);
+    }
 
 private:
     future<> read_loop() {
         return do_until([this] { return _closed; }, [this] {
-            return _channel.receive().then([this](udp_datagram datagram) {
-                return _read_queue.not_full().then([this, datagram = std::move(datagram)]() mutable {
-                    _read_queue.push(std::move(datagram));
-                });
+            return _channel.receive().then([this] (udp_datagram datagram) {
+                return _read_queue.push_eventually(std::move(datagram));
             });
         });
     }
 
     future<> write_loop() {
         return do_until([this] { return _closed; }, [this] {
-            return _write_queue.not_empty().then([this] {
-                send_payload payload = _write_queue.pop();
+            return _write_queue.pop_eventually().then([this] (send_payload payload) {
                 return _channel.send(payload.dst, std::move(payload.buffer));
             });
         });
@@ -650,6 +654,7 @@ future<> quic_connection<Socket>::close() {
     }
     
     _closing = true;
+    
     
     return quic_flush().then([this] () {
         _timeout_timer.cancel();
@@ -1273,7 +1278,10 @@ future<> quic_client_socket::receive() {
 
 
 future<> quic_client_socket::handle_connection_closing() {
-    return _channel_manager->close();
+    _channel_manager->abort_queues(std::make_exception_ptr(user_closed_connection_exception()));
+    return _receive_fiber.handle_exception([this] (const std::exception_ptr& e) {
+        return _channel_manager->close(); 
+    });
 }
 
 

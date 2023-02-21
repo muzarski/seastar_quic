@@ -48,6 +48,8 @@ seastar::future<> service_loop() {
                                                 // because the app is able to send again before the whole
                                                 // buffer is actually sent, and the program ends.
                                                 std::cout << "Able to send again!" << std::endl;
+                                            }).then([&conn] () {
+                                               return conn.close(); 
                                             });
                                         });
             });
