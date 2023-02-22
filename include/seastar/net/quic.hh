@@ -53,9 +53,10 @@ namespace seastar::net {
         virtual ~quic_connected_socket_impl() {}
         virtual data_source source(std::uint64_t id) = 0;
         virtual data_sink sink(std::uint64_t id) = 0;
-        //    virtual void shutdown_input() = 0;
-//    virtual void shutdown_output() = 0;
-//    virtual future<> wait_input_shutdown() = 0;
+        virtual future<> close() = 0;
+        virtual void shutdown_input() = 0;
+        virtual void shutdown_output() = 0;
+        virtual future<> wait_input_shutdown() = 0;
     };
 
     class quic_connected_socket {
@@ -67,10 +68,9 @@ namespace seastar::net {
         explicit quic_connected_socket(std::unique_ptr<quic_connected_socket_impl> impl) noexcept : _impl(std::move(impl)) {}
         input_stream<char> input(std::uint64_t id);
         output_stream<char> output(std::uint64_t id, size_t buffer_size = 8192);
+        future<> close();
         void shutdown_output() ;
-
         void shutdown_input() ;
-
         future<> wait_input_shutdown();
     };
 
@@ -83,12 +83,14 @@ namespace seastar::net {
     public:
         virtual ~quic_server_socket_impl() {}
         virtual future<quic_accept_result> accept() = 0;
+        virtual void abort_accept() = 0;
         virtual socket_address local_address() const = 0;
     };
 
     class quic_server_socket {
     private:
         std::unique_ptr<quic_server_socket_impl> _impl;
+        bool _aborted = false;
 
     public:
         quic_server_socket() noexcept = default;
@@ -97,7 +99,15 @@ namespace seastar::net {
         quic_server_socket(quic_server_socket&& qss) noexcept = default;
         ~quic_server_socket() noexcept = default;
 
+        void abort_accept() {
+            _impl->abort_accept();
+            _aborted = true;
+        }
+
         future<quic_accept_result> accept() {
+            if (_aborted) {
+                return make_exception_future<quic_accept_result>(std::system_error(ECONNABORTED, std::system_category()));
+            }
             return _impl->accept();
         }
 

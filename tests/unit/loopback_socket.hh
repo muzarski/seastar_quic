@@ -164,6 +164,10 @@ namespace seastar {
         data_sink sink(std::uint64_t id) override {
             return data_sink(std::make_unique<loopback_data_sink_impl>(_tx));
         }
+        //TODO
+        future<> close() override {
+            return seastar::make_ready_future<>();
+        }
 //    void shutdown_input() override {
 //        _rx->shutdown();
 //    }

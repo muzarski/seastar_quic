@@ -295,6 +295,8 @@ namespace seastar::net {
 
             future<> close() {
                 _closed = true;
+                _channel.close();
+                return make_ready_future<>();
                 return _read_fiber.then([this] () {
                     return _write_fiber.then([this] () {
                         _channel.close();
@@ -365,6 +367,7 @@ namespace seastar::net {
             socket_address                                                        _peer_address;
             timer<std::chrono::steady_clock>                                      _timeout_timer;
             future<>                                                              _stream_recv_fiber;
+            bool                                                                  _closing = false;
 
         public:
             bool                                                                  _read_future_resolved = false;
@@ -405,6 +408,9 @@ namespace seastar::net {
             bool is_closed();
             future<> write(temporary_buffer<char> tb, std::uint64_t stream_id);
             future<temporary_buffer<char>> read(std::uint64_t stream_id);
+            future<> close();
+            void close_read();
+            void close_write();
         };
 
 
@@ -443,7 +449,7 @@ namespace seastar::net {
 
         template <typename Socket>
         future<> quic_connection<Socket>::stream_recv_loop() {
-            return keep_doing([this] {
+            return do_until([this] () { return quiche_conn_is_closed(_connection) || _closing; }, [this] {
                 return _readable.get_future().then([this] {
                     std::uint64_t stream_id;
                     auto iter = quiche_conn_readable(_connection);
@@ -483,6 +489,8 @@ namespace seastar::net {
                             }
                         }
                     }
+                    quiche_stream_iter_free(iter);
+
                     if (!quiche_conn_is_readable(_connection)) {
                         _readable = promise<>();
                         _read_future_resolved = false;
@@ -546,6 +554,7 @@ namespace seastar::net {
                     }
                 }
             }
+            quiche_stream_iter_free(iter);
         }
 
         template <typename Socket>
@@ -632,6 +641,40 @@ namespace seastar::net {
         }
 
 
+        template <typename Socket>
+        future<> quic_connection<Socket>::close() {
+            if (!quiche_conn_is_closed(_connection)) {
+                quiche_conn_close(_connection,
+                                  true /* user closed connection */,
+                                  0,
+                                  nullptr,
+                                  0);
+            }
+
+            _closing = true;
+
+            return quic_flush().then([this] () {
+                _timeout_timer.cancel();
+                _readable.set_value();
+                return _stream_recv_fiber.then([this] () {
+                    return _socket->handle_connection_closing().then([this] () {
+                        _socket.release();
+                    });
+                });
+            });
+        }
+
+        template <typename Socket>
+        void quic_connection<Socket>::close_read(){
+            // TODO (hard coded stram_id)
+            quiche_conn_stream_send(_connection, 4, nullptr, 0, true);
+            _read_queues.clear();
+        }
+
+        template <typename Socket>
+        void quic_connection<Socket>::close_write(){
+            _write_queues.clear();
+        }
 //====================
 //....................
 //....................
@@ -723,6 +766,22 @@ namespace seastar::net {
             data_sink sink(std::uint64_t id) override {
                 // TODO: implement
                 return data_sink(std::make_unique<quiche_data_sink_impl<Socket>>(_conn, id));
+            }
+
+            future<> close() override {
+                return _conn->close();
+            }
+
+            void shutdown_input() override{
+                _conn->close_read();
+            }
+            void shutdown_output() override{
+                _conn->close_write();
+            }
+
+            future<> wait_input_shutdown() override {
+                //TODO: to be implemented
+                return seastar::make_ready_future<>();
             }
 
         };
@@ -817,7 +876,9 @@ namespace seastar::net {
             future<> service_loop();
             future<> send(send_payload &&payload);
             future<quic_accept_result> accept() override;
+            void abort_accept() override;
             socket_address local_address() const override;
+            future<> handle_connection_closing();
 
         private:
             future<> handle_datagram(udp_datagram&& datagram);
@@ -870,6 +931,10 @@ namespace seastar::net {
             auto result = request.get_future();
             _accept_requests.push(std::move(request));
             return result;
+        }
+
+        void quic_server_socket_quiche_impl::abort_accept() {
+
         }
 
         socket_address quic_server_socket_quiche_impl::local_address() const {
@@ -1117,6 +1182,12 @@ namespace seastar::net {
         }
 
 
+        future<> quic_server_socket_quiche_impl::handle_connection_closing() {
+            // TODO pass cid as argument. Clean up.
+            return make_ready_future<>();
+        }
+
+
 //====================
 //....................
 //....................
@@ -1149,6 +1220,7 @@ namespace seastar::net {
 
             future<quic_connected_socket> connect(socket_address sa);
             future<> send(send_payload&& payload);
+            future<> handle_connection_closing();
 
         private:
             future<> receive_loop();
@@ -1228,6 +1300,12 @@ namespace seastar::net {
             });
         }
 
+
+        future<> quic_client_socket::handle_connection_closing() {
+            return _channel_manager->close();
+        }
+
+
         void quiche_log_printer(const char* line, void* args) {
             std::cout << line << std::endl;
         }
@@ -1267,16 +1345,19 @@ namespace seastar::net {
         return {_impl->sink(id), buffer_size};
     }
 
+    future<> quic_connected_socket::close() {
+        return _impl->close();
+    }
     void quic_connected_socket::shutdown_output() {
-//    _impl->shutdown_output();
+        _impl->shutdown_output();
     }
 
     void quic_connected_socket::shutdown_input() {
-//    _impl->shutdown_input();
+        _impl->shutdown_input();
     }
 
     future<> quic_connected_socket::wait_input_shutdown() {
-        return make_ready_future<>();
+        return _impl->wait_input_shutdown();
     }
 
     void quic_enable_logging() {
