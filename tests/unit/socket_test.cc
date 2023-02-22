@@ -41,27 +41,27 @@ future<> handle_connection(connected_socket s) {
     auto out = s.output();
     return do_with(std::move(in), std::move(out), [](auto& in, auto& out) {
         return do_until([&in]() { return in.eof(); },
-            [&in, &out] {
-                return in.read().then([&out](auto buf) {
-                    return out.write(std::move(buf)).then([&out]() { return out.close(); });
-                });
-            });
+                        [&in, &out] {
+                            return in.read().then([&out](auto buf) {
+                                return out.write(std::move(buf)).then([&out]() { return out.close(); });
+                            });
+                        });
     });
 }
 
 future<> echo_server_loop() {
     return do_with(
-        server_socket(listen(make_ipv4_address({1234}), listen_options{.reuse_address = true})), [](auto& listener) {
-              // Connect asynchronously in background.
-              (void)connect(make_ipv4_address({"127.0.0.1", 1234})).then([](connected_socket&& socket) {
-                  socket.shutdown_output();
-              });
-              return listener.accept().then(
-                  [](accept_result ar) {
-                      connected_socket s = std::move(ar.connection);
-                      return handle_connection(std::move(s));
-                  }).then([l = std::move(listener)]() mutable { return l.abort_accept(); });
-        });
+            server_socket(listen(make_ipv4_address({1234}), listen_options{.reuse_address = true})), [](auto& listener) {
+                // Connect asynchronously in background.
+                (void)connect(make_ipv4_address({"127.0.0.1", 1234})).then([](connected_socket&& socket) {
+                    socket.shutdown_output();
+                });
+                return listener.accept().then(
+                        [](accept_result ar) {
+                            connected_socket s = std::move(ar.connection);
+                            return handle_connection(std::move(s));
+                        }).then([l = std::move(listener)]() mutable { return l.abort_accept(); });
+            });
 }
 
 class my_malloc_allocator : public std::pmr::memory_resource {
@@ -224,3 +224,4 @@ SEASTAR_TEST_CASE(socket_on_close_local_shutdown_test) {
         when_all(std::move(client), std::move(server)).discard_result().get();
     });
 }
+

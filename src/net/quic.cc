@@ -20,6 +20,7 @@
 
 #include <seastar/core/future.hh>
 #include <seastar/core/shared_ptr.hh>
+#include <seastar/core/weak_ptr.hh>
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/core/queue.hh>
 #include <seastar/net/api.hh>
@@ -279,6 +280,7 @@ public:
     , _read_queue(READ_QUEUE_SIZE)
     , _closed(false) {}
 
+
     [[nodiscard]] socket_address local_address() const {
         return _channel.local_address();
     }
@@ -365,8 +367,9 @@ private:
     std::unordered_map<std::uint64_t, queue<temporary_buffer<char>>>      _read_queues;
     std::unordered_map<std::uint64_t, std::deque<temporary_buffer<char>>> _write_queues;
     std::unordered_map<std::uint64_t, promise<>>                          _writable_promises;
+    std::unordered_map<std::uint64_t, promise<>>                          _input_shutdown_promises;
     promise<>                                                             _readable;
-    lw_shared_ptr<Socket>                                                 _socket;
+    weak_ptr<Socket>                                                      _socket;
     socket_address                                                        _local_address;
     socket_address                                                        _peer_address;
     timer<std::chrono::steady_clock>                                      _timeout_timer;
@@ -375,6 +378,7 @@ private:
 
 public:
     bool                                                                  _read_future_resolved = false;
+    lw_shared_ptr<Socket> just_to_live; // TODO: remove this, think of a solution for the ownership of that
 
 private:
     future<> stream_recv_loop();
@@ -382,11 +386,11 @@ private:
     void send_outstanding_data_in_streams_if_possible();
 
 public:
-    quic_connection(quiche_conn* connection, const lw_shared_ptr<Socket>& socket,
+    quic_connection(quiche_conn* connection, weak_ptr<Socket> socket,
                            socket_address la, socket_address pa)
             : _connection(connection)
             , _buffer(MAX_DATAGRAM_SIZE)
-            , _socket(socket)
+            , _socket(std::move(socket))
             , _local_address(la)
             , _peer_address(pa)
             , _timeout_timer()
@@ -412,7 +416,11 @@ public:
     bool is_closed();
     future<> write(temporary_buffer<char> tb, std::uint64_t stream_id);
     future<temporary_buffer<char>> read(std::uint64_t stream_id);
+    void shutdown_input(std::uint64_t id);
+    void shutdown_output(std::uint64_t stream_id);
+    future <> wait_input_shutdown(std::uint64_t stream_id);
     future<> close();
+    future<> close(std::uint64_t stream_id);
 };
 
 
@@ -456,6 +464,12 @@ future<> quic_connection<Socket>::stream_recv_loop() {
             std::uint64_t stream_id;
             auto iter = quiche_conn_readable(_connection);
             while (quiche_stream_iter_next(iter, &stream_id)) {
+                if (quiche_conn_stream_finished(_connection, stream_id)) {
+                    _read_queues.try_emplace(stream_id, STREAM_READ_QUEUE_SIZE).first->second.push(temporary_buffer<char>("", 0));
+                   //_input_shutdown_promises.try_emplace(stream_id).first->second.set_value();
+                    continue;
+                }
+
                 while(quiche_conn_stream_readable(_connection, stream_id)) {
                     bool fin = false;
                     const auto recv_result = quiche_conn_stream_recv(
@@ -642,6 +656,45 @@ template <typename Socket>
     return _read_queues.try_emplace(stream_id, STREAM_READ_QUEUE_SIZE).first->second.pop_eventually();
 }
 
+template <typename Socket>
+void quic_connection<Socket>::shutdown_input(std::uint64_t stream_id) {
+    auto queue_iter = _read_queues.find(stream_id);
+    if (queue_iter != _read_queues.end()) {
+        _read_queues.erase(queue_iter);
+    }
+    if (quiche_conn_stream_shutdown(_connection, stream_id, QUICHE_SHUTDOWN_READ, 0) < 0) {
+        // TODO: handle error
+    }
+    _input_shutdown_promises[stream_id].set_value();
+    (void) quic_flush();
+}
+
+template <typename Socket>
+void quic_connection<Socket>::shutdown_output(std::uint64_t stream_id) {
+    // TODO: add guard to _write_queues
+    // Thought: In TCP we have wait_for_all_data_acked first, do we want the same here?
+    _write_queues.erase(stream_id);
+    auto writable_promise = _writable_promises.find(stream_id);
+    if (writable_promise != _writable_promises.end()) {
+        // TODO: add custom exception
+        writable_promise->second.set_exception(std::make_exception_ptr(std::runtime_error("Output has been shut down")));
+        _writable_promises.erase(writable_promise);
+    }
+    if (quiche_conn_stream_send(_connection, stream_id, nullptr, 0, true) < 0) {
+        // TODO: Handle quiche error.
+    }
+    if (quiche_conn_stream_shutdown(_connection, stream_id, QUICHE_SHUTDOWN_WRITE, 0)) {
+        // TODO: Handle quiche error
+    }
+    (void) quic_flush();
+}
+
+template <typename Socket>
+future<> quic_connection<Socket>::wait_input_shutdown(std::uint64_t stream_id) {
+    // TODO: resolve this future wherever necessary, i.e when connection closed, stream finished (already done) and when
+    // input_shutdown() called.
+    return _input_shutdown_promises[stream_id].get_future();
+}
 
 template <typename Socket>
 future<> quic_connection<Socket>::close() {
@@ -654,19 +707,36 @@ future<> quic_connection<Socket>::close() {
     }
     
     _closing = true;
+
+    for (auto& [stream_id, _] : _write_queues) {
+        shutdown_output(stream_id);
+    }
+
+    for (auto& [stream_id, _] : _read_queues) {
+        shutdown_input(stream_id);
+    }
     
     
     return quic_flush().then([this] () {
         _timeout_timer.cancel();
         _readable.set_value();
         return _stream_recv_fiber.then([this] () {
-            return _socket->handle_connection_closing().then([this] () {
-                _socket.release();
+            return _socket->handle_connection_closing().then([] () {
+                // _socket.release();
+                return seastar::make_ready_future();
             });
         });
     });
 }
 
+template <typename Socket>
+future<> quic_connection<Socket>::close(std::uint64_t stream_id) {
+    // TODO: set the guard, wait for all data to be sent.
+    if (quiche_conn_stream_send(_connection, stream_id, nullptr, 0, true) < 0) {
+        // TODO: handle quiche error
+    }
+    return seastar::make_ready_future();
+}
 
 //====================
 //....................
@@ -724,7 +794,7 @@ public:
     future<> close() override {
         // TODO: implement this by sending FIN frame to the endpoint.
         // Although, here we should wait until all data in the stream is sent - how to do it efficiently?
-        return seastar::make_ready_future();
+        return _conn->close(_stream_id);
     }
 
     [[nodiscard]] size_t buffer_size() const noexcept override {
@@ -752,6 +822,13 @@ public:
     explicit quiche_quic_connected_socket_impl(lw_shared_ptr<quic_connection<Socket>> conn) 
     : _conn(std::move(conn)) {}
 
+    ~quiche_quic_connected_socket_impl() {
+        // For client, close the connection and destroy client socket.
+        // For server, only closes the connections. The socket will be closed in some other desctructor
+
+        (void) _conn->close();
+    }
+
     data_source source(std::uint64_t id) override {
         return data_source(std::make_unique<quiche_data_source_impl<Socket>>(_conn, id));
     }
@@ -759,6 +836,18 @@ public:
     data_sink sink(std::uint64_t id) override {
         // TODO: implement
         return data_sink(std::make_unique<quiche_data_sink_impl<Socket>>(_conn, id));
+    }
+
+    void shutdown_input(std::uint64_t stream_id) override {
+        _conn->shutdown_input(stream_id);
+    }
+
+    void shutdown_output(std::uint64_t stream_id) override {
+        _conn->shutdown_output(stream_id);
+    }
+
+    future<> wait_input_shutdown(std::uint64_t id) override {
+        return _conn->wait_input_shutdown(id);
     }
     
     future<> close() override {
@@ -777,7 +866,7 @@ public:
 //====================
 
 
-class quic_server_socket_quiche_impl final : public quic_server_socket_impl, public enable_lw_shared_from_this<quic_server_socket_quiche_impl> {
+class quic_server_socket_quiche_impl final : public quic_server_socket_impl, public seastar::weakly_referencable<quic_server_socket_quiche_impl> {
 private:
     // TODO: Check the comments left in the function `quic_retry`.
     // Right now, tokens aren't used properly and passing `socket_address::length()`
@@ -1050,7 +1139,7 @@ future<> quic_server_socket_quiche_impl::handle_pre_hs_connection(quic_header_in
     }
 
     auto [it, succeeded] = _connections.emplace(key, make_lw_shared<server_connection_t>(connection, 
-                                                                                       this->shared_from_this(),
+                                                                                       this->weak_from_this(),
                                                                                        _channel_manager->local_address(),
                                                                                        datagram.get_src()));
     if (!succeeded) {
@@ -1173,7 +1262,7 @@ future<> quic_server_socket_quiche_impl::handle_connection_closing() {
 //====================
 
 
-class quic_client_socket : public enable_lw_shared_from_this<quic_client_socket> {
+class quic_client_socket : public weakly_referencable<quic_client_socket>, public enable_lw_shared_from_this<quic_client_socket> {
 private:
     using client_connection_t = quic_connection<quic_client_socket>;
     
@@ -1225,9 +1314,11 @@ future<quic_connected_socket> quic_client_socket::connect(socket_address sa) {
         _connected_promise.set_exception(std::runtime_error("Creating a QUIC connection has failed."));
         return _connected_promise.get_future();
     }
-    
+
     _connection = make_lw_shared<client_connection_t>(connection_ptr, 
-            this->shared_from_this(), la, sa);
+            this->weak_from_this(), la, sa);
+
+    _connection->just_to_live = this->shared_from_this();
 
     // TODO: Something must clean this up afterwards, most likely `quic_connected_socket`.
     _receive_fiber = receive_loop();
@@ -1322,6 +1413,18 @@ output_stream<char> quic_connected_socket::output(std::uint64_t id, size_t buffe
     output_stream_options opts;
     opts.batch_flushes = true;
     return {_impl->sink(id), buffer_size};
+}
+
+void quic_connected_socket::shutdown_input(std::uint64_t stream_id) {
+    _impl->shutdown_input(stream_id);
+}
+
+void quic_connected_socket::shutdown_output(std::uint64_t stream_id) {
+    _impl->shutdown_output(stream_id);
+}
+
+future<> quic_connected_socket::wait_input_shutdown(std::uint64_t stream_id) {
+    return _impl->wait_input_shutdown(stream_id);
 }
 
 future<> quic_connected_socket::close() {
