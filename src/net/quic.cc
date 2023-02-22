@@ -412,6 +412,7 @@ public:
     bool is_closed();
     future<> write(temporary_buffer<char> tb, std::uint64_t stream_id);
     future<temporary_buffer<char>> read(std::uint64_t stream_id);
+    void shutdown_output(std::uint64_t stream_id);
     future<> close();
 };
 
@@ -456,6 +457,11 @@ future<> quic_connection<Socket>::stream_recv_loop() {
             std::uint64_t stream_id;
             auto iter = quiche_conn_readable(_connection);
             while (quiche_stream_iter_next(iter, &stream_id)) {
+                if (quiche_conn_stream_finished(_connection, stream_id)) {
+                    _read_queues.try_emplace(stream_id, STREAM_READ_QUEUE_SIZE).first->second.push(temporary_buffer<char>("", 0));
+                    continue;
+                }
+
                 while(quiche_conn_stream_readable(_connection, stream_id)) {
                     bool fin = false;
                     const auto recv_result = quiche_conn_stream_recv(
@@ -642,6 +648,25 @@ template <typename Socket>
     return _read_queues.try_emplace(stream_id, STREAM_READ_QUEUE_SIZE).first->second.pop_eventually();
 }
 
+template <typename Socket>
+void quic_connection<Socket>::shutdown_output(std::uint64_t stream_id) {
+    // TODO: add guard to _write_queues
+    // Thought: In TCP we have wait_for_all_data_acked first, do we want the same here?
+    _write_queues.erase(stream_id);
+    auto writable_promise = _writable_promises.find(stream_id);
+    if (writable_promise != _writable_promises.end()) {
+        // TODO: add custom exception
+        writable_promise->second.set_exception(std::make_exception_ptr(std::runtime_error("Output has been shut down")));
+        _writable_promises.erase(writable_promise);
+    }
+    if (quiche_conn_stream_send(_connection, stream_id, nullptr, 0, true) < 0) {
+        // TODO: Handle quiche error.
+    }
+    if (quiche_conn_stream_shutdown(_connection, stream_id, QUICHE_SHUTDOWN_WRITE, 0)) {
+        // TODO: Handle quiche error
+    }
+    (void) quic_flush();
+}
 
 template <typename Socket>
 future<> quic_connection<Socket>::close() {
@@ -759,6 +784,10 @@ public:
     data_sink sink(std::uint64_t id) override {
         // TODO: implement
         return data_sink(std::make_unique<quiche_data_sink_impl<Socket>>(_conn, id));
+    }
+
+    void shutdown_output(std::uint64_t stream_id) override {
+        _conn->shutdown_output(stream_id);
     }
     
     future<> close() override {
@@ -1322,6 +1351,10 @@ output_stream<char> quic_connected_socket::output(std::uint64_t id, size_t buffe
     output_stream_options opts;
     opts.batch_flushes = true;
     return {_impl->sink(id), buffer_size};
+}
+
+void quic_connected_socket::shutdown_output(std::uint64_t stream_id) {
+    _impl->shutdown_output(stream_id);
 }
 
 future<> quic_connected_socket::close() {
