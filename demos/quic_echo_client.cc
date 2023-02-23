@@ -26,38 +26,58 @@
 #include <seastar/core/future-util.hh>
 #include <seastar/net/api.hh>
 #include <seastar/net/quic.hh>
+#include <seastar/core/thread.hh>
 #include "seastar/core/sleep.hh"
 
-constexpr static std::uint64_t STREAM_ID = 4;
-static std::uint64_t msg_id = 0;
+constexpr static std::uint64_t STREAM_NUM = 100;
 
 using namespace std::chrono_literals;
+
+
+seastar::input_stream<char> arr1[STREAM_NUM];
+seastar::output_stream<char> arr2[STREAM_NUM];
 
 seastar::future<> service_loop() {
     return seastar::net::quic_connect(seastar::make_ipv4_address({1234}))
             .then([](seastar::net::quic_connected_socket conn) {
                 std::cout << "Connected!" << std::endl;
-                auto in = conn.input(STREAM_ID);
-                auto out = conn.output(STREAM_ID);
-                return seastar::do_with(std::move(conn), std::move(in), std::move(out),
-                                        [](auto &conn, auto &in, auto &out) {
-                                            return seastar::keep_doing([&in, &out]() {
-                                                return seastar::sleep(1s).then([&in, &out]() {
-                                                    std::string msg = "Hello from client " + std::to_string(msg_id++);
-                                                    return out.write(msg).then([&in, &out]() {
-                                                        return out.flush().then([&in]() {
-                                                            std::cout << "Sent message." << std::endl;
-                                                            return in.read().then(
-                                                                    [](seastar::temporary_buffer<char> buf) {
-                                                                        char msg_buf[buf.size() + 1];
-                                                                        memcpy(msg_buf, buf.get(), buf.size());
-                                                                        msg_buf[buf.size()] = '\0';
-                                                                        std::cout << "Received message: " << msg_buf
-                                                                                  << std::endl;
-                                                                        return seastar::make_ready_future();
-                                                                    });
-                                                        });
+                int start = 4;
+                for (std::uint64_t i = 0; i < STREAM_NUM; i++) {
+                    arr1[i] = conn.input(start);
+                    arr2[i] = conn.output(start);
+                    start += 4;
+                }
+
+                return seastar::do_with(std::move(conn), std::move(arr1), std::move(arr2),
+                                        [](auto &conn, auto &arr1, auto &arr2) {
+                                            return seastar::keep_doing([&arr1, &arr2]() {
+                                                return seastar::async([&] {
+                                                    auto client_write = seastar::async([&] {
+                                                        for (std::uint64_t j = 0; j < STREAM_NUM; j++) {
+                                                            seastar::sleep(1s).get();
+                                                            std::string msg =
+                                                                    "Hello from client " + std::to_string(j);
+                                                            arr2[j].write(msg).get();
+                                                            arr2[j].flush().get();
+                                                            std::cout << "Sent message. " << j << std::endl;
+                                                        }
                                                     });
+
+                                                    auto client_read = seastar::async([&] {
+                                                        for (std::uint64_t j = 0; j < STREAM_NUM; j++) {
+                                                            auto buf = arr1[j].read().get();
+                                                            char msg_buf[buf.size() + 1];
+                                                            memcpy(msg_buf, buf.get(), buf.size());
+                                                            msg_buf[buf.size()] = '\0';
+                                                            std::cout << "Received message: "
+                                                                      << msg_buf << " " << j
+                                                                      << std::endl;
+                                                        }
+                                                    });
+
+                                                    when_all(std::move(client_write),
+                                                             std::move(client_read)).discard_result().get();
+
                                                 });
                                             });
                                         });

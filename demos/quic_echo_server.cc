@@ -26,25 +26,53 @@
 #include <seastar/core/future-util.hh>
 #include <seastar/net/api.hh>
 #include <seastar/net/quic.hh>
+#include <seastar/core/thread.hh>
 #include <seastar/core/sleep.hh>
 
-constexpr static std::uint64_t STREAM_ID = 4;
+constexpr static std::uint64_t STREAM_NUM = 100;
+
+using namespace std::chrono_literals;
+
+seastar::input_stream<char> arr1[STREAM_NUM];
+seastar::output_stream<char> arr2[STREAM_NUM];
+
 
 seastar::future<> handle_connection(seastar::net::quic_accept_result accept_result) {
     std::cout << "Accepted connection!" << std::endl;
     auto conn = std::move(accept_result.connection);
-    auto in = conn.input(STREAM_ID);
-    auto out = conn.output(STREAM_ID);
-    return seastar::do_with(std::move(conn), std::move(in), std::move(out), [](auto &conn, auto &in, auto &out) {
-        return seastar::keep_doing([&in, &out]() {
-            return in.read().then([&out](seastar::temporary_buffer<char> buf) {
-                char msg_buf[buf.size() + 1];
-                memcpy(msg_buf, buf.get(), buf.size());
-                msg_buf[buf.size()] = '\0';
-                std::cout << "Received message: " << msg_buf << std::endl;
-                return out.write(std::move(buf)).then([&out]() {
-                    return out.flush();
-                });
+    int start = 4;
+    //TODO stabilize stream numbering
+    for(std::uint64_t i = 0; i < STREAM_NUM; i++){
+        arr1[i] = conn.input(start);
+        arr2[i] = conn.output(start);
+        start += 4;
+    }
+    return seastar::do_with(std::move(conn), std::move(arr1), std::move(arr2), []
+    (auto &conn, auto &arr1, auto &arr2) {
+        return seastar::keep_doing([&arr1, &arr2]() {
+            return seastar::async([&]
+            {
+                    auto server_read = seastar::async([&] {
+                        for (std::uint64_t j = 0; j < STREAM_NUM; j++) {
+                            auto buf = arr1[j].read().get();
+                            char msg_buf[buf.size() + 1];
+                            memcpy(msg_buf, buf.get(), buf.size());
+                            msg_buf[buf.size()] = '\0';
+                            std::cout << "Received message: " << msg_buf << std::endl;
+                        }
+                    });
+
+                    auto server_write = seastar::async([&] {
+                        for (std::uint64_t j = 0; j < STREAM_NUM; j++) {
+                            seastar::sleep(2s).get();
+                            std::cout << "sending message: " << j << std::endl;
+                            std::string msg =
+                                    "Hello from server " + std::to_string(j);
+                            arr2[j].write(msg).get();
+                            arr2[j].flush().get();
+                        }
+                    });
+                    when_all(std::move(server_read), std::move(server_write)).discard_result().get();
             });
         });
     });
@@ -52,8 +80,10 @@ seastar::future<> handle_connection(seastar::net::quic_accept_result accept_resu
 
 seastar::future<> service_loop() {
     // TODO: Either add keys to the repo or generate them here.
-    std::string cert_file = "/home/danielmastalerz/Pulpit/seastar_quic/quiche/quiche/examples/cert.crt";
-    std::string key_file = "/home/danielmastalerz/Pulpit/seastar_quic/quiche/quiche/examples/cert.key";
+//    std::string cert_file = "/home/danielmastalerz/Pulpit/seastar_quic/quiche/quiche/examples/cert.crt";
+//    std::string key_file = "/home/danielmastalerz/Pulpit/seastar_quic/quiche/quiche/examples/cert.key";
+    std::string cert_file = "/home/julias/mim/zpp/seastar-master/quiche/quiche/examples/cert.crt";
+    std::string key_file = "/home/julias/mim/zpp/seastar-master/quiche/quiche/examples/cert.key";
 
     return seastar::do_with(seastar::net::quic_listen(seastar::make_ipv4_address({1234}), cert_file, key_file),
                             [](auto &listener) {
