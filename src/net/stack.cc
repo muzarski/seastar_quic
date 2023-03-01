@@ -182,6 +182,22 @@ void socket::shutdown() {
     _si->shutdown();
 }
 
+future<net::quic_connected_socket> q_socket::connect(socket_address sa) {
+    return _si->connect(sa);
+}
+
+void q_socket::set_reuseaddr(bool reuseaddr) {
+    _si->set_reuseaddr(reuseaddr);
+}
+
+bool q_socket::get_reuseaddr() const {
+    return _si->get_reuseaddr();
+}
+
+void q_socket::shutdown() {
+    _si->shutdown();
+}
+
 server_socket::server_socket() noexcept {
 }
 

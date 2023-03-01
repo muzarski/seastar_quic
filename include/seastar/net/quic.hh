@@ -50,7 +50,7 @@ struct quic_connection_config {
 
 class quic_connected_socket_impl {
 public:
-    virtual ~quic_connected_socket_impl() {}
+    virtual ~quic_connected_socket_impl() {};
     virtual data_source source(std::uint64_t id) = 0;
     virtual data_sink sink(std::uint64_t id) = 0;
     virtual void shutdown_input(std::uint64_t id) = 0;
@@ -64,6 +64,7 @@ private:
     std::unique_ptr<quic_connected_socket_impl> _impl;
 
 public:
+    quic_connected_socket() = default;
     explicit quic_connected_socket(std::unique_ptr<quic_connected_socket_impl> impl) noexcept : _impl(std::move(impl)) {}
     input_stream<char> input(std::uint64_t id);
     output_stream<char> output(std::uint64_t id, size_t buffer_size = 8192);
@@ -80,7 +81,8 @@ struct quic_accept_result {
 
 class quic_server_socket_impl {
 public:
-    virtual ~quic_server_socket_impl() {}
+    virtual ~quic_server_socket_impl() {};
+    virtual void abort_accept() = 0;
     virtual future<quic_accept_result> accept() = 0;
     virtual socket_address local_address() const = 0;
 };
@@ -88,6 +90,7 @@ public:
 class quic_server_socket {
 private:
     std::unique_ptr<quic_server_socket_impl> _impl;
+    bool _aborted = false;
 
 public:
     quic_server_socket() noexcept = default;
@@ -96,7 +99,15 @@ public:
     quic_server_socket(quic_server_socket&& qss) noexcept = default;
     ~quic_server_socket() noexcept = default;
 
+    void abort_accept() {
+        _impl->abort_accept();
+        _aborted = true;
+    }
+
     future<quic_accept_result> accept() {
+        if (_aborted) {
+            return make_exception_future<quic_accept_result>(std::system_error(ECONNABORTED, std::system_category()));
+        }
         return _impl->accept();
     }
 

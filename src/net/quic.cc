@@ -945,6 +945,7 @@ public:
 
     future<> service_loop();
     future<> send(send_payload &&payload);
+    void abort_accept() override;
     future<quic_accept_result> accept() override;
     socket_address local_address() const override;
     future<> handle_connection_closing();
@@ -1250,6 +1251,10 @@ connection_id quic_server_socket_quiche_impl::generate_new_cid() {
 future<> quic_server_socket_quiche_impl::handle_connection_closing() {
     // TODO pass cid as argument. Clean up.
     return make_ready_future<>();
+}
+
+void seastar::net::quic_server_socket_quiche_impl::abort_accept() {
+    //TODO function currently used in testing, create an initial body
 }
 
 

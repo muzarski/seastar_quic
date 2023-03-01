@@ -35,6 +35,7 @@
 #include <seastar/util/std-compat.hh>
 #include <seastar/util/program-options.hh>
 #include <sys/types.h>
+#include <seastar/net/quic.hh>
 
 namespace seastar {
 
@@ -374,6 +375,49 @@ public:
     }
 };
 
+
+class q_socket_impl;
+
+class q_socket {
+    std::unique_ptr<q_socket_impl> _si;
+public:
+    q_socket() noexcept = default;
+    ~q_socket() {}
+
+    /// \cond internal
+    explicit q_socket(std::unique_ptr<q_socket_impl> si) noexcept
+            : _si(std::move(si)) {}
+    /// \endcond
+    /// Moves a \c seastar::socket object.
+    q_socket(q_socket&&) noexcept = default;
+    /// Move-assigns a \c seastar::socket object.
+    q_socket& operator=(q_socket&&) noexcept = default;
+
+    /// Attempts to establish the connection.
+    ///
+    /// \return a \ref connected_socket representing the connection.
+    future<net::quic_connected_socket> connect(socket_address sa);
+
+    /// Sets SO_REUSEADDR option (enable reuseaddr option on a socket)
+    void set_reuseaddr(bool reuseaddr);
+    /// Gets O_REUSEADDR option
+    /// \return whether the reuseaddr option is enabled or not
+    bool get_reuseaddr() const ;
+    /// Stops any in-flight connection attempt.
+    ///
+    /// Cancels the connection attempt if it's still in progress, and
+    /// terminates the connection if it has already been established.
+    void shutdown();
+};
+
+class q_socket_impl {
+public:
+    virtual ~q_socket_impl() {}
+    virtual future<net::quic_connected_socket> connect(socket_address sa) = 0;
+    virtual void set_reuseaddr(bool reuseaddr) = 0;
+    virtual bool get_reuseaddr() const = 0;
+    virtual void shutdown() = 0;
+};
 /// @}
 
 struct listen_options {
