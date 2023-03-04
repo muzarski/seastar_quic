@@ -497,7 +497,7 @@ future<> quic_connection<Socket>::stream_recv_loop() {
                 _readable = promise<>();
                 _read_future_resolved = false;
             }
-            return make_ready_future<>();
+            return quic_flush();
         });
     });
 }
