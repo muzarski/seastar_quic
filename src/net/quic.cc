@@ -36,12 +36,47 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include "seastar/net/inet_address.hh"
+#include "seastar/net/udp.hh"
+#include "seastar/net/ipv4_address.hh"
 
 // TODO: Think if some classes/structs should/should not be marked as `final`.
 
 namespace seastar::net {
 
 namespace {
+
+   class quic_udp_datagram {
+   private:
+       socket_address dst;
+       socket_address src;
+       packet p;
+   public:
+         quic_udp_datagram(socket_address dst, socket_address src, packet p)
+         : dst(std::move(dst))
+         , src(std::move(src))
+         , p(std::move(p))
+         {}
+
+         // move constructor
+         quic_udp_datagram(quic_udp_datagram &&other) noexcept {
+             dst = std::move(other.dst);
+             src = std::move(other.src);
+             p = std::move(other.p);
+         }
+
+         [[nodiscard]] const socket_address& get_dst() const noexcept {
+              return dst;
+         }
+
+         [[nodiscard]] const socket_address& get_src() const noexcept {
+              return src;
+         }
+
+         [[nodiscard]] const packet& get_packet() const noexcept {
+              return p;
+         }
+   };
 
 // Provide type safety.
 constexpr size_t MAX_CONNECTION_ID_LENGTH = QUICHE_MAX_CONN_ID_LEN;
@@ -255,39 +290,59 @@ private:
     constexpr static size_t READ_QUEUE_SIZE = 212992;
 
 private:
-    udp_channel         _channel;
+    int socket_fd;
     future<>            _write_fiber;
     future<>            _read_fiber;
     queue<send_payload> _write_queue;
-    queue<udp_datagram> _read_queue;
-    bool                _closed;
+    queue<quic_udp_datagram> _read_queue;
+    bool _closed;
 
 public:
     quic_udp_channel_manager()
-    : _channel(make_udp_channel())
-    , _write_fiber(make_ready_future<>())
+    : _write_fiber(make_ready_future<>())
     , _read_fiber(make_ready_future<>())
     , _write_queue(WRITE_QUEUE_SIZE) // TODO: decide on what packet qs size to use
     , _read_queue(READ_QUEUE_SIZE)
-    , _closed(false) {}
+    , _closed(false) {
+        socket_fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+        // mark socket as non-blocking
+        int flags = ::fcntl(socket_fd, F_GETFL, 0);
+        ::fcntl(socket_fd, F_SETFL, flags | O_NONBLOCK);
+    }
     
     explicit quic_udp_channel_manager(socket_address sa)
-    : _channel(make_udp_channel(sa))
-    , _write_fiber(make_ready_future<>())
+    : _write_fiber(make_ready_future<>())
     , _read_fiber(make_ready_future<>())
     , _write_queue(WRITE_QUEUE_SIZE) // TODO: decide on what packet qs size to use
     , _read_queue(READ_QUEUE_SIZE)
-    , _closed(false) {}
+    , _closed(false) {
+        socket_fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+        // mark socket as non-blocking
+        int flags = ::fcntl(socket_fd, F_GETFL, 0);
+        ::fcntl(socket_fd, F_SETFL, flags | O_NONBLOCK);
+        ::bind(socket_fd, (struct sockaddr *)&sa.as_posix_sockaddr(), sa.length());
+    }
 
     [[nodiscard]] socket_address local_address() const {
-        return _channel.local_address();
+        // use getsockname
+        ::sockaddr_storage storage;
+        ::socklen_t len = sizeof(storage);
+        ::getsockname(socket_fd, (struct sockaddr *)&storage, &len);
+
+        // get inet_address
+        ::in_addr i = ((struct sockaddr_in *)&storage)->sin_addr;
+        ::in_port_t p = ((struct sockaddr_in *)&storage)->sin_port;
+
+        inet_address addr(i);
+
+        return socket_address(addr, p);
     }
 
     future<> send(send_payload&& payload) {
         return _write_queue.push_eventually(std::move(payload));
     }
 
-    future<udp_datagram> read() {
+    future<quic_udp_datagram> read() {
         return _read_queue.pop_eventually();
     }
 
@@ -298,10 +353,10 @@ public:
 
     future<> close() {
         _closed = true;
-        _channel.shutdown_input();
+        // _channel.shutdown_input();
         return _read_fiber.handle_exception([this] (const std::exception_ptr &e) {
-            return _write_fiber.handle_exception([this] (const std::exception_ptr &e) {
-                _channel.close();
+            return _write_fiber.handle_exception([] (const std::exception_ptr &e) {
+                // _channel.close();
                 return make_ready_future<>();
             });
         });
@@ -315,16 +370,51 @@ public:
 private:
     future<> read_loop() {
         return do_until([this] { return _closed; }, [this] {
-            return _channel.receive().then([this] (udp_datagram datagram) {
-                return _read_queue.push_eventually(std::move(datagram));
-            });
+            // Read from the posix socket
+            char buf[65536];
+            ::sockaddr_storage src_addr;
+            ::socklen_t src_addr_len = sizeof(src_addr);
+            auto bytes_read = ::recvfrom(socket_fd, buf, sizeof(buf), 0, (struct sockaddr *)&src_addr, &src_addr_len);
+            if (bytes_read <= 0) {
+                // if nothing to read then skip
+                if (errno == EWOULDBLOCK) {
+                    return make_ready_future<>();
+                }
+
+                std::cout << "Error reading from socket, err: " << bytes_read << std::endl;
+                return make_ready_future<>();
+            } else {
+                std::cout << "Received UDP packet\n";
+            }
+
+            // Create packet
+            packet p(buf, bytes_read);
+
+            // Get src and dst
+            auto dst = local_address();
+            ::in_addr i = ((struct sockaddr_in *)&src_addr)->sin_addr;
+            ::in_port_t prt = ntohs(((struct sockaddr_in *)&src_addr)->sin_port);
+            inet_address addr(i);
+            auto src = socket_address(addr, prt);
+
+            // Create quic_udp_datagram
+            quic_udp_datagram datagram(dst, src, std::move(p));
+
+            // Push datagram on read queue
+            return _read_queue.push_eventually(std::move(datagram));
         });
     }
 
     future<> write_loop() {
         return do_until([this] { return _closed; }, [this] {
             return _write_queue.pop_eventually().then([this] (send_payload payload) {
-                return _channel.send(payload.dst, std::move(payload.buffer));
+                // Send via posix socket
+                auto bytes_sent = ::sendto(socket_fd, payload.buffer.get(), payload.buffer.size(), 0, (struct sockaddr *)&payload.dst.as_posix_sockaddr(), payload.dst.length());
+                if (bytes_sent < 0) {
+                    std::cerr << "Error sending packet: " << strerror(errno) << std::endl;
+                } else {
+                    std::cout << "Sent UDP packet\n";
+                }
             });
         });
     }
@@ -407,7 +497,7 @@ public:
 
     future<> quic_flush();
     future<> init();
-    void receive(udp_datagram&& datagram);
+    void receive(quic_udp_datagram&& datagram);
     bool is_established();
     bool is_closed();
     future<> write(temporary_buffer<char> tb, std::uint64_t stream_id);
@@ -574,8 +664,8 @@ future<> quic_connection<Socket>::init() {
 
 
 template <typename Socket>
-void quic_connection<Socket>::receive(udp_datagram&& datagram) {
-    auto* fa = datagram.get_data().fragment_array();
+void quic_connection<Socket>::receive(quic_udp_datagram&& datagram) {
+    auto* fa = datagram.get_packet().fragment_array();
     const quiche_recv_info recv_info = {
             .from       = &_peer_address.as_posix_sockaddr(),
             .from_len   = sizeof(_peer_address.as_posix_sockaddr()),
@@ -861,15 +951,15 @@ public:
     future<> handle_connection_closing();
 
 private:
-    future<> handle_datagram(udp_datagram&& datagram);
-    future<> handle_post_hs_connection(const lw_shared_ptr<server_connection_t>& connection, udp_datagram&& datagram);
+    future<> handle_datagram(quic_udp_datagram&& datagram);
+    future<> handle_post_hs_connection(const lw_shared_ptr<server_connection_t>& connection, quic_udp_datagram&& datagram);
     // TODO: Change this function to something proper, less C-like.
     static bool validate_token(const uint8_t* token, size_t token_len, const ::sockaddr_storage* addr,
             ::socklen_t addr_len, uint8_t* odcid, size_t* odcid_len);
     // TODO: Check if we cannot provide const references here instead.
-    future<> handle_pre_hs_connection(quic_header_info& header_info, udp_datagram&& datagram, connection_id& key);
-    future<> negotiate_version(const quic_header_info& header_info, udp_datagram&& datagram);
-    future<> quic_retry(const quic_header_info& header_info, udp_datagram&& datagram);
+    future<> handle_pre_hs_connection(quic_header_info& header_info, quic_udp_datagram&& datagram, connection_id& key);
+    future<> negotiate_version(const quic_header_info& header_info, quic_udp_datagram&& datagram);
+    future<> quic_retry(const quic_header_info& header_info, quic_udp_datagram&& datagram);
     static header_token<> mint_token(const quic_header_info& header_info, const ::sockaddr_storage* addr, ::socklen_t addr_len);
     connection_id generate_new_cid();
 };
@@ -894,7 +984,7 @@ future<> quic_server_socket_quiche_impl::service_loop() {
             connection->send_outstanding_data_in_streams_if_possible();
         }
 
-        return _channel_manager->read().then([this] (udp_datagram datagram) {
+        return _channel_manager->read().then([this] (quic_udp_datagram datagram) {
             return handle_datagram(std::move(datagram));
         });
     });
@@ -917,10 +1007,10 @@ socket_address quic_server_socket_quiche_impl::local_address() const {
     return _channel_manager->local_address();
 }
 
-future<> quic_server_socket_quiche_impl::handle_datagram(udp_datagram&& datagram) {
+future<> quic_server_socket_quiche_impl::handle_datagram(quic_udp_datagram&& datagram) {
     quic_header_info header_info;
 
-    const auto* fa = datagram.get_data().fragment_array();
+    const auto* fa = datagram.get_packet().fragment_array();
     std::memcpy(_buffer.data(), fa->base, fa->size);
 
     connection_id key;
@@ -955,7 +1045,7 @@ future<> quic_server_socket_quiche_impl::handle_datagram(udp_datagram&& datagram
 }
 
 future<> quic_server_socket_quiche_impl::handle_post_hs_connection(const lw_shared_ptr<server_connection_t>& connection, 
-                                                                  udp_datagram&& datagram) {
+                                                                  quic_udp_datagram&& datagram) {
     connection->receive(std::move(datagram));
     return connection->quic_flush();
 }
@@ -987,7 +1077,7 @@ bool quic_server_socket_quiche_impl::validate_token(const uint8_t* token, size_t
     return true;
 }
 
-future<> quic_server_socket_quiche_impl::handle_pre_hs_connection(quic_header_info& header_info, udp_datagram&& datagram, connection_id& key) {
+future<> quic_server_socket_quiche_impl::handle_pre_hs_connection(quic_header_info& header_info, quic_udp_datagram&& datagram, connection_id& key) {
     if (!quiche_version_is_supported(header_info.version)) {
         fmt::print("Negotiating the version...\n");
         return negotiate_version(header_info, std::move(datagram));
@@ -1073,7 +1163,7 @@ future<> quic_server_socket_quiche_impl::handle_pre_hs_connection(quic_header_in
 }
 
 
-future<> quic_server_socket_quiche_impl::negotiate_version(const quic_header_info& header_info, udp_datagram&& datagram) {
+future<> quic_server_socket_quiche_impl::negotiate_version(const quic_header_info& header_info, quic_udp_datagram&& datagram) {
     const auto written = quiche_negotiate_version(
         header_info.scid.data,
         header_info.scid.length,
@@ -1098,7 +1188,7 @@ future<> quic_server_socket_quiche_impl::negotiate_version(const quic_header_inf
 }
 
 
-future<> quic_server_socket_quiche_impl::quic_retry(const quic_header_info& header_info, udp_datagram&& datagram) {
+future<> quic_server_socket_quiche_impl::quic_retry(const quic_header_info& header_info, quic_udp_datagram&& datagram) {
     const auto addr = datagram.get_src().as_posix_sockaddr();
     const auto* peer_addr = reinterpret_cast<const ::sockaddr_storage*>(&addr);
     // TODO: Changing this to `datagram.get_src().length()`, which, to my understanding, should be
@@ -1252,7 +1342,7 @@ future<> quic_client_socket::receive_loop() {
 
 
 future<> quic_client_socket::receive() {
-    return _channel_manager->read().then([this](udp_datagram&& datagram) {
+    return _channel_manager->read().then([this](quic_udp_datagram&& datagram) {
         _connection->receive(std::move(datagram));
 
         if (_connection->is_closed()) {
