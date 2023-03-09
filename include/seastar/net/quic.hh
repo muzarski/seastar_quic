@@ -48,11 +48,13 @@ struct quic_connection_config {
     uint64_t            max_connection_window               = 24'000'000;
 };
 
+using quic_stream_id = uint64_t;
+
 class quic_connected_socket_impl {
 public:
     virtual ~quic_connected_socket_impl() {}
-    virtual data_source source(std::uint64_t id) = 0;
-    virtual data_sink sink(std::uint64_t id) = 0;
+    virtual data_source source(quic_stream_id id) = 0;
+    virtual data_sink sink(quic_stream_id id) = 0;
     virtual future<> close() = 0;
 };
 
@@ -62,8 +64,8 @@ private:
 
 public:
     explicit quic_connected_socket(std::unique_ptr<quic_connected_socket_impl> impl) noexcept : _impl(std::move(impl)) {}
-    input_stream<char> input(std::uint64_t id);
-    output_stream<char> output(std::uint64_t id, size_t buffer_size = 8192);
+    input_stream<char> input(quic_stream_id id);
+    output_stream<char> output(quic_stream_id id, size_t buffer_size = 8192);
     future<> close();
 };
 

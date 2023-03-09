@@ -19,6 +19,7 @@
 #include <seastar/net/quic.hh>
 
 #include <seastar/core/future.hh>
+#include <seastar/core/shared_future.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/core/queue.hh>
@@ -29,9 +30,12 @@
 
 #include <quiche.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>      // std::memset, etc.
+#include <optional>
 #include <random>       // Generating connection IDs
+#include <queue>
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
@@ -75,19 +79,19 @@ private:
 
 public:
     quiche_configuration() = delete;
-    quiche_configuration(quiche_configuration &other) = delete;
+    quiche_configuration(quiche_configuration& other) = delete;
     quiche_configuration& operator=(quiche_configuration &other) = delete;
 
-    quiche_configuration(quiche_configuration &&other) noexcept {
-        _config = std::exchange(other._config, nullptr);
-    }
+    quiche_configuration(quiche_configuration&& other) noexcept
+    : _config(std::exchange(other._config, nullptr))
+    {}
 
-    quiche_configuration& operator=(quiche_configuration &&other) noexcept {
+    quiche_configuration& operator=(quiche_configuration&& other) noexcept {
         _config = std::exchange(other._config, nullptr);
         return *this;
     }
 
-    explicit quiche_configuration(const quic_connection_config &config)
+    explicit quiche_configuration(const quic_connection_config& config)
     : _config(quiche_config_new(QUICHE_PROTOCOL_VERSION))
     {
         if (!_config) {
@@ -129,7 +133,7 @@ public:
             const quic_connection_config& config)
     : quiche_configuration(config)
     {
-        const auto handle_quiche_err = [&](auto return_code, const auto &msg) {
+        const auto handle_quiche_err = [&](auto return_code, const auto& msg) {
             constexpr decltype(return_code) OK_CODE = 0;
             if (return_code != OK_CODE) {
                 // TODO: For the time being, to make development a bit easier.
@@ -232,15 +236,23 @@ namespace {
 //=====================
 
 
-struct send_payload {
-    temporary_buffer<char>  buffer;
-    socket_address          dst;
+template<typename T>
+using quic_buffer_template = temporary_buffer<T>;
 
-    send_payload(const char* buf, size_t size, const socket_address& sa)
+template<typename ByteType>
+struct send_payload_template {
+    static_assert(sizeof(ByteType) == 1);
+
+    quic_buffer_template<ByteType>  buffer;
+    socket_address                  dst;
+
+    send_payload_template() = default;
+
+    send_payload_template(const ByteType* buf, size_t size, const socket_address& sa)
     : buffer(buf, size)
     , dst(sa) {}
 
-    send_payload(const char* buf, size_t size, const ::sockaddr_storage &dest, ::socklen_t dest_len)
+    send_payload_template(const ByteType* buf, size_t size, const ::sockaddr_storage &dest, ::socklen_t dest_len)
     : buffer(buf, size)
     {
         ::sockaddr_in addr_in{};
@@ -249,10 +261,14 @@ struct send_payload {
     }
 };
 
+using quic_byte_type = char;
+using quic_buffer    = quic_buffer_template<quic_byte_type>;
+using send_payload   = send_payload_template<quic_byte_type>;
+
 class quic_udp_channel_manager {
 private:
-    constexpr static size_t WRITE_QUEUE_SIZE = 212992;
-    constexpr static size_t READ_QUEUE_SIZE = 212992;
+    constexpr static size_t WRITE_QUEUE_SIZE = 212'992;
+    constexpr static size_t READ_QUEUE_SIZE  = 212'992;
 
 private:
     udp_channel         _channel;
@@ -299,8 +315,8 @@ public:
     future<> close() {
         _closed = true;
         _channel.shutdown_input();
-        return _read_fiber.handle_exception([this] (const std::exception_ptr &e) {
-            return _write_fiber.handle_exception([this] (const std::exception_ptr &e) {
+        return _read_fiber.handle_exception([this] (const std::exception_ptr& e) {
+            return _write_fiber.handle_exception([this] (const std::exception_ptr& e) {
                 _channel.close();
                 return make_ready_future<>();
             });
@@ -331,67 +347,231 @@ private:
 };
 
 
-// TODO: If you think this is a good idea,
-// create a CRTP struct for static polymorphism for
-// the server and client structures. They share the same
-// interface, so that will reduce code duplication
-// with no performance loss (due to the compiler's optimizations).
 
-
-class quic_server_socket_quiche_impl;
-class quic_client_socket;
-
-//====================
-//....................
-//....................
-// QUIC connection
-//....................
-//....................
-//====================
-
-
-template <typename Socket>
+template<typename Socket>
 class quic_connection {
 private:
-    friend class quic_client_socket;
-    friend class quic_server_socket_quiche_impl;
+    constexpr static size_t STREAM_READ_QUEUE_SIZE = 10'000;
+
+    // Type of the timer responsible for timeout events.
+    using timeout_timer = timer<std::chrono::steady_clock>;
+    // Type of the timer responsible for sending data (pacing).
+    using send_timer    = timer<std::chrono::steady_clock>;
+
+    using timeout_clock = typename timeout_timer::clock;
+    using send_clock    = typename send_timer::clock;
+
+    using timeout_time_point    = typename timeout_timer::time_point;
+    using timeout_time_duration = typename timeout_timer::duration;
+    using send_time_point       = typename send_timer::time_point;
+    using send_time_duration    = typename send_timer::duration;
 
 private:
-    constexpr static size_t STREAM_READ_QUEUE_SIZE = 10000;
+    // Acceptable error when sending out packets. We use this to avoid
+    // situations when the send timer needs to constantly call the callback
+    // with very short breaks in between. Instead, we send everything
+    // that ought to be sent within the span `[now, now + SEND_TIME_EPSILON]`.
+    constexpr static send_time_duration SEND_TIME_EPSILON = std::chrono::nanoseconds(20);
 
 private:
-    quiche_conn*                                                          _connection;
-    std::vector<char>                                                     _buffer;
-    std::unordered_map<std::uint64_t, queue<temporary_buffer<char>>>      _read_queues;
-    std::unordered_map<std::uint64_t, std::deque<temporary_buffer<char>>> _write_queues;
-    std::unordered_map<std::uint64_t, promise<>>                          _writable_promises;
-    promise<>                                                             _readable;
-    lw_shared_ptr<Socket>                                                 _socket;
-    socket_address                                                        _local_address;
-    socket_address                                                        _peer_address;
-    timer<std::chrono::steady_clock>                                      _timeout_timer;
-    future<>                                                              _stream_recv_fiber;
-    bool                                                                  _closing = false;
+    // Payload with a timestamp when the data should be send.
+    // Its purpose is to cooperate with timers and provide pacing.
+    struct paced_payload {
+    private:
+        // When to send the data.
+        send_time_point time;
+    
+    public:
+        // Data to be sent.
+        send_payload    payload;
 
-public:
-    bool                                                                  _read_future_resolved = false;
+        paced_payload(send_payload spl, const send_time_point& t)
+        : time(t)
+        , payload(std::move(spl))
+        {}
+
+        bool operator<(const paced_payload& other) const noexcept {
+            return time < other.time;
+        }
+
+        bool operator<(const send_time_point& stp) const noexcept {
+            return time < stp;
+        }
+
+        friend bool operator<(const send_time_point& stp, const paced_payload& pp) noexcept {
+            return stp < pp.time;
+        }
+
+        bool operator>(const paced_payload& other) const noexcept {
+            return time > other.time;
+        }
+
+        const auto& get_time() const noexcept {
+            return time;
+        }
+    };
+
+    struct quic_stream {
+    public:
+        // Data to be read from the stream.
+        queue<quic_buffer>              read_queue = queue<quic_buffer>(STREAM_READ_QUEUE_SIZE);
+        // Data to be sent via the stream.
+        std::deque<quic_buffer>         write_queue;
+        // A field used for providing the user of the API
+        // with the information when they will be able to
+        // send data via the stream again (by producing
+        // a `shared_future` from the `shared_promise`)
+        // -- the future will only hold a value when
+        // they can send data via the stream again.
+        //
+        // The value of the field is normally equal
+        // to `std::nullopt` except when the stream
+        // is cluttered and cannot accept more data,
+        // in which case it holds a promise.
+        std::optional<shared_promise<>> maybe_writable = std::nullopt;
+    };
+
+    // Class providing a way to mark data if there is some data
+    // to be processed by the streams.
+    class read_marker {
+    private:
+        // A `promise<>` used for generating `future<>`s to provide
+        // a means to mark if there may be some data to be processed by
+        // the streams, and to check the marker.
+        shared_promise<>    _readable         = shared_promise<>{};
+        // Equals to `true` if and only if the promise `_readable`
+        // has been assigned a value.
+        bool                _promise_resolved = false;
+    
+    public:
+        decltype(auto) get_shared_future() const noexcept {
+            return _readable.get_shared_future();
+        }
+
+        void mark_as_ready() noexcept {
+            if (!_promise_resolved) {
+                _readable.set_value();
+                _promise_resolved = true;
+            }
+        }
+
+        void reset() noexcept {
+            if (_promise_resolved) {
+                _readable = shared_promise<>{};
+                _promise_resolved = false;
+            }
+        }
+    };
+
+    // A wrapper over bool to prevent setting the value back to `false`
+    // once an instance of `quic_connection` has been marked as closing.
+    // Doing that could cause a lot of problems as some loops could have
+    // already been stopped, but some other not. It's undefined what should
+    // happen in that case, so it's better to ban it altogether.
+    class closing_marker {
+    private:
+        bool _closing = false;
+    
+    public:
+        void mark_as_closing() noexcept { _closing = true; }
+        operator bool() const noexcept { return _closing; }
+    };
+
+    // An extension of `std::priority_queue` to provide a means to move an element out of it.
+    template<typename T, typename Container = std::vector<T>, typename Compare = std::greater<T>>
+    class send_queue_template : public std::priority_queue<T, Container, Compare> {
+    public:
+        T fetch_top() {
+            using super_type = std::priority_queue<T, Container, Compare>;
+
+            std::pop_heap(super_type::c.begin(), super_type::c.end(), super_type::comp);
+            T result = std::move(super_type::c.back());
+            super_type::c.pop_back();
+            return result;
+        }
+    };
+
+    // The type of the container storing packets waiting to be sent
+    // to the network.
+    //
+    // TODO: Investigate if Quiche specifies the timestamps
+    // the library gives are always order in the non-decreasing order.
+    // If that's the case, replace this with something more efficient,
+    // for example with `std::queue`.
+    using send_queue = send_queue_template<paced_payload>;
 
 private:
+    // The Quiche connection instance corresponding to a particular `quic_connection`.
+    // If `_connection` is equal to `nullptr`, the connection has already been invalidated
+    // and no further clean-up is needed.
+    quiche_conn*                                    _connection;
+    // The socket via which communication with the network is performed.
+    lw_shared_ptr<Socket>                           _socket;
+    std::vector<quic_byte_type>                     _buffer;
+
+    const socket_address                            _peer_address;
+
+    std::unordered_map<quic_stream_id, quic_stream> _streams;
+
+    send_timer                                      _send_timer;
+    timeout_timer                                   _timeout_timer;
+
+    // Data to be sent to the peer.
+    //
+    // Invariant: data is ordered in the non-decreasing order
+    //            in regard to the expected time it should be sent.
+    send_queue                                      _send_queue;
+
+    future<>                                        _stream_recv_fiber;
+    read_marker                                     _read_marker;
+
+    // Set to `true` when requested by the user to be closed
+    // or when the destructor has been called. Set to `false` otherwise.
+    closing_marker                                  _closing_marker;
+
+private:
+    bool is_closing() const noexcept;
     future<> stream_recv_loop();
-    future<> wait_send_available(std::uint64_t stream_id);
-    void send_outstanding_data_in_streams_if_possible();
+    future<> wait_send_available(quic_stream_id stream_id);
 
 public:
-    quic_connection(quiche_conn* connection, const lw_shared_ptr<Socket>& socket,
-                           socket_address la, socket_address pa)
-            : _connection(connection)
-            , _buffer(MAX_DATAGRAM_SIZE)
-            , _socket(socket)
-            , _local_address(la)
-            , _peer_address(pa)
-            , _timeout_timer()
-            , _stream_recv_fiber(make_ready_future<>())
+    // TODO: Might be deleted later on. Right now the default constructor
+    // is present to make development easier.
+    quic_connection() = default;
+
+    quic_connection(quiche_conn* connection, lw_shared_ptr<Socket> socket, const socket_address& pa)
+    : _connection(connection)
+    , _socket(socket)
+    , _buffer(MAX_DATAGRAM_SIZE)
+    , _peer_address(pa)
+    , _send_timer()
+    , _timeout_timer()
+    , _stream_recv_fiber(make_ready_future<>())
     {}
+
+    quic_connection(const quic_connection&) = delete;
+    quic_connection& operator=(const quic_connection&) = delete;
+
+    quic_connection(quic_connection&& other)
+    : _connection(std::exchange(other._connection, nullptr))
+    , _socket(other.socket)
+    , _buffer(std::move(other._buffer))
+    , _peer_address(other._peer_address)
+    , _send_timer(std::move(other._send_timer))
+    , _timeout_timer(std::move(other._timeout_timer))
+    , _send_queue(std::move(other._send_queue))
+    , _stream_recv_fiber(std::move(other._stream_recv_fiber))
+    , _read_marker(std::move(other._read_marker))
+    , _closing_marker(other._closing_marker)
+    {}
+
+    quic_connection& operator=(quic_connection&& other) {
+        if (this != std::addressof(other)) {
+            this->~quic_connection();
+            new (this) quic_connection {std::move(other)};
+        }
+        return *this;
+    }
 
     ~quic_connection() {
         // TODO: Right now, this destructor is more proof-of-concept-like
@@ -405,25 +585,261 @@ public:
         }
     }
 
-    future<> quic_flush();
+    // Initializes the callbacks and loops.
     future<> init();
+    
+    // Pass a datagram to process by the connection.
     void receive(udp_datagram&& datagram);
-    bool is_established();
-    bool is_closed();
-    future<> write(temporary_buffer<char> tb, std::uint64_t stream_id);
-    future<temporary_buffer<char>> read(std::uint64_t stream_id);
+    
+    // Send a message via a stream.
+    future<> write(quic_buffer qb, quic_stream_id stream_id);
+    // Read a message from a stream.
+    future<quic_buffer> read(quic_stream_id stream_id);
+
+    bool is_established() const noexcept;
+    bool is_closed() const noexcept;
+
+    void send_outstanding_data_in_streams_if_possible();
+    future<> quic_flush();
+
     future<> close();
 };
 
+template<typename Socket>
+bool quic_connection<Socket>::is_closing() const noexcept {
+    return quiche_conn_is_closed(_connection) || _closing_marker;
+}
+
+template<typename Socket>
+future<> quic_connection<Socket>::stream_recv_loop() {
+    return do_until([this] { return is_closing(); }, [this] {
+        return _read_marker.get_shared_future().then([this] {
+            quic_stream_id stream_id;
+            auto iter = quiche_conn_readable(_connection);
+            
+            while (quiche_stream_iter_next(iter, &stream_id)) {
+                auto& stream = _streams[stream_id];
+
+                while (quiche_conn_stream_readable(_connection, stream_id)) {
+                    bool fin = false;
+                    const auto recv_result = quiche_conn_stream_recv(
+                        _connection,
+                        stream_id,
+                        reinterpret_cast<uint8_t*>(_buffer.data()),
+                        _buffer.size(),
+                        &fin
+                    );
+
+                    if (recv_result < 0) {
+                        // TODO: Handle this properly.
+                        fmt::print(stderr, "Reading from a stream has failed with message: {}\n", recv_result);
+                    } else {
+                        quic_buffer message{_buffer.data(), static_cast<size_t>(recv_result)};
+                        // TODO: Wrap this in some kind of `not_full` future
+                        // (or just read only when necessary).
+                        // TODO2: Learn more about exceptions that might be thrown here.
+                        stream.read_queue.push(std::move(message));
+
+                        if (fin) {
+                            quiche_conn_stream_send(_connection, stream_id, nullptr, 0, true);
+                            // Push the empty buffer (interpreted as EOF).
+                            stream.read_queue.push({});
+                        }
+                    }
+                }
+            }
+
+            quiche_stream_iter_free(iter);
+
+            if (!quiche_conn_is_readable(_connection)) {
+                _read_marker.reset();
+            }
+
+            return quic_flush();
+        });
+    });
+}
+
+template<typename Socket>
+future<> quic_connection<Socket>::wait_send_available(quic_stream_id stream_id) {
+    if (quiche_conn_stream_capacity(_connection, stream_id) > 0) {
+        return make_ready_future<>();
+    } else {
+        auto& stream = _streams[stream_id];
+        if (!stream.maybe_writable.has_value()) {
+            stream.maybe_writable = shared_promise<>{};
+        }
+        return stream.maybe_writable->get_shared_future();
+    }
+}
+
+template<typename Socket>
+future<> quic_connection<Socket>::init() {
+    _send_timer.set_callback([this] {
+        (void) repeat([this] {
+            if (_send_queue.empty()) {
+                return make_ready_future<stop_iteration>(stop_iteration::yes);
+            }
+
+            const send_time_point now = send_clock::now();
+            const send_time_point& send_time = _send_queue.top().get_time();
+
+            if (_send_queue.top().get_time() <= now + SEND_TIME_EPSILON) {
+                // It is time to send the packet from the front of the queue.
+                auto payload = std::move(_send_queue.fetch_top().payload);
+                return _socket->send(std::move(payload)).then([] {
+                    return make_ready_future<stop_iteration>(stop_iteration::no);
+                });
+            } else {
+                // No more packets should be sent now.
+                _send_timer.rearm(send_time);
+                return make_ready_future<stop_iteration>(stop_iteration::yes);
+            }
+        });
+    });
+
+    _timeout_timer.set_callback([this] {
+        quiche_conn_on_timeout(_connection);
+        (void) quic_flush();
+    });
+
+    _stream_recv_fiber = stream_recv_loop();
+
+    // The client side of a connection ought to flush after initialization.
+    return quic_flush();
+}
+
+template<typename Socket>
+void quic_connection<Socket>::receive(udp_datagram&& datagram) {
+    fmt::print(stderr, "Quic conn receive\n");
+    auto* fa = datagram.get_data().fragment_array();
+    auto pa = _peer_address.as_posix_sockaddr();
+    auto la = _socket->local_address().as_posix_sockaddr();
+
+    const quiche_recv_info recv_info = {
+        .from       = &pa,
+        .from_len   = sizeof(pa),
+        .to         = &la,
+        .to_len     = sizeof(la)
+    };
+
+    const auto recv_result = quiche_conn_recv(
+        _connection,
+        reinterpret_cast<uint8_t*>(fa->base),
+        fa->size,
+        &recv_info
+    );
+
+    if (recv_result < 0) {
+        fmt::print(stderr, "Failed to process a QUIC packet. Return value: {}\n", recv_result);
+    } else if (quiche_conn_is_readable(_connection)) {
+        _read_marker.mark_as_ready();
+    }
+}
+
+template<typename Socket>
+[[maybe_unused]] future<> quic_connection<Socket>::write(quic_buffer qb, quic_stream_id stream_id) {
+    const auto written = quiche_conn_stream_send(
+        _connection,
+        stream_id,
+        reinterpret_cast<const uint8_t*>(qb.get()),
+        qb.size(),
+        false
+    );
+
+    if (written < 0) {
+        // TODO: Handle the error.
+        fmt::print("[Write] Writing to a stream has failed with message: {}\n", written);
+    }
+
+    if (!std::cmp_equal(written, qb.size())) {
+        qb.trim_front(written);
+        // TODO: Can a situation like this happen that Quiche keeps track
+        // of a stream but we don't store it in the map? Investigate it.
+        // In such a case, we should catch an exception here and report it.
+        auto& stream = _streams[stream_id];
+        stream.write_queue.push_front(std::move(qb));
+    } 
+    
+    (void) quic_flush();
+    return wait_send_available(stream_id);
+}
+
+template<typename Socket>
+future<quic_buffer> quic_connection<Socket>::read(quic_stream_id stream_id) {
+    auto& stream = _streams[stream_id];
+    return stream.read_queue.pop_eventually();
+}
+
+template<typename Socket>
+bool quic_connection<Socket>::is_established() const noexcept {
+    return quiche_conn_is_established(_connection);
+}
+
+template<typename Socket>
+bool quic_connection<Socket>::is_closed() const noexcept {
+    return quiche_conn_is_closed(_connection);
+}
 
 template <typename Socket>
+void quic_connection<Socket>::send_outstanding_data_in_streams_if_possible() {
+    quiche_stream_iter* iter = quiche_conn_writable(_connection);
+    quic_stream_id stream_id;
+
+    while (quiche_stream_iter_next(iter, &stream_id)) {
+        auto& stream = _streams[stream_id];
+        auto& queue = stream.write_queue;
+
+        while (!queue.empty()) {
+            auto qb = std::move(queue.front());
+            queue.pop_front();
+
+            const auto written = quiche_conn_stream_send(
+                    _connection,
+                    stream_id,
+                    reinterpret_cast<const uint8_t*>(qb.get()),
+                    qb.size(),
+                    false
+            );
+
+            if (written < 0) {
+                // TODO: Handle quiche error.
+                fmt::print("[Send outstanding] Writing to a stream has failed with message: {}\n", written);
+            }
+
+            if (!std::cmp_equal(written, qb.size())) {
+                qb.trim_front(static_cast<size_t>(written));
+                queue.push_front(std::move(qb));
+                break;
+            }
+        }
+
+        if (quiche_conn_stream_capacity(_connection, stream_id) > 0) {
+            if (stream.maybe_writable) {
+                stream.maybe_writable->set_value();
+                stream.maybe_writable = std::nullopt;
+            }
+        }
+    }
+    quiche_stream_iter_free(iter);
+}
+
+template<typename Socket>
 future<> quic_connection<Socket>::quic_flush() {
-    // TODO: Is it really a good idea to allocate this statically?
+    // TODO: Why not use `_buffer` instead?
     static uint8_t out[MAX_DATAGRAM_SIZE];
 
     return repeat([this] {
-        quiche_send_info send_info;
+        // Converts a time point stored as `timespec` to `send_time_point`.
+        constexpr auto get_send_time = [](const timespec& at) constexpr noexcept -> send_time_point {
+            return static_cast<send_time_point>(
+                std::chrono::duration_cast<send_time_duration>(
+                    std::chrono::seconds(at.tv_sec) + std::chrono::nanoseconds(at.tv_nsec)
+                )
+            );
+        };
 
+        quiche_send_info send_info;
         const auto written = quiche_conn_send(_connection, out, sizeof(out), &send_info);
 
         if (written == QUICHE_ERR_DONE) {
@@ -434,233 +850,44 @@ future<> quic_connection<Socket>::quic_flush() {
             throw std::runtime_error("Failed to create a packet.");
         }
 
-        // TODO: Handle pacing.
         send_payload payload(reinterpret_cast<char*>(out), written, send_info.to, send_info.to_len);
-        return _socket->send(std::move(payload)).then([] {
-            return make_ready_future<stop_iteration>(stop_iteration::no);
-        });
+        const auto send_time = get_send_time(send_info.at);
+
+        _send_queue.push(paced_payload {std::move(payload), send_time});
+        if (_send_queue.size() == 1 || send_time < _send_queue.top()) {
+            _send_timer.rearm(send_time);
+        }
+
+        return make_ready_future<stop_iteration>(stop_iteration::no);
     }).then([this] {
-        const auto timeout = static_cast<int64_t>(quiche_conn_timeout_as_millis(_connection));
+        const auto timeout = static_cast<std::int64_t>(quiche_conn_timeout_as_millis(_connection));
         if (timeout >= 0) {
-            _timeout_timer.rearm(std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout));
+            _timeout_timer.rearm(timeout_clock::now() + std::chrono::milliseconds(timeout));
         }
         return make_ready_future<>();
     });
 }
 
-
-template <typename Socket>
-future<> quic_connection<Socket>::stream_recv_loop() {
-    return do_until([this] () { return quiche_conn_is_closed(_connection) || _closing; }, [this] {
-        return _readable.get_future().then([this] {
-            std::uint64_t stream_id;
-            auto iter = quiche_conn_readable(_connection);
-            while (quiche_stream_iter_next(iter, &stream_id)) {
-                while(quiche_conn_stream_readable(_connection, stream_id)) {
-                    bool fin = false;
-                    const auto recv_result = quiche_conn_stream_recv(
-                            _connection,
-                            stream_id,
-                            reinterpret_cast<uint8_t*>(_buffer.data()),
-                            _buffer.size(),
-                            &fin
-                    );
-
-                    if (recv_result < 0) {
-                        fmt::print("Reading from a stream has failed with message: {}\n", recv_result);
-                        // TODO: Handle this properly.
-                    } else {
-                        temporary_buffer<char> message(_buffer.data(), recv_result);
-                        // TODO: wrap this in some kind of `not_full` future.
-                        // (or just read only when necessary)
-                        auto pushed = _read_queues.try_emplace(stream_id, STREAM_READ_QUEUE_SIZE).first->second.push(std::move(message));
-                        if (!pushed) {
-                            fmt::print("The read queue is full. Dropping the message.\n");
-                        }
-
-                        /* TODO: Handle the message properly when fin == true.
-                                Right now we only send an empty FIN message to the endpoint. */
-                        if (fin) {
-                            quiche_conn_stream_send(_connection, stream_id, nullptr, 0, true);
-                            // Push the empty buffer (interpreted as EOF).
-                            pushed = _read_queues.try_emplace(stream_id, STREAM_READ_QUEUE_SIZE).first->second.push({});
-                            if (!pushed) {
-                                fmt::print("The read queue is full. Dropping the message.\n");
-                            }
-                        }
-                    }
-                }
-            }
-            quiche_stream_iter_free(iter);
-
-            if (!quiche_conn_is_readable(_connection)) {
-                _readable = promise<>();
-                _read_future_resolved = false;
-            }
-            return make_ready_future<>();
-        });
-    });
-}
-
-template <typename Socket>
-future<> quic_connection<Socket>::wait_send_available(std::uint64_t stream_id) {
-    auto capacity = quiche_conn_stream_capacity(_connection, stream_id);
-    if (capacity > 0) {
-        return make_ready_future<>();
-    }
-    auto inserted_promise = _writable_promises.try_emplace(stream_id, promise<>());
-    return inserted_promise.first->second.get_future();
-}
-
-template <typename Socket>
-void quic_connection<Socket>::send_outstanding_data_in_streams_if_possible() {
-    quiche_stream_iter* iter = quiche_conn_writable(_connection);
-    std::uint64_t stream_id;
-    while (quiche_stream_iter_next(iter, &stream_id)) {
-        auto queue_iter = _write_queues.find(stream_id);
-        if (queue_iter == _write_queues.end()) {
-            continue;
-        }
-        auto& queue = queue_iter->second;
-        while (!queue.empty()) {
-            auto tb = std::move(queue.front());
-            queue.pop_front();
-
-            const auto written = quiche_conn_stream_send(
-                    _connection,
-                    stream_id,
-                    reinterpret_cast<const uint8_t*>(tb.get()),
-                    tb.size(),
-                    false
-            );
-
-            if (written < 0) {
-                // TODO: Handle quiche error.
-                fmt::print("Writing to a stream has failed with message: {}\n", written);
-            }
-
-            size_t actually_written = written > 0 ? written : 0;
-            if (actually_written != tb.size()) {
-                tb.trim_front(actually_written);
-                queue.push_front(std::move(tb));
-                break;
-            }
-        }
-
-        auto stream_capacity = quiche_conn_stream_capacity(_connection, stream_id);
-        if (stream_capacity > 0) {
-            auto stream_promise = _writable_promises.find(stream_id);
-            if (stream_promise != _writable_promises.end()) {
-                stream_promise->second.set_value();
-                _writable_promises.erase(stream_promise);
-            }
-        }
-    }
-    quiche_stream_iter_free(iter);
-}
-
-template <typename Socket>
-future<> quic_connection<Socket>::init() {
-    _timeout_timer.set_callback([this] {
-        quiche_conn_on_timeout(_connection);
-        (void) quic_flush();
-    });
-
-    _stream_recv_fiber = stream_recv_loop();
-
-    // A client ought to flush after the initialization.
-    return quic_flush();
-}
-
-
-template <typename Socket>
-void quic_connection<Socket>::receive(udp_datagram&& datagram) {
-    auto* fa = datagram.get_data().fragment_array();
-    const quiche_recv_info recv_info = {
-            .from       = &_peer_address.as_posix_sockaddr(),
-            .from_len   = sizeof(_peer_address.as_posix_sockaddr()),
-            .to         = &_local_address.as_posix_sockaddr(),
-            .to_len     = sizeof(_local_address.as_posix_sockaddr())
-    };
-
-    const auto recv_result = quiche_conn_recv(
-            _connection,
-            reinterpret_cast<uint8_t*>(fa->base),
-            fa->size,
-            &recv_info
-    );
-
-    if (recv_result < 0) {
-        fmt::print(stderr, "Failed to process a QUIC packet. Return value: {}\n", recv_result);
-    }
-}
-
-template <typename Socket>
-bool quic_connection<Socket>::is_established() {
-    return quiche_conn_is_established(_connection);
-}
-
-
-template <typename Socket>
-bool quic_connection<Socket>::is_closed() {
-    return quiche_conn_is_closed(_connection);
-}
-
-
-// TODO: I think that this future should be resolved when stream is writable with necessary amount of bytes.
-// Right now it returns when flushed and we don't do any flow control for the stream.
-template <typename Socket>
-[[maybe_unused]] future<> quic_connection<Socket>::write(temporary_buffer<char> tb, std::uint64_t stream_id) {
-
-    const auto written = quiche_conn_stream_send(
-            _connection,
-            stream_id,
-            reinterpret_cast<const uint8_t*>(tb.get()),
-            tb.size(),
-            false
-    );
-
-    if (written < 0) {
-        // TODO: Handle quiche error.
-        fmt::print("Writing to a stream has failed with message: {}\n", written);
-    }
-
-    size_t actually_written = written > 0 ? written : 0;
-
-    if (actually_written != tb.size()) {
-        tb.trim_front(actually_written);
-        _write_queues.try_emplace(stream_id).first->second.push_back(std::move(tb));
-    }
-
-    (void) quic_flush();
-    return wait_send_available(stream_id);
-}
-
-
-template <typename Socket>
-[[maybe_unused]] future<temporary_buffer<char>> quic_connection<Socket>::read(std::uint64_t stream_id) {
-    return _read_queues.try_emplace(stream_id, STREAM_READ_QUEUE_SIZE).first->second.pop_eventually();
-}
-
-
-template <typename Socket>
+template<typename Socket>
 future<> quic_connection<Socket>::close() {
     if (!quiche_conn_is_closed(_connection)) {
-        quiche_conn_close(_connection, 
-                          true /* user closed connection */,
-                          0,
-                          nullptr,
-                          0);
+        quiche_conn_close(
+            _connection,
+            true, // The user closed the connection.
+            0,
+            nullptr,
+            0
+        );
     }
-    
-    _closing = true;
-    
-    
-    return quic_flush().then([this] () {
+
+    _closing_marker.mark_as_closing();
+
+    return quic_flush().then([this] {
         _timeout_timer.cancel();
-        _readable.set_value();
-        return _stream_recv_fiber.then([this] () {
-            return _socket->handle_connection_closing().then([this] () {
+        _read_marker.mark_as_ready();
+        
+        return _stream_recv_fiber.then([this] {
+            return _socket->handle_connection_closing().then([this] {
                 _socket.release();
             });
         });
@@ -681,10 +908,10 @@ template <typename Socket>
 class quiche_data_source_impl final: public data_source_impl {
 private:
     lw_shared_ptr<quic_connection<Socket>> _conn;
-    std::uint64_t _stream_id;
+    quic_stream_id _stream_id;
 
 public:
-    quiche_data_source_impl(lw_shared_ptr<quic_connection<Socket>> conn, std::uint64_t stream_id)
+    quiche_data_source_impl(lw_shared_ptr<quic_connection<Socket>> conn, quic_stream_id stream_id)
     : _conn(std::move(conn))
     , _stream_id(stream_id) 
     {}
@@ -709,10 +936,10 @@ class quiche_data_sink_impl final: public data_sink_impl {
 private:
     constexpr static size_t BUFFER_SIZE = 65'507;
     lw_shared_ptr<quic_connection<Socket>> _conn;
-    std::uint64_t _stream_id;
+    quic_stream_id _stream_id;
 
 public:
-    quiche_data_sink_impl(lw_shared_ptr<quic_connection<Socket>> conn, std::uint64_t stream_id)
+    quiche_data_sink_impl(lw_shared_ptr<quic_connection<Socket>> conn, quic_stream_id stream_id)
     : _conn(std::move(conn))
     , _stream_id(stream_id) 
     {}
@@ -752,11 +979,11 @@ public:
     explicit quiche_quic_connected_socket_impl(lw_shared_ptr<quic_connection<Socket>> conn) 
     : _conn(std::move(conn)) {}
 
-    data_source source(std::uint64_t id) override {
+    data_source source(quic_stream_id id) override {
         return data_source(std::make_unique<quiche_data_source_impl<Socket>>(_conn, id));
     }
 
-    data_sink sink(std::uint64_t id) override {
+    data_sink sink(quic_stream_id id) override {
         // TODO: implement
         return data_sink(std::make_unique<quiche_data_sink_impl<Socket>>(_conn, id));
     }
@@ -837,7 +1064,6 @@ public:
     explicit quic_server_socket_quiche_impl(const socket_address& sa, const std::string& cert, const std::string& key,
             const quic_connection_config& quic_config)
     : _quiche_configuration(cert, key, quic_config)
-    // , _udp_channel(make_udp_channel(sa))
     , _channel_manager(make_lw_shared<quic_udp_channel_manager>(sa))
     , _buffer(MAX_DATAGRAM_SIZE)
     , _send_queue(make_ready_future<>())
@@ -846,7 +1072,6 @@ public:
     explicit quic_server_socket_quiche_impl(const std::string& cert, const std::string& key,
             const quic_connection_config& quic_config)
     : _quiche_configuration(cert, key, quic_config)
-    // , _udp_channel(make_udp_channel())
     , _channel_manager(make_lw_shared<quic_udp_channel_manager>())
     , _buffer(MAX_DATAGRAM_SIZE)
     , _send_queue(make_ready_future<>())
@@ -882,18 +1107,6 @@ future<> quic_server_socket_quiche_impl::service_loop() {
     // TODO: Consider changing this to seastar::repeat and passing a stop toket to it
     // once the destructor of the class has been called.
     return keep_doing([this] {
-        // TODO: Change this to something more efficient.
-        // If I remember correctly, quiche has some function
-        // returning an iterator over the connections that
-        // have some data to send.
-        for (auto& [_, connection] : _connections) {
-            if (quiche_conn_is_readable(connection->_connection) && !connection->_read_future_resolved) {
-                connection->_readable.set_value();
-                connection->_read_future_resolved = true;
-            }
-            connection->send_outstanding_data_in_streams_if_possible();
-        }
-
         return _channel_manager->read().then([this] (udp_datagram datagram) {
             return handle_datagram(std::move(datagram));
         });
@@ -1051,7 +1264,6 @@ future<> quic_server_socket_quiche_impl::handle_pre_hs_connection(quic_header_in
 
     auto [it, succeeded] = _connections.emplace(key, make_lw_shared<server_connection_t>(connection, 
                                                                                        this->shared_from_this(),
-                                                                                       _channel_manager->local_address(),
                                                                                        datagram.get_src()));
     if (!succeeded) {
         fmt::print("Emplacing a connection has failed.\n");
@@ -1129,7 +1341,7 @@ future<> quic_server_socket_quiche_impl::quic_retry(const quic_header_info& head
     }
 
     send_payload payload(_buffer.data(), written, datagram.get_src());
-    
+
     return _channel_manager->send(std::move(payload));
 }
 
@@ -1198,6 +1410,10 @@ public:
     future<> send(send_payload&& payload);
     future<> handle_connection_closing();
 
+    socket_address local_address() const {
+        return _channel_manager->local_address();
+    }
+
 private:
     future<> receive_loop();
     future<> receive();
@@ -1227,7 +1443,7 @@ future<quic_connected_socket> quic_client_socket::connect(socket_address sa) {
     }
     
     _connection = make_lw_shared<client_connection_t>(connection_ptr, 
-            this->shared_from_this(), la, sa);
+            this->shared_from_this(), sa);
 
     // TODO: Something must clean this up afterwards, most likely `quic_connected_socket`.
     _receive_fiber = receive_loop();
@@ -1263,11 +1479,6 @@ future<> quic_client_socket::receive() {
             _promise_resolved = true;
             _connected_promise.set_value(quic_connected_socket(
                     std::make_unique<quiche_quic_connected_socket_impl<quic_client_socket>>(_connection)));
-        }
-
-        if (quiche_conn_is_readable(_connection->_connection) && !_connection->_read_future_resolved) {
-            _connection->_readable.set_value();
-            _connection->_read_future_resolved = true;
         }
 
         _connection->send_outstanding_data_in_streams_if_possible();
@@ -1314,11 +1525,11 @@ future<quic_connected_socket> quic_connect(socket_address sa, const quic_connect
     });
 }
 
-input_stream<char> quic_connected_socket::input(std::uint64_t id) {
+input_stream<char> quic_connected_socket::input(quic_stream_id id) {
     return input_stream<char>(_impl->source(id));
 }
 
-output_stream<char> quic_connected_socket::output(std::uint64_t id, size_t buffer_size) {
+output_stream<char> quic_connected_socket::output(quic_stream_id id, size_t buffer_size) {
     output_stream_options opts;
     opts.batch_flushes = true;
     return {_impl->sink(id), buffer_size};
