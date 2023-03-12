@@ -105,7 +105,7 @@ public:
             sizeof(PROTOCOL_LIST) - 1
         );
 
-        constexpr auto convert_cc = [](quic_cc_algorithm cc) noexcept -> quiche_cc_algorithm {
+        constexpr auto convert_cc = [](quic_cc_algorithm cc) constexpr noexcept -> quiche_cc_algorithm {
             switch (cc) {
                 case quic_cc_algorithm::BBR:    return QUICHE_CC_BBR;
                 case quic_cc_algorithm::CUBIC:  return QUICHE_CC_CUBIC;
@@ -174,7 +174,7 @@ public:
 
 
 struct connection_id {
-    uint8_t _cid[MAX_CONNECTION_ID_LENGTH]{};
+    uint8_t _cid[MAX_CONNECTION_ID_LENGTH];
 
     connection_id() {
         std::memset(_cid, 0, sizeof(_cid));
@@ -236,34 +236,28 @@ namespace {
 //=====================
 
 
-template<typename T>
-using quic_buffer_template = temporary_buffer<T>;
+using quic_buffer = temporary_buffer<quic_byte_type>;
 
-template<typename ByteType>
-struct send_payload_template {
-    static_assert(sizeof(ByteType) == 1);
+struct send_payload {
+    quic_buffer     buffer;
+    socket_address  dst;
 
-    quic_buffer_template<ByteType>  buffer;
-    socket_address                  dst;
+    send_payload() = default;
 
-    send_payload_template() = default;
+    send_payload(quic_buffer&& buf, const socket_address& dest)
+    : buffer(std::move(buf))
+    , dst(dest)
+    {}
 
-    send_payload_template(const ByteType* buf, size_t size, const socket_address& sa)
-    : buffer(buf, size)
-    , dst(sa) {}
-
-    send_payload_template(const ByteType* buf, size_t size, const ::sockaddr_storage &dest, ::socklen_t dest_len)
-    : buffer(buf, size)
+    send_payload(quic_buffer&& buf, const ::sockaddr_storage& dest, ::socklen_t dest_len)
+    : buffer(std::move(buf))
     {
-        ::sockaddr_in addr_in{};
-        std::memcpy(&addr_in, &dest, dest_len);
-        dst = addr_in; // TODO: handle ipv6
+        // TODO: Handle IPv6.
+        ::sockaddr_in addr_in;
+        std::memcpy(std::addressof(addr_in), std::addressof(dest), dest_len);
+        dst = addr_in;
     }
 };
-
-using quic_byte_type = char;
-using quic_buffer    = quic_buffer_template<quic_byte_type>;
-using send_payload   = send_payload_template<quic_byte_type>;
 
 class quic_udp_channel_manager {
 private:
@@ -390,19 +384,8 @@ private:
         , payload(std::move(spl))
         {}
 
-        bool operator<(const paced_payload& other) const noexcept {
-            return time < other.time;
-        }
-
-        bool operator<(const send_time_point& stp) const noexcept {
-            return time < stp;
-        }
-
-        friend bool operator<(const send_time_point& stp, const paced_payload& pp) noexcept {
-            return stp < pp.time;
-        }
-
-        bool operator>(const paced_payload& other) const noexcept {
+        // For setting an order on the type so we can sort instances of it in priority queues.
+        bool operator>(const paced_payload& other) const noexcept(noexcept(time > other.time)) {
             return time > other.time;
         }
 
@@ -684,7 +667,7 @@ future<> quic_connection<Socket>::init() {
             const send_time_point now = send_clock::now();
             const send_time_point& send_time = _send_queue.top().get_time();
 
-            if (_send_queue.top().get_time() <= now + SEND_TIME_EPSILON) {
+            if (send_time <= now + SEND_TIME_EPSILON) {
                 // It is time to send the packet from the front of the queue.
                 auto payload = std::move(_send_queue.fetch_top().payload);
                 return _socket->send(std::move(payload)).then([] {
@@ -711,7 +694,6 @@ future<> quic_connection<Socket>::init() {
 
 template<typename Socket>
 void quic_connection<Socket>::receive(udp_datagram&& datagram) {
-    fmt::print(stderr, "Quic conn receive\n");
     auto* fa = datagram.get_data().fragment_array();
     auto pa = _peer_address.as_posix_sockaddr();
     auto la = _socket->local_address().as_posix_sockaddr();
@@ -783,7 +765,7 @@ bool quic_connection<Socket>::is_closed() const noexcept {
 
 template <typename Socket>
 void quic_connection<Socket>::send_outstanding_data_in_streams_if_possible() {
-    quiche_stream_iter* iter = quiche_conn_writable(_connection);
+    auto* iter = quiche_conn_writable(_connection);
     quic_stream_id stream_id;
 
     while (quiche_stream_iter_next(iter, &stream_id)) {
@@ -831,7 +813,7 @@ future<> quic_connection<Socket>::quic_flush() {
 
     return repeat([this] {
         // Converts a time point stored as `timespec` to `send_time_point`.
-        constexpr auto get_send_time = [](const timespec& at) constexpr noexcept -> send_time_point {
+        constexpr auto get_send_time = [](const timespec& at) constexpr -> send_time_point {
             return static_cast<send_time_point>(
                 std::chrono::duration_cast<send_time_duration>(
                     std::chrono::seconds(at.tv_sec) + std::chrono::nanoseconds(at.tv_nsec)
@@ -850,14 +832,17 @@ future<> quic_connection<Socket>::quic_flush() {
             throw std::runtime_error("Failed to create a packet.");
         }
 
-        send_payload payload(reinterpret_cast<char*>(out), written, send_info.to, send_info.to_len);
+        quic_buffer qb{reinterpret_cast<quic_byte_type*>(out), static_cast<size_t>(written)};
+        send_payload payload{std::move(qb), send_info.to, send_info.to_len};
+
         const auto send_time = get_send_time(send_info.at);
 
-        _send_queue.push(paced_payload {std::move(payload), send_time});
-        if (_send_queue.size() == 1 || send_time < _send_queue.top()) {
+        if (_send_queue.empty() || send_time < _send_queue.top().get_time()) {
             _send_timer.rearm(send_time);
         }
-
+        
+        _send_queue.push(paced_payload{std::move(payload), send_time});
+        
         return make_ready_future<stop_iteration>(stop_iteration::no);
     }).then([this] {
         const auto timeout = static_cast<std::int64_t>(quiche_conn_timeout_as_millis(_connection));
@@ -1045,18 +1030,12 @@ private:
     // Local buffer for receiving bytes from the network.
     // Use std::vector instead of an automatic memory container
     // to avoid stack overflows.
-    std::vector<char>                                   _buffer;
+    std::vector<quic_byte_type>                         _buffer;
     std::queue<promise<quic_accept_result>>             _accept_requests;
     // TODO: Consider using std::map or std::vector instead. Pros:
     //       * no need to provide a hashing function
     //       * might be faster for fewer connections
     // Best if we could use std::colony (C++23) or some equivalent of it.
-    //
-    // Note: Since we iterate over the connections every time we enter
-    // the service loop, providing a cache-friendly data structure
-    // is crucial. On the other hand, handling each of them may
-    // take a considerable amount of time, and in that case, it wouldn't
-    // be that much of a problem, i.e. it wouldn't be a bottleneck.
     std::unordered_map<connection_id, lw_shared_ptr<server_connection_t>>  _connections;
     future<>                                            _send_queue;
 
@@ -1263,7 +1242,7 @@ future<> quic_server_socket_quiche_impl::handle_pre_hs_connection(quic_header_in
     }
 
     auto [it, succeeded] = _connections.emplace(key, make_lw_shared<server_connection_t>(connection, 
-                                                                                       this->shared_from_this(),
+            this->shared_from_this(),
                                                                                        datagram.get_src()));
     if (!succeeded) {
         fmt::print("Emplacing a connection has failed.\n");
@@ -1278,7 +1257,8 @@ future<> quic_server_socket_quiche_impl::handle_pre_hs_connection(quic_header_in
     });
     
     // Start the service loop in the connection.
-    lw_shared_ptr<server_connection_t> &conn = it->second;
+    // TODO: If the reference is removed, a segmentation fault occurs.
+    lw_shared_ptr<server_connection_t>& conn = it->second;
     return conn->init().then([this, datagram = std::move(datagram), &conn] () mutable {
         return handle_post_hs_connection(conn, std::move(datagram));
     });
@@ -1300,11 +1280,8 @@ future<> quic_server_socket_quiche_impl::negotiate_version(const quic_header_inf
         return make_ready_future<>();
     }
 
-    send_payload payload(
-        _buffer.data(),
-        written,
-        datagram.get_src()
-    );
+    quic_buffer qb{reinterpret_cast<quic_byte_type*>(_buffer.data()), static_cast<size_t>(written)};
+    send_payload payload{std::move(qb), datagram.get_src()};
     
     return _channel_manager->send(std::move(payload));
 }
@@ -1340,7 +1317,8 @@ future<> quic_server_socket_quiche_impl::quic_retry(const quic_header_info& head
         return make_ready_future<>();
     }
 
-    send_payload payload(_buffer.data(), written, datagram.get_src());
+    quic_buffer qb{reinterpret_cast<quic_byte_type*>(_buffer.data()), static_cast<size_t>(written)};
+    send_payload payload(std::move(qb), datagram.get_src());
 
     return _channel_manager->send(std::move(payload));
 }
@@ -1525,11 +1503,11 @@ future<quic_connected_socket> quic_connect(socket_address sa, const quic_connect
     });
 }
 
-input_stream<char> quic_connected_socket::input(quic_stream_id id) {
-    return input_stream<char>(_impl->source(id));
+input_stream<quic_byte_type> quic_connected_socket::input(quic_stream_id id) {
+    return input_stream<quic_byte_type>(_impl->source(id));
 }
 
-output_stream<char> quic_connected_socket::output(quic_stream_id id, size_t buffer_size) {
+output_stream<quic_byte_type> quic_connected_socket::output(quic_stream_id id, size_t buffer_size) {
     output_stream_options opts;
     opts.batch_flushes = true;
     return {_impl->sink(id), buffer_size};
