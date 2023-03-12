@@ -49,6 +49,7 @@ struct quic_connection_config {
 };
 
 using quic_stream_id = uint64_t;
+using quic_byte_type = char;
 
 class quic_connected_socket_impl {
 public:
@@ -64,8 +65,8 @@ private:
 
 public:
     explicit quic_connected_socket(std::unique_ptr<quic_connected_socket_impl> impl) noexcept : _impl(std::move(impl)) {}
-    input_stream<char> input(quic_stream_id id);
-    output_stream<char> output(quic_stream_id id, size_t buffer_size = 8192);
+    input_stream<quic_byte_type> input(quic_stream_id id);
+    output_stream<quic_byte_type> output(quic_stream_id id, size_t buffer_size = 8192);
     future<> close();
 };
 
