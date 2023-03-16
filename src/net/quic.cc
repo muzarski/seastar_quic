@@ -721,6 +721,8 @@ void quic_connection<Socket>::receive(udp_datagram&& datagram) {
 
 template<typename Socket>
 [[maybe_unused]] future<> quic_connection<Socket>::write(quic_buffer qb, quic_stream_id stream_id) {
+    // TODO: throw an exception if _closing_marker is set to true
+    
     const auto written = quiche_conn_stream_send(
         _connection,
         stream_id,
@@ -743,12 +745,14 @@ template<typename Socket>
         stream.write_queue.push_front(std::move(qb));
     } 
     
-    (void) quic_flush();
-    return wait_send_available(stream_id);
+    return quic_flush().then([stream_id, this] () {
+        return wait_send_available(stream_id);    
+    });
 }
 
 template<typename Socket>
 future<quic_buffer> quic_connection<Socket>::read(quic_stream_id stream_id) {
+    // TODO: throw an exception if _closing_marker is set to true
     auto& stream = _streams[stream_id];
     return stream.read_queue.pop_eventually();
 }
@@ -857,6 +861,9 @@ future<> quic_connection<Socket>::quic_flush() {
 
 template<typename Socket>
 future<> quic_connection<Socket>::close() {
+    // TODO: Wait until stream capacity is MAX.
+    // Wait until paced_payload_queue is empty.
+    
     if (!quiche_conn_is_closed(_connection)) {
         quiche_conn_close(
             _connection,
