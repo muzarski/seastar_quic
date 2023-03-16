@@ -814,9 +814,12 @@ future<> quic_connection<Socket>::quic_flush() {
     return repeat([this] {
         // Converts a time point stored as `timespec` to `send_time_point`.
         constexpr auto get_send_time = [](const timespec& at) constexpr -> send_time_point {
-            return static_cast<send_time_point>(
+            // TODO: Ditch modulo here when the library has fixed the issue with `timespec`.
+            // See: `https://github.com/cloudflare/quiche/pull/1403`.
+            using nsec_type = decltype(at.tv_nsec);
+            return send_time_point(
                 std::chrono::duration_cast<send_time_duration>(
-                    std::chrono::seconds(at.tv_sec) + std::chrono::nanoseconds(at.tv_nsec)
+                    std::chrono::seconds(at.tv_sec) + std::chrono::nanoseconds(at.tv_nsec % static_cast<nsec_type>(1e9))
                 )
             );
         };
@@ -835,12 +838,11 @@ future<> quic_connection<Socket>::quic_flush() {
         quic_buffer qb{reinterpret_cast<quic_byte_type*>(out), static_cast<size_t>(written)};
         send_payload payload{std::move(qb), send_info.to, send_info.to_len};
 
-        const auto send_time = get_send_time(send_info.at);
+        const send_time_point send_time = get_send_time(send_info.at);
 
         if (_send_queue.empty() || send_time < _send_queue.top().get_time()) {
             _send_timer.rearm(send_time);
         }
-        
         _send_queue.push(paced_payload{std::move(payload), send_time});
         
         return make_ready_future<stop_iteration>(stop_iteration::no);
