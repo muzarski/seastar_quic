@@ -27,10 +27,12 @@
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/queue.hh>
 #include <seastar/core/loop.hh>
-#include <seastar/core/sleep.hh>
 #include <seastar/core/do_with.hh>
 #include <seastar/net/stack.hh>
+#include <seastar/net/api.hh>
+#include <seastar/net/quic.hh>
 #include <seastar/core/sharded.hh>
+#include "seastar/net/api.hh"
 
 namespace seastar {
 
@@ -42,7 +44,6 @@ struct loopback_error_injector {
     virtual error client_rcv_error() { return error::none; }
     virtual error client_snd_error() { return error::none; }
     virtual error connect_error()    { return error::none; }
-    virtual std::chrono::microseconds connect_delay() { return std::chrono::microseconds(0); }
 };
 
 class loopback_buffer {
@@ -56,7 +57,6 @@ private:
     queue<temporary_buffer<char>> _q{1};
     loopback_error_injector* _error_injector;
     type _type;
-    promise<> _shutdown;
 public:
     loopback_buffer(loopback_error_injector* error_injection, type t) : _error_injector(error_injection), _type(t) {}
     future<> push(temporary_buffer<char>&& b) {
@@ -92,16 +92,8 @@ public:
         return _q.pop_eventually();
     }
     void shutdown() noexcept {
-        if (!_aborted) {
-            // it can be called by both -- reader and writer socket impls
-            _shutdown.set_value();
-        }
         _aborted = true;
         _q.abort(std::make_exception_ptr(std::system_error(EPIPE, std::system_category())));
-    }
-
-    future<> wait_input_shutdown() {
-        return _shutdown.get_future();
     }
 };
 
@@ -160,65 +152,53 @@ public:
 };
 
 
-class loopback_connected_socket_impl : public net::connected_socket_impl {
+class loopback_connected_socket_impl : public net::quic_connected_socket_impl {
     lw_shared_ptr<foreign_ptr<lw_shared_ptr<loopback_buffer>>> _tx;
     lw_shared_ptr<loopback_buffer> _rx;
 public:
     loopback_connected_socket_impl(foreign_ptr<lw_shared_ptr<loopback_buffer>> tx, lw_shared_ptr<loopback_buffer> rx)
             : _tx(make_lw_shared(std::move(tx))), _rx(std::move(rx)) {
     }
-    data_source source() override {
+    data_source source(std::uint64_t id) override {
         return data_source(std::make_unique<loopback_data_source_impl>(_rx));
     }
-    data_sink sink() override {
+    data_sink sink(std::uint64_t id) override {
         return data_sink(std::make_unique<loopback_data_sink_impl>(_tx));
     }
-    void shutdown_input() override {
+    void shutdown_input(std::uint64_t id) override {
         _rx->shutdown();
     }
-    void shutdown_output() override {
+    void shutdown_output(std::uint64_t id) override {
         (void)smp::submit_to(_tx->get_owner_shard(), [tx = _tx] {
             (*tx)->shutdown();
         });
     }
-    void set_nodelay(bool nodelay) override {
+    void shutdown_all_input() override {
+        _rx->shutdown();
     }
-    bool get_nodelay() const override {
-        return true;
+    void shutdown_all_output() override {
+        (void)smp::submit_to(_tx->get_owner_shard(), [tx = _tx] {
+            (*tx)->shutdown();
+        });
     }
-    void set_keepalive(bool keepalive) override {}
-    bool get_keepalive() const override {
-        return false;
-    }
-    void set_keepalive_parameters(const net::keepalive_params&) override {}
-    net::keepalive_params get_keepalive_parameters() const override {
-        return net::tcp_keepalive_params {std::chrono::seconds(0), std::chrono::seconds(0), 0};
-    }
-    void set_sockopt(int level, int optname, const void* data, size_t len) override {
-        throw std::runtime_error("Setting custom socket options is not supported for loopback");
-    }
-    int get_sockopt(int level, int optname, void* data, size_t len) const override {
-        throw std::runtime_error("Getting custom socket options is not supported for loopback");
-    }
-    socket_address local_address() const noexcept override {
-        // dummy
-        return {};
-    }
-    future<> wait_input_shutdown() override {
+    future<> wait_input_shutdown(std::uint64_t id) override {
         abort(); // No tests use this
+        return make_ready_future<>();
+    }
+    future<> close() override {
         return make_ready_future<>();
     }
 };
 
-class loopback_server_socket_impl : public net::server_socket_impl {
-    lw_shared_ptr<queue<connected_socket>> _pending;
+class loopback_server_socket_impl : public net::quic_server_socket_impl {
+    lw_shared_ptr<queue<net::quic_connected_socket>> _pending;
 public:
-    explicit loopback_server_socket_impl(lw_shared_ptr<queue<connected_socket>> q)
+    explicit loopback_server_socket_impl(lw_shared_ptr<queue<net::quic_connected_socket>> q)
             : _pending(std::move(q)) {
     }
-    future<accept_result> accept() override {
-        return _pending->pop_eventually().then([] (connected_socket&& cs) {
-            return make_ready_future<accept_result>(accept_result{std::move(cs), socket_address()});
+    future<net::quic_accept_result> accept() override {
+        return _pending->pop_eventually().then([] (net::quic_connected_socket&& cs) {
+            return make_ready_future<net::quic_accept_result>(net::quic_accept_result{std::move(cs), socket_address()});
         });
     }
     void abort_accept() override {
@@ -234,29 +214,29 @@ public:
 class loopback_connection_factory {
     unsigned _shard = 0;
     unsigned _shards_count;
-    std::vector<lw_shared_ptr<queue<connected_socket>>> _pending;
+    std::vector<lw_shared_ptr<queue<net::quic_connected_socket>>> _pending;
 public:
     explicit loopback_connection_factory(unsigned shards_count = smp::count)
             : _shards_count(shards_count)
     {
         _pending.resize(shards_count);
     }
-    server_socket get_server_socket() {
+    net::quic_server_socket get_server_socket() {
         assert(this_shard_id() < _shards_count);
         if (!_pending[this_shard_id()]) {
-            _pending[this_shard_id()] = make_lw_shared<queue<connected_socket>>(10);
+            _pending[this_shard_id()] = make_lw_shared<queue<net::quic_connected_socket>>(10);
         }
-        return server_socket(std::make_unique<loopback_server_socket_impl>(_pending[this_shard_id()]));
+        return net::quic_server_socket(std::make_unique<loopback_server_socket_impl>(_pending[this_shard_id()]));
     }
     future<> make_new_server_connection(foreign_ptr<lw_shared_ptr<loopback_buffer>> b1, lw_shared_ptr<loopback_buffer> b2) {
         assert(this_shard_id() < _shards_count);
         if (!_pending[this_shard_id()]) {
-            _pending[this_shard_id()] = make_lw_shared<queue<connected_socket>>(10);
+            _pending[this_shard_id()] = make_lw_shared<queue<net::quic_connected_socket>>(10);
         }
-        return _pending[this_shard_id()]->push_eventually(connected_socket(std::make_unique<loopback_connected_socket_impl>(std::move(b1), b2)));
+        return _pending[this_shard_id()]->push_eventually(net::quic_connected_socket(std::make_unique<loopback_connected_socket_impl>(std::move(b1), b2)));
     }
-    connected_socket make_new_client_connection(lw_shared_ptr<loopback_buffer> b1, foreign_ptr<lw_shared_ptr<loopback_buffer>> b2) {
-        return connected_socket(std::make_unique<loopback_connected_socket_impl>(std::move(b2), b1));
+    net::quic_connected_socket make_new_client_connection(lw_shared_ptr<loopback_buffer> b1, foreign_ptr<lw_shared_ptr<loopback_buffer>> b2) {
+        return net::quic_connected_socket(std::make_unique<loopback_connected_socket_impl>(std::move(b2), b1));
     }
     unsigned next_shard() {
         return _shard++ % _shards_count;
@@ -274,17 +254,17 @@ public:
     }
 };
 
-class loopback_socket_impl : public net::socket_impl {
+class loopback_socket_impl : public q_socket_impl {
     loopback_connection_factory& _factory;
     loopback_error_injector* _error_injector;
     lw_shared_ptr<loopback_buffer> _b1;
     foreign_ptr<lw_shared_ptr<loopback_buffer>> _b2;
-    std::optional<promise<connected_socket>> _connect_abort;
+    std::optional<promise<net::quic_connected_socket>> _connect_abort;
 public:
     loopback_socket_impl(loopback_connection_factory& factory, loopback_error_injector* error_injector = nullptr)
             : _factory(factory), _error_injector(error_injector)
     { }
-    future<connected_socket> connect(socket_address sa, socket_address local, seastar::transport proto = seastar::transport::TCP) override {
+    future<net::quic_connected_socket> connect(socket_address sa) override {
         if (_error_injector) {
             auto error = _error_injector->connect_error();
             if (error != loopback_error_injector::error::none) {
@@ -302,15 +282,7 @@ public:
                 return make_foreign(b2);
             });
         }).then([this] (foreign_ptr<lw_shared_ptr<loopback_buffer>> b2) {
-            if (_error_injector) {
-                auto delay = _error_injector->connect_delay();
-                if (delay != std::chrono::microseconds(0)) {
-                    return seastar::sleep(delay).then([this, b2 = std::move(b2)] () mutable {
-                        return _factory.make_new_client_connection(_b1, std::move(b2));
-                    });
-                }
-            }
-            return make_ready_future<connected_socket>(_factory.make_new_client_connection(_b1, std::move(b2)));
+            return _factory.make_new_client_connection(_b1, std::move(b2));
         });
     }
     virtual void set_reuseaddr(bool reuseaddr) override {}

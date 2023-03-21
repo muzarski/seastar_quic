@@ -19,7 +19,7 @@
  * Copyright (C) 2016 ScyllaDB
  */
 
-#include "loopback_socket.hh"
+#include "loopback_socket_quic.hh"
 #include <seastar/rpc/rpc.hh>
 #include <seastar/rpc/rpc_types.hh>
 #include <seastar/rpc/lz4_compressor.hh>
