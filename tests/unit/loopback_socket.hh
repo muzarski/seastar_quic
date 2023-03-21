@@ -184,29 +184,14 @@ public:
             (*tx)->shutdown();
         });
     }
-//    void set_nodelay(bool nodelay) override {
-//    }
-//    bool get_nodelay() const override {
-//        return true;
-//    }
-//    void set_keepalive(bool keepalive) override {}
-//    bool get_keepalive() const override {
-//        return false;
-//    }
-//    void set_keepalive_parameters(const net::keepalive_params&) override {}
-//    net::keepalive_params get_keepalive_parameters() const override {
-//        return net::tcp_keepalive_params {std::chrono::seconds(0), std::chrono::seconds(0), 0};
-//    }
-//    void set_sockopt(int level, int optname, const void* data, size_t len) override {
-//        throw std::runtime_error("Setting custom socket options is not supported for loopback");
-//    }
-//    int get_sockopt(int level, int optname, void* data, size_t len) const override {
-//        throw std::runtime_error("Getting custom socket options is not supported for loopback");
-//    }
-//    socket_address local_address() const noexcept override {
-//        // dummy
-//        return {};
-//    }
+    void shutdown_all_input() override {
+        _rx->shutdown();
+    }
+    void shutdown_all_output() override {
+        (void)smp::submit_to(_tx->get_owner_shard(), [tx = _tx] {
+            (*tx)->shutdown();
+        });
+    }
     future<> wait_input_shutdown(std::uint64_t id) override {
         abort(); // No tests use this
         return make_ready_future<>();

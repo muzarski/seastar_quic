@@ -67,6 +67,7 @@ template <class CharType> class output_stream;
 
 class server_socket;
 class socket;
+class q_socket;
 class connected_socket;
 class socket_address;
 struct listen_options;

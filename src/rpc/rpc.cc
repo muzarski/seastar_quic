@@ -9,6 +9,8 @@
 template <> struct fmt::formatter<seastar::rpc::streaming_domain_type> : fmt::ostream_formatter {};
 #endif
 
+constexpr static std::uint64_t INITIAL_ID = 4;
+
 namespace seastar {
 
 namespace rpc {
@@ -163,7 +165,7 @@ namespace rpc {
   future<> connection::stop_send_loop(std::exception_ptr ex) {
       _error = true;
       if (_connected) {
-          _fd.shutdown_output(4);
+          _fd.shutdown_all_output();
       }
       if (ex == nullptr) {
           ex = std::make_exception_ptr(closed_error());
@@ -202,8 +204,8 @@ namespace rpc {
           throw std::runtime_error("already connected");
       }
       _fd = std::move(fd);
-      _read_buf =_fd.input(4);
-      _write_buf = _fd.output(4);
+      _read_buf =_fd.input(INITIAL_ID);
+      _write_buf = _fd.output(INITIAL_ID);
       _connected = true;
   }
 
@@ -315,7 +317,7 @@ namespace rpc {
   void connection::abort() {
       if (!_error) {
           _error = true;
-          _fd.shutdown_input(4);
+          _fd.shutdown_all_input();
       }
   }
 
@@ -763,16 +765,16 @@ namespace rpc {
 
   client::client(const logger& l, void* s, client_options ops, q_socket socket, const socket_address& addr, const socket_address& local)
   : rpc::connection(l, s), _socket(std::move(socket)), _server_addr(addr), _local_addr(local), _options(ops) {
-       _socket.set_reuseaddr(ops.reuseaddr);
+//       _socket.set_reuseaddr(ops.reuseaddr);
       // Run client in the background.
       // Communicate result via _stopped.
       // The caller has to call client::stop() to synchronize.
       (void)_socket.connect(addr).then([this, ops = std::move(ops)] (net::quic_connected_socket fd) {
 //          fd.set_nodelay(ops.tcp_nodelay);
-          if (ops.keepalive) {
+//          if (ops.keepalive) {
 //              fd.set_keepalive(true);
 //              fd.set_keepalive_parameters(ops.keepalive.value());
-          }
+//          }
           set_socket(std::move(fd));
 
           feature_map features;
@@ -862,13 +864,13 @@ namespace rpc {
       enqueue_zero_frame();
   }
 
-//  client::client(const logger& l, void* s, const socket_address& addr, const socket_address& local)
-//  : client(l, s, client_options{}, make_socket(), addr, local)
-//  {}
-//
-//  client::client(const logger& l, void* s, client_options options, const socket_address& addr, const socket_address& local)
-//  : client(l, s, options, make_socket(), addr, local)
-//  {}
+  client::client(const logger& l, void* s, const socket_address& addr, const socket_address& local)
+  : client(l, s, client_options{}, seastar::net::new_q_socket(), addr, local)
+  {}
+
+  client::client(const logger& l, void* s, client_options options, const socket_address& addr, const socket_address& local)
+  : client(l, s, options,  seastar::net::new_q_socket(), addr, local)
+  {}
 
   client::client(const logger& l, void* s, q_socket socket, const socket_address& addr, const socket_address& local)
   : client(l, s, client_options{}, std::move(socket), addr, local)
@@ -1096,7 +1098,7 @@ future<> server::connection::send_unknown_verb_reply(std::optional<rpc_clock_typ
               log_exception(*this, log_level::error,
                       format("server{} connection dropped", is_stream() ? " stream" : "").c_str(), ep);
           }
-          _fd.shutdown_input(4);
+          _fd.shutdown_all_input();
           _error = true;
           _stream_queue.abort(std::make_exception_ptr(stream_closed()));
           return stop_send_loop(ep).then_wrapped([this] (future<> f) {

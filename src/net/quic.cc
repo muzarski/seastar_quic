@@ -418,6 +418,8 @@ public:
     future<temporary_buffer<char>> read(std::uint64_t stream_id);
     void shutdown_input(std::uint64_t id);
     void shutdown_output(std::uint64_t stream_id);
+    void shutdown_all_input();
+    void shutdown_all_output();
     future <> wait_input_shutdown(std::uint64_t stream_id);
     future<> close();
     future<> close(std::uint64_t stream_id);
@@ -690,6 +692,20 @@ void quic_connection<Socket>::shutdown_output(std::uint64_t stream_id) {
 }
 
 template <typename Socket>
+void quic_connection<Socket>::shutdown_all_input() {
+    for (auto& [stream_id, _] : _read_queues) {
+        shutdown_input(stream_id);
+    }
+}
+
+template <typename Socket>
+void quic_connection<Socket>::shutdown_all_output() {
+    for (auto& [stream_id, _] : _write_queues) {
+        shutdown_output(stream_id);
+    }
+}
+
+template <typename Socket>
 future<> quic_connection<Socket>::wait_input_shutdown(std::uint64_t stream_id) {
     // TODO: resolve this future wherever necessary, i.e when connection closed, stream finished (already done) and when
     // input_shutdown() called.
@@ -844,6 +860,14 @@ public:
 
     void shutdown_output(std::uint64_t stream_id) override {
         _conn->shutdown_output(stream_id);
+    }
+
+    void shutdown_all_input() override {
+        _conn->shutdown_all_input();
+    }
+
+    void shutdown_all_output() override {
+        _conn->shutdown_all_output();
     }
 
     future<> wait_input_shutdown(std::uint64_t id) override {
@@ -1380,6 +1404,27 @@ future<> quic_client_socket::handle_connection_closing() {
     });
 }
 
+template <typename Socket>
+class quiche_q_socket_impl : public q_socket_impl{
+    quiche_configuration                    _config;
+    lw_shared_ptr<quic_connection<Socket>> _conn;
+public:
+
+    explicit quiche_q_socket_impl(const quic_connection_config& quic_config)
+            : _config(quic_config), _conn() {}
+    virtual future<net::quic_connected_socket> connect(socket_address sa) override {
+        return quic_connect(sa);
+    };
+    virtual void set_reuseaddr(bool reuseaddr) override {};
+    virtual bool get_reuseaddr() const override { return false; };
+    virtual void shutdown() override {
+        if (_conn) {
+            //TODO take care of the return value
+            _conn->close();
+        }
+    }
+};
+
 
 void quiche_log_printer(const char* line, void* args) {
     std::cout << line << std::endl;
@@ -1420,6 +1465,14 @@ output_stream<char> quic_connected_socket::output(std::uint64_t id, size_t buffe
     return {_impl->sink(id), buffer_size};
 }
 
+void quic_connected_socket::shutdown_all_input() {
+    _impl->shutdown_all_input();
+}
+
+void quic_connected_socket::shutdown_all_output() {
+    _impl->shutdown_all_output();
+}
+
 void quic_connected_socket::shutdown_input(std::uint64_t stream_id) {
     _impl->shutdown_input(stream_id);
 }
@@ -1440,4 +1493,7 @@ void quic_enable_logging() {
     quiche_enable_debug_logging(quiche_log_printer, nullptr);
 }
 
+q_socket new_q_socket() {
+    return q_socket(std::make_unique<quiche_q_socket_impl<quic_client_socket>>(quic_connection_config()));
+}
 } // namespace seastar::net

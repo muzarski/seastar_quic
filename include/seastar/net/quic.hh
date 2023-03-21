@@ -55,6 +55,8 @@ public:
     virtual data_sink sink(std::uint64_t id) = 0;
     virtual void shutdown_input(std::uint64_t id) = 0;
     virtual void shutdown_output(std::uint64_t id) = 0;
+    virtual void shutdown_all_input() = 0;
+    virtual void shutdown_all_output() = 0;
     virtual future<> wait_input_shutdown(std::uint64_t id) = 0;
     virtual future<> close() = 0;
 };
@@ -70,6 +72,8 @@ public:
     output_stream<char> output(std::uint64_t id, size_t buffer_size = 8192);
     void shutdown_input(std::uint64_t id);
     void shutdown_output(std::uint64_t id);
+    void shutdown_all_input();
+    void shutdown_all_output();
     future<> wait_input_shutdown(std::uint64_t id);
     future<> close();
 };
@@ -129,5 +133,7 @@ quic_connect(socket_address sa, const quic_connection_config& quic_config = quic
 
 // Quiche raw logs
 void quic_enable_logging();
+
+q_socket new_q_socket();
 
 } // namespace seastar::net
