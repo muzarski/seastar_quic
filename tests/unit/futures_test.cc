@@ -68,9 +68,9 @@ public:
     expected_exception() : runtime_error("expected") {}
 };
 
-#ifdef __clang__
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wself-move"
+#if defined(__clang__) || (defined(__GNUC__) && __GNUC__ >= 13)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wself-move"
 #endif
 SEASTAR_TEST_CASE(test_self_move) {
     future_state<std::tuple<std::unique_ptr<int>>> s1;
@@ -104,8 +104,8 @@ SEASTAR_TEST_CASE(test_self_move) {
 
     return make_ready_future<>();
 }
-#ifdef __clang__
-#pragma clang diagnostic pop
+#if defined(__clang__) || (defined(__GNUC__) && __GNUC__ >= 13)
+#pragma GCC diagnostic pop
 #endif
 
 static subscription<int> get_empty_subscription(std::function<future<> (int)> func) {
@@ -753,6 +753,48 @@ SEASTAR_TEST_CASE(test_map_reduce0_lifetime) {
     long n = 10;
     return map_reduce(boost::make_counting_iterator<long>(0), boost::make_counting_iterator<long>(n),
             map{}, 0L, reduce{}).then([n] (long res) {
+        long expected = (n * (n - 1)) / 2;
+        BOOST_REQUIRE_EQUAL(res, expected);
+    });
+}
+
+SEASTAR_TEST_CASE(test_map_reduce1_lifetime) {
+    struct map {
+        bool destroyed = false;
+        ~map() {
+            destroyed = true;
+        }
+        auto operator()(long x) {
+            return yield().then([this, x] {
+                BOOST_REQUIRE(!destroyed);
+                return x;
+            });
+        }
+    };
+    struct reduce {
+        long res = 0;
+        bool destroyed = false;
+        ~reduce() {
+            BOOST_TEST_MESSAGE("~reduce()");
+            destroyed = true;
+        }
+        auto operator()(long x) {
+            return yield().then([this, x] {
+                BOOST_REQUIRE(!destroyed);
+                res += x;
+                return make_ready_future<>();
+            });
+        }
+        auto get() {
+            return sleep(std::chrono::milliseconds(10)).then([this] {
+                BOOST_REQUIRE(!destroyed);
+                return res;
+            });
+        }
+    };
+    long n = 10;
+    return map_reduce(boost::make_counting_iterator<long>(0), boost::make_counting_iterator<long>(n),
+                      map{}, reduce{}).then([n] (long res) {
         long expected = (n * (n - 1)) / 2;
         BOOST_REQUIRE_EQUAL(res, expected);
     });
@@ -1639,6 +1681,16 @@ SEASTAR_TEST_CASE(test_warn_on_broken_promise_with_no_future) {
     });
 
     return make_ready_future<>();
+}
+
+SEASTAR_TEST_CASE(test_destroy_promise_after_state_take_value) {
+    future<> f = make_ready_future<>();
+    auto p = std::make_unique<seastar::promise<>>();
+    f = p->get_future();
+    p->set_value();
+    auto g = f.then([] {});
+    p.reset();
+    return g;
 }
 
 SEASTAR_THREAD_TEST_CASE(test_exception_future_with_backtrace) {

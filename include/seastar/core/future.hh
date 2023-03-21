@@ -21,25 +21,23 @@
 
 #pragma once
 
+#include <cassert>
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
+#include <functional>
+#include <memory>
+#include <stdexcept>
+#include <type_traits>
+#include <utility>
 #include <seastar/core/task.hh>
 #include <seastar/core/thread_impl.hh>
-#include <stdexcept>
-#include <atomic>
-#include <memory>
-#include <type_traits>
-#include <assert.h>
-#include <cstdlib>
 #include <seastar/core/function_traits.hh>
 #include <seastar/util/critical_alloc_section.hh>
-#include <seastar/util/attribute-compat.hh>
 #include <seastar/util/concepts.hh>
 #include <seastar/util/noncopyable_function.hh>
 #include <seastar/util/backtrace.hh>
 #include <seastar/util/std-compat.hh>
-
-#if __cplusplus > 201703L
-#include <concepts>
-#endif
 
 namespace seastar {
 
@@ -1346,7 +1344,7 @@ task* continuation_base_with_promise<Promise, T SEASTAR_ELLIPSIS>::waiting_task(
 ///           A list with two or more types is deprecated; use
 ///           \c future<std::tuple<T...>> instead.
 template <typename SEASTAR_ELLIPSIS T>
-class SEASTAR_NODISCARD future : private internal::future_base {
+class [[nodiscard]] future : private internal::future_base {
     using future_state = seastar::future_state<internal::future_stored_type_t<T SEASTAR_ELLIPSIS>>;
     future_state _state;
     static constexpr bool copy_noexcept = future_state::copy_noexcept;
@@ -1395,7 +1393,7 @@ private:
         // other build modes.
 #ifdef SEASTAR_DEBUG
         if (_state.available()) {
-            tws->set_state(std::move(_state));
+            tws->set_state(get_available_state_ref());
             ::seastar::schedule(tws);
             return;
         }

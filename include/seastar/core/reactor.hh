@@ -21,67 +21,68 @@
 
 #pragma once
 
-#include <seastar/core/seastar.hh>
-#include <seastar/core/iostream.hh>
 #include <seastar/core/aligned_buffer.hh>
 #include <seastar/core/cacheline.hh>
+#include <seastar/core/circular_buffer.hh>
 #include <seastar/core/circular_buffer_fixed_capacity.hh>
+#include <seastar/core/condition-variable.hh>
+#include <seastar/core/enum.hh>
+#include <seastar/core/fair_queue.hh>
+#include <seastar/core/file.hh>
+#include <seastar/core/future.hh>
 #include <seastar/core/idle_cpu_handler.hh>
+#include <seastar/core/internal/io_request.hh>
+#include <seastar/core/internal/io_sink.hh>
+#include <seastar/core/iostream.hh>
+#include <seastar/core/linux-aio.hh>
+#include <seastar/core/lowres_clock.hh>
+#include <seastar/core/make_task.hh>
+#include <seastar/core/manual_clock.hh>
+#include <seastar/core/memory.hh>
+#include <seastar/core/metrics_registration.hh>
+#include <seastar/core/posix.hh>
+#include <seastar/core/reactor_config.hh>
+#include <seastar/core/scattered_message.hh>
+#include <seastar/core/scheduling.hh>
+#include <seastar/core/scheduling_specific.hh>
+#include <seastar/core/seastar.hh>
+#include <seastar/core/semaphore.hh>
+#include <seastar/core/smp.hh>
+#include <seastar/core/sstring.hh>
+#include <seastar/core/temporary_buffer.hh>
+#include <seastar/core/thread_cputime_clock.hh>
+#include <seastar/core/timer.hh>
+#include <seastar/net/api.hh>
+#include <seastar/util/eclipse.hh>
+#include <seastar/util/log.hh>
+#include <seastar/util/std-compat.hh>
+#include <boost/container/static_vector.hpp>
+#include <boost/lockfree/spsc_queue.hpp>
+#include <boost/next_prior.hpp>
+#include <boost/range/irange.hpp>
+#include <boost/thread/barrier.hpp>
+#include <algorithm>
+#include <atomic>
+#include <cassert>
+#include <chrono>
+#include <cstring>
 #include <memory>
+#include <queue>
+#include <ratio>
+#include <set>
+#include <stack>
+#include <stdexcept>
+#include <string_view>
+#include <system_error>
+#include <thread>
 #include <type_traits>
+#include <unordered_map>
+#include <vector>
+#include <unistd.h>
 #include <sys/epoll.h>
 #include <sys/types.h>
 #include <sys/socket.h>
-#include <unordered_map>
 #include <netinet/ip.h>
-#include <cstring>
-#include <cassert>
-#include <stdexcept>
-#include <unistd.h>
-#include <vector>
-#include <queue>
-#include <algorithm>
-#include <thread>
-#include <system_error>
-#include <chrono>
-#include <ratio>
-#include <atomic>
-#include <stack>
-#include <seastar/util/std-compat.hh>
-#include <boost/next_prior.hpp>
-#include <boost/lockfree/spsc_queue.hpp>
-#include <boost/thread/barrier.hpp>
-#include <boost/container/static_vector.hpp>
-#include <set>
-#include <seastar/core/reactor_config.hh>
-#include <seastar/core/linux-aio.hh>
-#include <seastar/util/eclipse.hh>
-#include <seastar/core/future.hh>
-#include <seastar/core/posix.hh>
-#include <seastar/core/sstring.hh>
-#include <seastar/net/api.hh>
-#include <seastar/core/temporary_buffer.hh>
-#include <seastar/core/circular_buffer.hh>
-#include <seastar/core/file.hh>
-#include <seastar/core/semaphore.hh>
-#include <seastar/core/fair_queue.hh>
-#include <seastar/core/scattered_message.hh>
-#include <seastar/core/enum.hh>
-#include <seastar/core/memory.hh>
-#include <seastar/core/thread_cputime_clock.hh>
-#include <boost/range/irange.hpp>
-#include <seastar/core/timer.hh>
-#include <seastar/core/condition-variable.hh>
-#include <seastar/util/log.hh>
-#include <seastar/core/lowres_clock.hh>
-#include <seastar/core/manual_clock.hh>
-#include <seastar/core/metrics_registration.hh>
-#include <seastar/core/scheduling.hh>
-#include <seastar/core/scheduling_specific.hh>
-#include <seastar/core/smp.hh>
-#include <seastar/core/internal/io_request.hh>
-#include <seastar/core/internal/io_sink.hh>
-#include <seastar/core/make_task.hh>
 #include "internal/pollable_fd.hh"
 #include "internal/poll.hh"
 
@@ -428,6 +429,7 @@ private:
     void account_runtime(task_queue& tq, sched_clock::duration runtime);
     void account_idle(sched_clock::duration idletime);
     void allocate_scheduling_group_specific_data(scheduling_group sg, scheduling_group_key key);
+    future<> rename_scheduling_group_specific_data(scheduling_group sg);
     future<> init_scheduling_group(scheduling_group sg, sstring name, float shares);
     future<> init_new_scheduling_group_key(scheduling_group_key key, scheduling_group_key_config cfg);
     future<> destroy_scheduling_group(scheduling_group sg) noexcept;
@@ -689,7 +691,9 @@ public:
     void set_bypass_fsync(bool value);
     void update_blocked_reactor_notify_ms(std::chrono::milliseconds ms);
     std::chrono::milliseconds get_blocked_reactor_notify_ms() const;
-    // For testing:
+    /// For testing, sets the stall reporting function which is called when
+    /// a stall is detected (and not suppressed). Setting the function also
+    /// resets the supression state.
     void set_stall_detector_report_function(std::function<void ()> report);
     std::function<void ()> get_stall_detector_report_function() const;
 };

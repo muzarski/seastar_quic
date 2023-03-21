@@ -379,7 +379,7 @@ Seastar coroutines work, using lambda coroutines as continuations can result in 
 take one of the following approaches:
 
 1. Use lambda coroutines as arguments to functions that explicitly claim support for them
-2. Wrap lambda coroutines with seastar::coroutine::lambda(), and ensure the lambda coroutine is fully awaited within the statement it is defined in.
+2. Wrap lambda coroutines with `seastar::coroutine::lambda()`, and ensure the lambda coroutine is fully awaited within the statement it is defined in.
 
 An example of wrapping a lambda coroutine is:
 
@@ -399,11 +399,11 @@ future<> foo() {
 ```
 
 Notes:
-1. seastar::future::then() accepts a continuation
-2. We wrap the argument to seastar::future::then() with seastar::coroutine::lambda()
-3. We ensure evaluation of the lambda completes within the same expression using the outer co_await.
+1. `seastar::future::then()` accepts a continuation
+2. We wrap the argument to `seastar::future::then()` with `seastar::coroutine::lambda()`
+3. We ensure evaluation of the lambda completes within the same expression using the outer `co_await`.
 
-More information can be found in lambda-coroutine-fiasco.md.
+More information can be found in `lambda-coroutine-fiasco.md`.
 
 ## Generators in coroutines
 
@@ -2088,7 +2088,7 @@ Although `foreign_ptr` ensures that the object's *destructor* automatically runs
 ```
 So `seastar::foreign_ptr<>` not only has functional benefits (namely, to run the destructor on the home shard), it also has *documentational* benefits - it warns the programmer to watch out every time the object is used, that this is a *foreign* pointer, and if we want to do anything non-trivial with the pointed object, we may need to do it on the home shard.
 
-Above, we discussed the case of transferring ownership of an object to a another shard, via `seastar::foreign_ptr<std::unique_ptr<T>>`. However, sometimes the sender does not want to relinquish ownership of the object. Sometimes, it wants the remote thread to operate on its object and return with the object intact. Sometimes, it wants to send the same object to multiple shards. In such cases, `seastar::foreign_ptr<seastar::lw_shared_ptr<T>> is useful. The user needs to watch out, of course, not to operate on the same object from multiple threads concurrently. If this cannot be ensured by program logic alone, some methods of serialization must be used - such as running the operations on the home shard with `submit_to()` as described above.
+Above, we discussed the case of transferring ownership of an object to a another shard, via `seastar::foreign_ptr<std::unique_ptr<T>>`. However, sometimes the sender does not want to relinquish ownership of the object. Sometimes, it wants the remote thread to operate on its object and return with the object intact. Sometimes, it wants to send the same object to multiple shards. In such cases, `seastar::foreign_ptr<seastar::lw_shared_ptr<T>>` is useful. The user needs to watch out, of course, not to operate on the same object from multiple threads concurrently. If this cannot be ensured by program logic alone, some methods of serialization must be used - such as running the operations on the home shard with `submit_to()` as described above.
 
 Normally, a `seastar::foreign_ptr` cannot not be copied - only moved. However, when it holds a smart pointer that can be copied (namely, a `shared_ptr`), one may want to make an additional copy of that pointer and create a second `foreign_ptr`. Doing this is inefficient and asynchronous (it requires communicating with the original owner of the object to create the copies), so a method `future<foreign_ptr> copy()` needs to be explicitly used instead of the normal copy constructor.
 
