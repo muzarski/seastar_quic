@@ -56,6 +56,7 @@ public:
     virtual ~quic_connected_socket_impl() {}
     virtual data_source source(quic_stream_id id) = 0;
     virtual data_sink sink(quic_stream_id id) = 0;
+    virtual void shutdown_output(quic_stream_id id) = 0;
     virtual future<> close() = 0;
 };
 
@@ -67,6 +68,7 @@ public:
     explicit quic_connected_socket(std::unique_ptr<quic_connected_socket_impl> impl) noexcept : _impl(std::move(impl)) {}
     input_stream<quic_byte_type> input(quic_stream_id id);
     output_stream<quic_byte_type> output(quic_stream_id id, size_t buffer_size = 8192);
+    void shutdown_output(quic_stream_id id);
     future<> close();
 };
 
