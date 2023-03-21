@@ -44,6 +44,7 @@ struct loopback_error_injector {
     virtual error client_rcv_error() { return error::none; }
     virtual error client_snd_error() { return error::none; }
     virtual error connect_error()    { return error::none; }
+    virtual std::chrono::microseconds connect_delay() { return std::chrono::microseconds(0); }
 };
 
 class loopback_buffer {
