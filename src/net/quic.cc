@@ -1420,7 +1420,7 @@ public:
     virtual void shutdown() override {
         if (_conn) {
             //TODO take care of the return value
-            _conn->close();
+            (void) _conn->close();
         }
     }
 };
