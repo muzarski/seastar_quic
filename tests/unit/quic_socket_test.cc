@@ -51,9 +51,7 @@ future<> handle_connection(quic_accept_result ar) {
         return do_until([&in]() { return in.eof(); },
                         [&in, &out] {
                             return in.read().then([&out](auto buf) {
-                                return out.write(std::move(buf)).handle_exception([](auto ep) {
-                                    std::cout << "write failed: " << ep << std::endl;
-                                }).then([&out]() { return out.close(); });
+                                return out.write(std::move(buf)).then([&out]() { return out.close(); });
                             });
                         });
     });
