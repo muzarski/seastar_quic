@@ -539,7 +539,8 @@ public:
     }
     template<typename Serializer, typename... Out>
     future<sink<Out...>> make_stream_sink() {
-        return make_stream_sink<Serializer, Out...>(make_socket());
+        //todo: temporary solution
+        return make_stream_sink<Serializer, Out...>(net::new_q_socket());
     }
 };
 
