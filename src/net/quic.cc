@@ -21,6 +21,7 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/shared_future.hh>
 #include <seastar/core/shared_ptr.hh>
+#include <seastar/core/weak_ptr.hh>
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/core/queue.hh>
 #include <seastar/net/api.hh>
@@ -340,7 +341,8 @@ private:
     }
 };
 
-
+// Needed to be visible for quic_connection.
+class quic_client_socket;
 
 template<typename Socket>
 class quic_connection {
@@ -359,6 +361,8 @@ private:
     using timeout_time_duration = typename timeout_timer::duration;
     using send_time_point       = typename send_timer::time_point;
     using send_time_duration    = typename send_timer::duration;
+
+    using socket_ptr_type       = std::conditional_t<std::is_same_v<Socket, quic_client_socket>, lw_shared_ptr<Socket>, weak_ptr<Socket>>;
 
 private:
     // Acceptable error when sending out packets. We use this to avoid
@@ -492,7 +496,8 @@ private:
     // and no further clean-up is needed.
     quiche_conn*                                    _connection;
     // The socket via which communication with the network is performed.
-    lw_shared_ptr<Socket>                           _socket;
+    socket_ptr_type                                 _socket;
+
     std::vector<quic_byte_type>                     _buffer;
 
     const socket_address                            _peer_address;
@@ -525,14 +530,25 @@ public:
     // is present to make development easier.
     quic_connection() = default;
 
+    // TODO: use enable_if for the constructors below.
     quic_connection(quiche_conn* connection, lw_shared_ptr<Socket> socket, const socket_address& pa)
-    : _connection(connection)
-    , _socket(socket)
-    , _buffer(MAX_DATAGRAM_SIZE)
-    , _peer_address(pa)
-    , _send_timer()
-    , _timeout_timer()
-    , _stream_recv_fiber(make_ready_future<>())
+            : _connection(connection)
+            , _socket(socket)
+            , _buffer(MAX_DATAGRAM_SIZE)
+            , _peer_address(pa)
+            , _send_timer()
+            , _timeout_timer()
+            , _stream_recv_fiber(make_ready_future<>())
+    {}
+
+    quic_connection(quiche_conn* connection, weak_ptr<Socket> socket, const socket_address& pa)
+            : _connection(connection)
+            , _socket(socket)
+            , _buffer(MAX_DATAGRAM_SIZE)
+            , _peer_address(pa)
+            , _send_timer()
+            , _timeout_timer()
+            , _stream_recv_fiber(make_ready_future<>())
     {}
 
     quic_connection(const quic_connection&) = delete;
@@ -909,9 +925,7 @@ future<> quic_connection<Socket>::close() {
         _read_marker.mark_as_ready();
 
         return _stream_recv_fiber.then([this] {
-            return _socket->handle_connection_closing().then([this] {
-                _socket.release();
-            });
+            return _socket->handle_connection_closing();
         });
     });
 }
@@ -1038,7 +1052,7 @@ public:
 
 class quic_server_socket_quiche_impl final
         : public quic_server_socket_impl
-        , public enable_lw_shared_from_this<quic_server_socket_quiche_impl>
+        , public weakly_referencable<quic_server_socket_quiche_impl>
 {
 private:
     // TODO: Check the comments left in the function `quic_retry`.
@@ -1306,7 +1320,7 @@ future<> quic_server_socket_quiche_impl::handle_pre_hs_connection(quic_header_in
         key,
         make_lw_shared<server_connection>(
             connection,
-            this->shared_from_this(),
+            this->weak_from_this(),
             datagram.get_src()
         )
     );
@@ -1514,6 +1528,7 @@ future<quic_connected_socket> quic_client_socket::connect(socket_address sa) {
     }
 
     _connection = make_lw_shared<client_connection>(connection_ptr, this->shared_from_this(), sa);
+
 
     // TODO: Something must clean this up afterwards, most likely `quic_connected_socket`.
     _receive_fiber = receive_loop();
