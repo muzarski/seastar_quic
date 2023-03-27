@@ -57,7 +57,6 @@ public:
     virtual data_source source(quic_stream_id id) = 0;
     virtual data_sink sink(quic_stream_id id) = 0;
     virtual void shutdown_output(quic_stream_id id) = 0;
-    virtual future<> close() = 0;
 };
 
 class quic_connected_socket {
@@ -69,7 +68,6 @@ public:
     input_stream<quic_byte_type> input(quic_stream_id id);
     output_stream<quic_byte_type> output(quic_stream_id id, size_t buffer_size = 8192);
     void shutdown_output(quic_stream_id id);
-    future<> close();
 };
 
 struct quic_accept_result {
@@ -82,6 +80,7 @@ public:
     virtual ~quic_server_socket_impl() {}
     virtual future<quic_accept_result> accept() = 0;
     virtual socket_address local_address() const = 0;
+    virtual void abort_accept() noexcept = 0;
 };
 
 class quic_server_socket {
@@ -102,18 +101,22 @@ public:
     [[nodiscard]] socket_address local_address() const noexcept {
         return _impl->local_address();
     }
+    
+    void abort_accept() noexcept {
+        _impl->abort_accept();
+    };
 };
 
 // Initiate the quic server, provide certs, choose version etc.
-quic_server_socket quic_listen(const std::string& cert_file, const std::string& cert_key,
-                               const quic_connection_config& quic_config = quic_connection_config());
+//quic_server_socket quic_listen(const std::string& cert_file, const std::string& cert_key,
+//                               const quic_connection_config& quic_config = quic_connection_config());
 
-quic_server_socket quic_listen(socket_address sa, const std::string& cert_file, const std::string& cert_key,
+quic_server_socket quic_listen(const socket_address &sa, const std::string& cert_file, const std::string& cert_key,
                                const quic_connection_config& quic_config = quic_connection_config());
 
 // Initiate connection to the server, choose version etc.
 future<quic_connected_socket> 
-quic_connect(socket_address sa, const quic_connection_config& quic_config = quic_connection_config());
+quic_connect(const socket_address &sa, const quic_connection_config& quic_config = quic_connection_config());
 
 // Quiche raw logs
 void quic_enable_logging();

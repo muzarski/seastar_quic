@@ -27,6 +27,7 @@
 #include <seastar/net/api.hh>
 #include <seastar/net/quic.hh>
 #include "seastar/core/sleep.hh"
+#include <seastar/core/reactor.hh>
 
 constexpr static std::uint64_t STREAM_ID = 4;
 constexpr static std::uint64_t HUNDRED_MEGABYTES = 1000 * 1000 * 100;
@@ -48,8 +49,6 @@ seastar::future<> service_loop() {
                                                 // because the app is able to send again before the whole
                                                 // buffer is actually sent, and the program ends.
                                                 std::cout << "Able to send again!" << std::endl;
-                                            }).then([&conn] () {
-                                               return conn.close(); 
                                             });
                                         });
             });
