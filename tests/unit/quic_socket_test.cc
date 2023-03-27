@@ -39,8 +39,8 @@ using namespace seastar::net;
 
 constexpr static std::uint64_t STREAM_ID = 4;
 
-static std::string cert_file = "/home/danielmastalerz/Pulpit/seastar_quic/quiche/quiche/examples/cert.crt";
-static std::string key_file = "/home/danielmastalerz/Pulpit/seastar_quic/quiche/quiche/examples/cert.key";
+std::string cert_file = "/home/muzarski/sem5/zpp/seastar_quic/quiche/quiche/examples/cert.crt";
+std::string key_file = "/home/muzarski/sem5/zpp/seastar_quic/quiche/quiche/examples/cert.key";
 
 
 future<> handle_connection(quic_accept_result ar) {
@@ -69,9 +69,7 @@ future<> echo_server_loop() {
                 return listener.accept().then(
                         [](net::quic_accept_result ar) {
                             return handle_connection(std::move(ar));
-                        }).then([l = std::move(listener)]() mutable {
-                    // return l.abort_accept();
-                });
+                        }).then([&listener]() mutable { listener.abort_accept(); });
             });
 }
 
@@ -88,7 +86,10 @@ my_malloc_allocator malloc_allocator;
 std::pmr::polymorphic_allocator<char> allocator{&malloc_allocator};
 
 SEASTAR_TEST_CASE(socket_allocation_test) {
-    return echo_server_loop().finally([](){ engine().exit((malloc_allocator.allocs == malloc_allocator.frees) ? 0 : 1); });
+    return echo_server_loop().finally([](){ 
+        fmt::print("Allocs {}, frees {}\n", malloc_allocator.allocs, malloc_allocator.frees); 
+        engine().exit((malloc_allocator.allocs == malloc_allocator.frees) ? 0 : 1); 
+    });
 }
 
 //SEASTAR_TEST_CASE(socket_skip_test) {
