@@ -32,6 +32,7 @@
 #include <boost/thread/barrier.hpp>
 #include <boost/range/irange.hpp>
 #include <deque>
+#include <optional>
 #include <thread>
 
 /// \file
@@ -53,10 +54,14 @@ namespace internal {
 
 unsigned smp_service_group_id(smp_service_group ssg) noexcept;
 
+#ifdef SEASTAR_BUILD_SHARED_LIBS
+shard_id* this_shard_id_ptr() noexcept;
+#else
 inline shard_id* this_shard_id_ptr() noexcept {
     static thread_local shard_id g_this_shard_id;
     return &g_this_shard_id;
 }
+#endif
 
 }
 

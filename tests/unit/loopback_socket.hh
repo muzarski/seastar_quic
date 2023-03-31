@@ -27,6 +27,7 @@
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/queue.hh>
 #include <seastar/core/loop.hh>
+#include <seastar/core/sleep.hh>
 #include <seastar/core/do_with.hh>
 #include <seastar/net/stack.hh>
 #include <seastar/core/sharded.hh>
@@ -41,6 +42,7 @@ struct loopback_error_injector {
     virtual error client_rcv_error() { return error::none; }
     virtual error client_snd_error() { return error::none; }
     virtual error connect_error()    { return error::none; }
+    virtual std::chrono::microseconds connect_delay() { return std::chrono::microseconds(0); }
 };
 
 class loopback_buffer {
@@ -54,6 +56,7 @@ private:
     queue<temporary_buffer<char>> _q{1};
     loopback_error_injector* _error_injector;
     type _type;
+    promise<> _shutdown;
 public:
     loopback_buffer(loopback_error_injector* error_injection, type t) : _error_injector(error_injection), _type(t) {}
     future<> push(temporary_buffer<char>&& b) {
@@ -89,8 +92,16 @@ public:
         return _q.pop_eventually();
     }
     void shutdown() noexcept {
+        if (!_aborted) {
+            // it can be called by both -- reader and writer socket impls
+            _shutdown.set_value();
+        }
         _aborted = true;
         _q.abort(std::make_exception_ptr(std::system_error(EPIPE, std::system_category())));
+    }
+
+    future<> wait_input_shutdown() {
+        return _shutdown.get_future();
     }
 };
 
@@ -194,8 +205,7 @@ public:
         return {};
     }
     future<> wait_input_shutdown() override {
-        abort(); // No tests use this
-        return make_ready_future<>();
+        return _rx->wait_input_shutdown();
     }
 };
 
@@ -291,7 +301,15 @@ public:
                 return make_foreign(b2);
             });
         }).then([this] (foreign_ptr<lw_shared_ptr<loopback_buffer>> b2) {
-            return _factory.make_new_client_connection(_b1, std::move(b2));
+            if (_error_injector) {
+                auto delay = _error_injector->connect_delay();
+                if (delay != std::chrono::microseconds(0)) {
+                    return seastar::sleep(delay).then([this, b2 = std::move(b2)] () mutable {
+                        return _factory.make_new_client_connection(_b1, std::move(b2));
+                    });
+                }
+            }
+            return make_ready_future<connected_socket>(_factory.make_new_client_connection(_b1, std::move(b2)));
         });
     }
     virtual void set_reuseaddr(bool reuseaddr) override {}

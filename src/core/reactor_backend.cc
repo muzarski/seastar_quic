@@ -33,6 +33,7 @@
 #include <filesystem>
 #include <sys/poll.h>
 #include <sys/syscall.h>
+#include <sys/resource.h>
 
 #ifdef SEASTAR_HAVE_URING
 #include <liburing.h>
@@ -1246,11 +1247,25 @@ have_md_devices() {
     return false;
 }
 
+static size_t mlock_limit() {
+    struct ::rlimit lim;
+    int r = ::getrlimit(RLIMIT_MEMLOCK, &lim);
+    if (r == -1) {
+        return 0; // assume the worst; this is advisory anyway
+    }
+    return lim.rlim_cur;
+}
+
 static
 bool
 detect_io_uring() {
     if (!kernel_uname().whitelisted({"5.17"}) && have_md_devices()) {
         // Older kernels fall back to workqueues for RAID devices
+        return false;
+    }
+    if (!kernel_uname().whitelisted({"5.12"}) && mlock_limit() < (8 << 20)) {
+        // Older kernels lock about 32k/vcpu for the ring itself. Require 8MB of
+        // locked memory to be safe (8MB is what newer kernels and newer systemd provide)
         return false;
     }
     auto ring_opt = try_create_uring(1, false);
@@ -1659,44 +1674,7 @@ public:
         fd.fd.shutdown(how);
     }
     virtual future<size_t> read(pollable_fd_state& fd, void* buffer, size_t len) override {
-        if (fd.take_speculation(POLLIN)) {
-            try {
-                auto r = fd.fd.read(buffer, len);
-                if (r) {
-                    if (size_t(*r) == len) {
-                        fd.speculate_epoll(EPOLLIN);
-                    }
-                    return make_ready_future<size_t>(*r);
-                }
-            } catch (...) {
-                return current_exception_as_future<size_t>();
-            }
-        }
-        class read_completion final : public io_completion {
-            pollable_fd_state& _fd;
-            const size_t _to_read;
-            promise<size_t> _result;
-        public:
-            read_completion(pollable_fd_state& fd, size_t to_read)
-                : _fd(fd), _to_read(to_read) {}
-            void complete(size_t bytes) noexcept final {
-                if (bytes == _to_read) {
-                    _fd.speculate_epoll(EPOLLIN);
-                }
-                _result.set_value(bytes);
-                delete this;
-            }
-            void set_exception(std::exception_ptr eptr) noexcept final {
-                _result.set_exception(eptr);
-                delete this;
-            }
-            future<size_t> get_future() {
-                return _result.get_future();
-            }
-        };
-        auto desc = std::make_unique<read_completion>(fd, len);
-        auto req = internal::io_request::make_read(fd.fd.get(), -1, buffer, len, false);
-        return submit_request(std::move(desc), std::move(req));
+        return _r.do_read(fd, buffer, len);
     }
     virtual future<size_t> recvmsg(pollable_fd_state& fd, const std::vector<iovec>& iov) override {
         if (fd.take_speculation(POLLIN)) {
@@ -2040,15 +2018,15 @@ reactor_backend_selector reactor_backend_selector::default_backend() {
 
 std::vector<reactor_backend_selector> reactor_backend_selector::available() {
     std::vector<reactor_backend_selector> ret;
-    if (has_enough_aio_nr() && detect_aio_poll()) {
-        ret.push_back(reactor_backend_selector("linux-aio"));
-    }
-    ret.push_back(reactor_backend_selector("epoll"));
 #ifdef SEASTAR_HAVE_URING
     if (detect_io_uring()) {
         ret.push_back(reactor_backend_selector("io_uring"));
     }
 #endif
+    if (has_enough_aio_nr() && detect_aio_poll()) {
+        ret.push_back(reactor_backend_selector("linux-aio"));
+    }
+    ret.push_back(reactor_backend_selector("epoll"));
     return ret;
 }
 

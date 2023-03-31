@@ -23,13 +23,15 @@
 
 #include <seastar/core/future.hh>
 #include <seastar/core/chunked_fifo.hh>
-#include <stdexcept>
-#include <exception>
-#include <optional>
 #include <seastar/core/timer.hh>
 #include <seastar/core/abortable_fifo.hh>
 #include <seastar/core/timed_out_error.hh>
 #include <seastar/core/abort_on_expiry.hh>
+#include <cassert>
+#include <exception>
+#include <optional>
+#include <stdexcept>
+#include <utility>
 
 namespace seastar {
 
@@ -185,6 +187,35 @@ private:
         }
     };
     internal::abortable_fifo<entry, expiry_handler> _wait_list;
+
+#ifdef SEASTAR_SEMAPHORE_DEBUG
+    struct used_flag {
+        // set to true from the wait path
+        // prevents the semaphore from being moved or move-reassigned when _used
+        bool _used = false;
+
+        used_flag() = default;
+        used_flag(used_flag&& o) noexcept {
+            assert(!_used && "semaphore cannot be moved after it has been used");
+        }
+        used_flag& operator=(used_flag&& o) noexcept {
+            if (this != &o) {
+                assert(!_used && !o._used && "semaphore cannot be moved after it has been used");
+            }
+            return *this;
+        }
+        void use() noexcept {
+            _used = true;
+        }
+    };
+#else
+    struct used_flag {
+        void use() noexcept {}
+    };
+#endif
+
+    [[no_unique_address]] used_flag _used;
+
     bool has_available_units(size_t nr) const noexcept {
         return _count >= 0 && (static_cast<size_t>(_count) >= nr);
     }
@@ -241,6 +272,7 @@ public:
     ///         \ref semaphore_timed_out exception.  If the semaphore was
     ///         \ref broken(), may contain a \ref broken_semaphore exception.
     future<> wait(time_point timeout, size_t nr = 1) noexcept {
+        _used.use();
         if (may_proceed(nr)) {
             _count -= nr;
             return make_ready_future<>();
@@ -276,6 +308,7 @@ public:
     ///         \ref semaphore_aborted exception.  If the semaphore was
     ///         \ref broken(), may contain a \ref broken_semaphore exception.
     future<> wait(abort_source& as, size_t nr = 1) noexcept {
+        _used.use();
         if (may_proceed(nr)) {
             _count -= nr;
             return make_ready_future<>();
@@ -340,6 +373,7 @@ public:
     ///
     /// \param nr Amount of units to consume (default 1).
     void consume(size_t nr = 1) noexcept {
+        _used.use();
         if (_ex) {
             return;
         }
@@ -357,6 +391,7 @@ public:
     /// \param nr number of units to reduce the counter by (default 1).
     /// \return `true` if the counter had sufficient units, and was decremented.
     bool try_wait(size_t nr = 1) noexcept {
+        _used.use();
         if (may_proceed(nr)) {
             _count -= nr;
             return true;

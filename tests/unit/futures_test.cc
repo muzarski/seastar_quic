@@ -68,20 +68,16 @@ public:
     expected_exception() : runtime_error("expected") {}
 };
 
-#ifdef __clang__
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wself-move"
+#if defined(__clang__) || (defined(__GNUC__) && __GNUC__ >= 13)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wself-move"
 #endif
 SEASTAR_TEST_CASE(test_self_move) {
     future_state<std::tuple<std::unique_ptr<int>>> s1;
     s1.set(std::make_unique<int>(42));
     s1 = std::move(s1); // no crash, but the value of s1 is not defined.
 
-#if SEASTAR_API_LEVEL < 5
-    future_state<std::tuple<std::unique_ptr<int>>> s2;
-#else
     future_state<std::unique_ptr<int>> s2;
-#endif
     s2.set(std::make_unique<int>(42));
     std::swap(s2, s2);
     BOOST_REQUIRE_EQUAL(*std::move(s2).get0(), 42);
@@ -104,8 +100,8 @@ SEASTAR_TEST_CASE(test_self_move) {
 
     return make_ready_future<>();
 }
-#ifdef __clang__
-#pragma clang diagnostic pop
+#if defined(__clang__) || (defined(__GNUC__) && __GNUC__ >= 13)
+#pragma GCC diagnostic pop
 #endif
 
 static subscription<int> get_empty_subscription(std::function<future<> (int)> func) {
@@ -758,6 +754,48 @@ SEASTAR_TEST_CASE(test_map_reduce0_lifetime) {
     });
 }
 
+SEASTAR_TEST_CASE(test_map_reduce1_lifetime) {
+    struct map {
+        bool destroyed = false;
+        ~map() {
+            destroyed = true;
+        }
+        auto operator()(long x) {
+            return yield().then([this, x] {
+                BOOST_REQUIRE(!destroyed);
+                return x;
+            });
+        }
+    };
+    struct reduce {
+        long res = 0;
+        bool destroyed = false;
+        ~reduce() {
+            BOOST_TEST_MESSAGE("~reduce()");
+            destroyed = true;
+        }
+        auto operator()(long x) {
+            return yield().then([this, x] {
+                BOOST_REQUIRE(!destroyed);
+                res += x;
+                return make_ready_future<>();
+            });
+        }
+        auto get() {
+            return sleep(std::chrono::milliseconds(10)).then([this] {
+                BOOST_REQUIRE(!destroyed);
+                return res;
+            });
+        }
+    };
+    long n = 10;
+    return map_reduce(boost::make_counting_iterator<long>(0), boost::make_counting_iterator<long>(n),
+                      map{}, reduce{}).then([n] (long res) {
+        long expected = (n * (n - 1)) / 2;
+        BOOST_REQUIRE_EQUAL(res, expected);
+    });
+}
+
 // This test doesn't actually test anything - it just waits for the future
 // returned by sleep to complete. However, a bug we had in sleep() caused
 // this test to fail the sanitizer in the debug build, so this is a useful
@@ -1217,9 +1255,6 @@ SEASTAR_TEST_CASE(test_futurize_from_tuple) {
     future<int> fut1 = futurize<int>::from_tuple(v1);
     future<> fut2 = futurize<void>::from_tuple(v2);
     BOOST_REQUIRE(fut1.get0() == std::get<0>(v1));
-#if SEASTAR_API_LEVEL < 5
-    BOOST_REQUIRE(fut2.get() == v2);
-#endif
     return make_ready_future<>();
 }
 
@@ -1305,7 +1340,7 @@ SEASTAR_TEST_CASE(test_when_all_succeed_functions) {
     return when_all_succeed(f, [] {
         throw 42;
         return make_ready_future<>();
-    }, yield()).then_wrapped([] (auto res) { // type of `res` changes when SESTAR_API_LEVEL < 3
+    }, yield()).then_wrapped([] (future<std::tuple<int>> res) {
         BOOST_REQUIRE(res.available());
         BOOST_REQUIRE(res.failed());
         res.ignore_ready_future();
@@ -1480,12 +1515,6 @@ SEASTAR_THREAD_TEST_CASE(test_shared_future_with_abort) {
     BOOST_REQUIRE(f4.available());
 }
 
-#if SEASTAR_API_LEVEL < 4
-#define THEN_UNPACK then
-#else
-#define THEN_UNPACK then_unpack
-#endif
-
 SEASTAR_TEST_CASE(test_when_all_succeed_tuples) {
     return seastar::when_all_succeed(
         make_ready_future<>(),
@@ -1494,7 +1523,7 @@ SEASTAR_TEST_CASE(test_when_all_succeed_tuples) {
         make_ready_future<>(),
         make_ready_future<std::tuple<int, sstring>>(std::tuple(84, "hi")),
         make_ready_future<bool>(true)
-    ).THEN_UNPACK([] (sstring msg, int v, std::tuple<int, sstring> t, bool b) {
+    ).then_unpack([] (sstring msg, int v, std::tuple<int, sstring> t, bool b) {
         BOOST_REQUIRE_EQUAL(msg, "hello world");
         BOOST_REQUIRE_EQUAL(v, 42);
         BOOST_REQUIRE_EQUAL(std::get<0>(t), 84);
@@ -1506,7 +1535,7 @@ SEASTAR_TEST_CASE(test_when_all_succeed_tuples) {
                 make_ready_future<sstring>("hello world"),
                 make_exception_future<int>(43),
                 make_ready_future<>()
-        ).THEN_UNPACK([] (sstring, int) {
+        ).then_unpack([] (sstring, int) {
             BOOST_FAIL("shouldn't reach");
             return false;
         }).handle_exception([] (auto excp) {
@@ -1639,6 +1668,16 @@ SEASTAR_TEST_CASE(test_warn_on_broken_promise_with_no_future) {
     });
 
     return make_ready_future<>();
+}
+
+SEASTAR_TEST_CASE(test_destroy_promise_after_state_take_value) {
+    future<> f = make_ready_future<>();
+    auto p = std::make_unique<seastar::promise<>>();
+    f = p->get_future();
+    p->set_value();
+    auto g = f.then([] {});
+    p.reset();
+    return g;
 }
 
 SEASTAR_THREAD_TEST_CASE(test_exception_future_with_backtrace) {

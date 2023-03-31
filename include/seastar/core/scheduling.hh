@@ -22,6 +22,7 @@
 #pragma once
 
 #include <chrono>
+#include <functional>
 #include <typeindex>
 #include <seastar/core/sstring.hh>
 #include <seastar/core/function_traits.hh>
@@ -33,13 +34,7 @@ namespace seastar {
 
 constexpr unsigned max_scheduling_groups() { return SEASTAR_SCHEDULING_GROUPS_COUNT; }
 
-#if SEASTAR_API_LEVEL < 6
-#define SEASTAR_ELLIPSIS ...
-template <typename SEASTAR_ELLIPSIS T>
-#else
-#define SEASTAR_ELLIPSIS
 template <typename T = void>
-#endif
 class future;
 
 class reactor;
@@ -137,6 +132,8 @@ struct scheduling_group_key_config {
     std::type_index type_index;
     /// A function that will be called for each newly allocated value
     std::function<void (void*)> constructor;
+    /// A function that will be called for each value after the scheduling group is renamed.
+    std::function<void (void*)> rename;
     /// A function that will be called for each element that is about
     /// to be dealocated.
     std::function<void (void*)> destructor;
@@ -325,6 +322,10 @@ scheduling_group_from_index(unsigned index) noexcept {
     return scheduling_group(index);
 }
 
+#ifdef SEASTAR_BUILD_SHARED_LIBS
+scheduling_group*
+current_scheduling_group_ptr() noexcept;
+#else
 inline
 scheduling_group*
 current_scheduling_group_ptr() noexcept {
@@ -332,7 +333,7 @@ current_scheduling_group_ptr() noexcept {
     static thread_local scheduling_group sg;
     return &sg;
 }
-
+#endif
 }
 /// \endcond
 

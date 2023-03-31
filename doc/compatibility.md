@@ -42,7 +42,7 @@ Seastar supports gcc and clang. Ports to other compilers are
 welcome.
 
 The last two major releases of a compiler are supported (e.g.
-gcc 9 and gcc 10). Patches to support older versions are welcome,
+gcc 11 and gcc 12). Patches to support older versions are welcome,
 as long as they don't require onerous compromises.
 
 Deprecation
@@ -107,8 +107,10 @@ API Level History
 |Level|Introduced |Mandatory|Description                                   |
 |:---:|:---------:|:-------:| -------------------------------------------- |
 | 2   |  2019-07  | 2020-04 | Non-variadic futures in socket::accept()     |
-| 3   |  2020-05  |         | make_file_data_sink() closes file and returns a future<>  |
-| 4   |  2020-06  |         | Non-variadic futures in when_all_succeed()   |
+| 3   |  2020-05  | 2023-03 | make_file_data_sink() closes file and returns a future<>  |
+| 4   |  2020-06  | 2023-03 | Non-variadic futures in when_all_succeed()   |
+| 5   |  2020-08  | 2023-03 | future::get() returns std::monostate() instead of void |
+| 6   |  2020-09  | 2023-03 | future<T> instead of future<T...>            |
 
 
 Note: The "mandatory" column indicates when backwards compatibility

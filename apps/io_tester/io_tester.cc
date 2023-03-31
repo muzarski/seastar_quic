@@ -165,13 +165,16 @@ public:
 struct shard_info {
     unsigned parallelism = 0;
     unsigned rps = 0;
+    unsigned limit = std::numeric_limits<unsigned>::max();
     unsigned shares = 10;
+    std::string sched_class = "";
     uint64_t request_size = 4 << 10;
     uint64_t bandwidth = 0;
     std::chrono::duration<float> think_time = 0ms;
     std::chrono::duration<float> think_after = 0ms;
     std::chrono::duration<float> execution_time = 1ms;
     seastar::scheduling_group scheduling_group = seastar::default_scheduling_group();
+    seastar::io_priority_class io_class = seastar::default_priority_class();
 };
 
 struct options {
@@ -229,7 +232,7 @@ public:
     class_data(job_config cfg)
         : _config(std::move(cfg))
         , _alignment(_config.shard_info.request_size >= 4096 ? 4096 : 512)
-        , _iop(io_priority_class::register_one(name(), _config.shard_info.shares))
+        , _iop(cfg.shard_info.io_class)
         , _sg(cfg.shard_info.scheduling_group)
         , _latencies(extended_p_square_probabilities = quantiles)
         , _pos_distribution(0,  _config.file_size / _config.shard_info.request_size)
@@ -261,7 +264,7 @@ private:
         return parallel_for_each(boost::irange(0u, parallelism), [this, stop] (auto dummy) mutable {
             auto bufptr = allocate_aligned_buffer<char>(this->req_size(), _alignment);
             auto buf = bufptr.get();
-            return do_until([stop] { return std::chrono::steady_clock::now() > stop; }, [this, buf, stop] () mutable {
+            return do_until([this, stop] { return std::chrono::steady_clock::now() > stop || requests() > limit(); }, [this, buf, stop] () mutable {
                 auto start = std::chrono::steady_clock::now();
                 return issue_request(buf, nullptr).then([this, start, stop] (auto size) {
                     auto now = std::chrono::steady_clock::now();
@@ -282,7 +285,7 @@ private:
                 auto pause = std::chrono::duration_cast<std::chrono::microseconds>(1s) / rps;
                 auto pause_dist = _config.options.pause_fn(pause);
                 return seastar::sleep((pause / parallelism) * dummy).then([this, buf, stop, pause = pause_dist.get(), &intent, &in_flight] () mutable {
-                    return do_until([stop] { return std::chrono::steady_clock::now() > stop; }, [this, buf, stop, pause, &intent, &in_flight] () mutable {
+                    return do_until([this, stop] { return std::chrono::steady_clock::now() > stop || requests() > limit(); }, [this, buf, stop, pause, &intent, &in_flight] () mutable {
                         auto start = std::chrono::steady_clock::now();
                         in_flight++;
                         return issue_request(buf, &intent).then_wrapped([this, start, pause, stop, &in_flight] (auto size_f) {
@@ -405,6 +408,10 @@ protected:
 
     unsigned rps() const {
         return _config.shard_info.rps;
+    }
+
+    unsigned limit() const noexcept {
+        return _config.shard_info.limit;
     }
 
     unsigned shares() const {
@@ -766,9 +773,14 @@ struct convert<shard_info> {
         if (node["rps"]) {
             sl.rps = node["rps"].as<unsigned>();
         }
+        if (node["limit"]) {
+            sl.limit = node["limit"].as<unsigned>();
+        }
 
         if (node["shares"]) {
             sl.shares = node["shares"].as<unsigned>();
+        } else if (node["class"]) {
+            sl.sched_class = node["class"].as<std::string>();
         }
         if (node["bandwidth"]) {
             sl.bandwidth = node["bandwidth"].as<byte_size>().size;
@@ -955,11 +967,32 @@ int main(int ac, char** av) {
             YAML::Node doc = YAML::LoadFile(yaml);
             auto reqs = doc.as<std::vector<job_config>>();
 
-            parallel_for_each(reqs, [] (auto& r) {
-                return seastar::create_scheduling_group(r.name, r.shard_info.shares).then([&r] (seastar::scheduling_group sg) {
-                    r.shard_info.scheduling_group = sg;
+            struct sched_class {
+                seastar::scheduling_group sg;
+                seastar::io_priority_class iop;
+            };
+            std::unordered_map<std::string, sched_class> sched_classes;
+
+            parallel_for_each(reqs, [&sched_classes] (auto& r) {
+                if (r.shard_info.sched_class != "") {
+                    return make_ready_future<>();
+                }
+
+                return seastar::create_scheduling_group(r.name, r.shard_info.shares).then([&r, &sched_classes] (seastar::scheduling_group sg) {
+                    sched_classes.insert(std::make_pair(r.name, sched_class {
+                        .sg = sg,
+                        .iop = io_priority_class::register_one(r.name, r.shard_info.shares),
+                    }));
                 });
             }).get();
+
+            for (job_config& r : reqs) {
+                auto cname = r.shard_info.sched_class != "" ? r.shard_info.sched_class : r.name;
+                fmt::print("Job {} -> sched class {}\n", r.name, cname);
+                auto& sc = sched_classes.at(cname);
+                r.shard_info.scheduling_group = sc.sg;
+                r.shard_info.io_class = sc.iop;
+            }
 
             if (*st_type == directory_entry_type::block_device) {
                 uint64_t off = 0;

@@ -22,8 +22,6 @@
 #include <seastar/core/prometheus.hh>
 #include <sstream>
 
-#include <seastar/core/scollectd_api.hh>
-#include "core/scollectd-impl.hh"
 #include <seastar/core/metrics_api.hh>
 #include <seastar/http/function_handlers.hh>
 #include <boost/algorithm/string/replace.hpp>
@@ -82,9 +80,11 @@ static void add_name(std::ostream& s, const sstring& name, const std::map<sstrin
 
     if (!labels.empty()) {
         for (auto l : labels) {
-            s << delimiter;
-            s << l.first  << "=\"" << l.second << '"';
-            delimiter = ",";
+            if (!boost::algorithm::starts_with(l.first, "__")) {
+                s << delimiter;
+                s << l.first  << "=\"" << l.second << '"';
+                delimiter = ",";
+            }
         }
     }
     s << "} ";
@@ -632,7 +632,7 @@ future<> write_text_representation(output_stream<char>& out, const config& ctx, 
     });
 }
 
-class metrics_handler : public handler_base  {
+class metrics_handler : public httpd::handler_base  {
     sstring _prefix;
     config _ctx;
     static std::function<bool(const mi::labels_type&)> _true_function;
@@ -714,13 +714,13 @@ std::function<bool(const mi::labels_type&)> metrics_handler::_true_function = []
     return true;
 };
 
-future<> add_prometheus_routes(http_server& server, config ctx) {
-    server._routes.put(GET, "/metrics", new metrics_handler(ctx));
+future<> add_prometheus_routes(httpd::http_server& server, config ctx) {
+    server._routes.put(httpd::GET, "/metrics", new metrics_handler(ctx));
     return make_ready_future<>();
 }
 
-future<> add_prometheus_routes(distributed<http_server>& server, config ctx) {
-    return server.invoke_on_all([ctx](http_server& s) {
+future<> add_prometheus_routes(distributed<httpd::http_server>& server, config ctx) {
+    return server.invoke_on_all([ctx](httpd::http_server& s) {
         return add_prometheus_routes(s, ctx);
     });
 }

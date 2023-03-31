@@ -27,8 +27,8 @@
 #error Coroutines support disabled.
 #endif
 
-#include <seastar/core/std-coroutine.hh>
 #include <seastar/coroutine/exception.hh>
+#include <coroutine>
 
 namespace seastar {
 
@@ -70,11 +70,11 @@ public:
             return _promise.get_future();
         }
 
-        SEASTAR_INTERNAL_COROUTINE_NAMESPACE::suspend_never initial_suspend() noexcept { return { }; }
-        SEASTAR_INTERNAL_COROUTINE_NAMESPACE::suspend_never final_suspend() noexcept { return { }; }
+        std::suspend_never initial_suspend() noexcept { return { }; }
+        std::suspend_never final_suspend() noexcept { return { }; }
 
         virtual void run_and_dispose() noexcept override {
-            auto handle = SEASTAR_INTERNAL_COROUTINE_NAMESPACE::coroutine_handle<promise_type>::from_promise(*this);
+            auto handle = std::coroutine_handle<promise_type>::from_promise(*this);
             handle.resume();
         }
 
@@ -112,11 +112,11 @@ public:
             return _promise.get_future();
         }
 
-        SEASTAR_INTERNAL_COROUTINE_NAMESPACE::suspend_never initial_suspend() noexcept { return { }; }
-        SEASTAR_INTERNAL_COROUTINE_NAMESPACE::suspend_never final_suspend() noexcept { return { }; }
+        std::suspend_never initial_suspend() noexcept { return { }; }
+        std::suspend_never final_suspend() noexcept { return { }; }
 
         virtual void run_and_dispose() noexcept override {
-            auto handle = SEASTAR_INTERNAL_COROUTINE_NAMESPACE::coroutine_handle<promise_type>::from_promise(*this);
+            auto handle = std::coroutine_handle<promise_type>::from_promise(*this);
             handle.resume();
         }
 
@@ -142,7 +142,7 @@ public:
     }
 
     template<typename U>
-    void await_suspend(SEASTAR_INTERNAL_COROUTINE_NAMESPACE::coroutine_handle<U> hndl) noexcept {
+    void await_suspend(std::coroutine_handle<U> hndl) noexcept {
         if (!CheckPreempt || !_future.available()) {
             _future.set_coroutine(hndl.promise());
         } else {
@@ -167,7 +167,7 @@ public:
     }
 
     template<typename U>
-    void await_suspend(SEASTAR_INTERNAL_COROUTINE_NAMESPACE::coroutine_handle<U> hndl) noexcept {
+    void await_suspend(std::coroutine_handle<U> hndl) noexcept {
         if (!CheckPreempt || !_future.available()) {
             _future.set_coroutine(hndl.promise());
         } else {
@@ -192,7 +192,7 @@ public:
     }
 
     template<typename U>
-    void await_suspend(SEASTAR_INTERNAL_COROUTINE_NAMESPACE::coroutine_handle<U> hndl) noexcept {
+    void await_suspend(std::coroutine_handle<U> hndl) noexcept {
         if (!CheckPreempt || !_future.available()) {
             _future.set_coroutine(hndl.promise());
         } else {
@@ -216,13 +216,13 @@ namespace coroutine {
 /// If constructed from a future, co_await-ing it will bypass
 /// checking if the task quota is depleted, which means that
 /// a ready future will be handled immediately.
-template<typename... T> struct SEASTAR_NODISCARD without_preemption_check : public seastar::future<T...> {
+template<typename... T> struct [[nodiscard]] without_preemption_check : public seastar::future<T...> {
     explicit without_preemption_check(seastar::future<T...>&& f) noexcept : seastar::future<T...>(std::move(f)) {}
 };
-template<typename T> struct SEASTAR_NODISCARD without_preemption_check<T> : public seastar::future<T> {
+template<typename T> struct [[nodiscard]] without_preemption_check<T> : public seastar::future<T> {
     explicit without_preemption_check(seastar::future<T>&& f) noexcept : seastar::future<T>(std::move(f)) {}
 };
-template<> struct SEASTAR_NODISCARD without_preemption_check<> : public seastar::future<> {
+template<> struct [[nodiscard]] without_preemption_check<> : public seastar::future<> {
     explicit without_preemption_check(seastar::future<>&& f) noexcept : seastar::future<>(std::move(f)) {}
 };
 
@@ -273,11 +273,11 @@ auto operator co_await(coroutine::without_preemption_check<T...> f) noexcept {
 } // seastar
 
 
-namespace SEASTAR_INTERNAL_COROUTINE_NAMESPACE {
+namespace std {
 
 template<typename... T, typename... Args>
 class coroutine_traits<seastar::future<T...>, Args...> : public seastar::internal::coroutine_traits_base<T...> {
 };
 
-} // SEASTAR_INTERNAL_COROUTINE_NAMESPACE
+} // std
 

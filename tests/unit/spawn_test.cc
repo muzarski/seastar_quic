@@ -99,19 +99,22 @@ SEASTAR_TEST_CASE(test_spawn_input) {
         auto stdout = process.stdout();
         return do_with(std::move(process), std::move(stdin), std::move(stdout), [](auto& p, auto& stdin, auto& stdout) {
             return stdin.write(text).then([&stdin] {
-                return stdin.flush();
+                return stdin.close();
             }).handle_exception_type([] (std::system_error& e) {
-                testlog.error("failed to write to stdin: {}", e);
-                return make_exception_future<>(std::move(e));
+                BOOST_TEST_ERROR(fmt::format("failed to write to stdin: {}", e));
             }).then([&stdout] {
                 return stdout.read_exactly(text.size());
             }).handle_exception_type([] (std::system_error& e) {
-                testlog.error("failed to read from stdout: {}", e);
-                return make_exception_future<temporary_buffer<char>>(std::move(e));
+                BOOST_TEST_ERROR(fmt::format("failed to read from stdout: {}", e));
+                return make_ready_future<temporary_buffer<char>>();
             }).then([] (temporary_buffer<char> echo) {
                 BOOST_CHECK_EQUAL(sstring(echo.get(), echo.size()), text);
             }).finally([&p] {
-                return p.wait().discard_result();
+                return p.wait().then([](process::wait_status wstatus) {
+                    auto* exit_status = std::get_if<process::wait_exited>(&wstatus);
+                    BOOST_REQUIRE(exit_status != nullptr);
+                    BOOST_CHECK_EQUAL(exit_status->exit_code, EXIT_SUCCESS);
+                 });
             });
         });
     });
@@ -129,10 +132,14 @@ SEASTAR_TEST_CASE(test_spawn_kill) {
             auto* wait_signaled = std::get_if<experimental::process::wait_signaled>(&wait_status);
             BOOST_REQUIRE(wait_signaled != nullptr);
             BOOST_CHECK_EQUAL(wait_signaled->terminating_signal, SIGTERM);
-            // sleep should be terminated in 10ms
             auto end = std::chrono::high_resolution_clock::now();
             auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-            BOOST_CHECK_LE(ms, 10);
+            // sleep should be terminated in 10ms.
+            // pidfd_open(2) may fail and thus p.wait() falls back to
+            // waitpid(2) with backoff (at least 20ms).
+            // the minimal backoff is added to 10ms, so the test can pass on
+            // older kernels as well.
+            BOOST_CHECK_LE(ms, 10 + 20);
         });
     });
 }

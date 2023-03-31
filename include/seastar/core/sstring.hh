@@ -24,6 +24,9 @@
 #include <stdint.h>
 #include <algorithm>
 #include <cassert>
+#if __has_include(<compare>)
+#include <compare>
+#endif
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -328,7 +331,7 @@ public:
      *  @param op the function object used for setting the new content of the string
      */
     template <class Operation>
-    SEASTAR_CONCEPT( requires std::is_invocable_r<size_t, Operation, char_type*, size_t>::value )
+    SEASTAR_CONCEPT( requires std::is_invocable_r_v<size_t, Operation, char_type*, size_t> )
     void resize_and_overwrite(size_t n, Operation op) {
         if (n > size()) {
             *this = basic_sstring(initialized_later(), n);
@@ -574,9 +577,15 @@ public:
     bool operator!=(const basic_sstring& x) const noexcept {
         return !operator==(x);
     }
+#if __cpp_lib_three_way_comparison
+    constexpr std::strong_ordering operator<=>(const auto& x) const noexcept {
+        return compare(x) <=> 0;
+    }
+#else
     bool operator<(const basic_sstring& x) const noexcept {
         return compare(x) < 0;
     }
+#endif
     basic_sstring operator+(const basic_sstring& x) const {
         basic_sstring ret(initialized_later(), size() + x.size());
         std::copy(begin(), end(), ret.begin());
@@ -765,7 +774,7 @@ std::ostream& operator<<(std::ostream& os, const std::unordered_map<Key, T, Hash
         } else {
             first = false;
         }
-        os << "{ " << elem.first << " -> " << elem.second << "}";
+        os << "{" << elem.first << " -> " << elem.second << "}";
     }
     os << "}";
     return os;
@@ -775,6 +784,11 @@ std::ostream& operator<<(std::ostream& os, const std::unordered_map<Key, T, Hash
 #if FMT_VERSION >= 90000
 
 template <typename char_type, typename Size, Size max_size, bool NulTerminate>
-struct fmt::formatter<seastar::basic_sstring<char_type, Size, max_size, NulTerminate>> : fmt::ostream_formatter {};
+struct fmt::formatter<seastar::basic_sstring<char_type, Size, max_size, NulTerminate>> : fmt::formatter<std::basic_string_view<char_type>> {
+    template <typename FormatContext>
+    auto format(const ::seastar::basic_sstring<char_type, Size, max_size, NulTerminate>& s, FormatContext& ctx) const {
+        return formatter<std::basic_string_view<char_type>>::format(s, ctx);
+    }
+};
 
 #endif

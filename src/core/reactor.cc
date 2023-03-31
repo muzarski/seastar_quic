@@ -63,7 +63,6 @@
 #include <seastar/core/smp_options.hh>
 #include <seastar/util/log.hh>
 #include <seastar/util/read_first_line.hh>
-#include "core/file-impl.hh"
 #include "core/reactor_backend.hh"
 #include "core/syscall_result.hh"
 #include "core/thread_pool.hh"
@@ -517,6 +516,14 @@ future<size_t> pollable_fd_state::sendto(socket_address addr, const void* buf, s
 
 namespace internal {
 
+#ifdef SEASTAR_BUILD_SHARED_LIBS
+const preemption_monitor*& get_need_preempt_var() {
+    static preemption_monitor bootstrap_preemption_monitor;
+    static thread_local const preemption_monitor* g_need_preempt = &bootstrap_preemption_monitor;
+    return g_need_preempt;
+}
+#endif
+
 void set_need_preempt_var(const preemption_monitor* np) {
     get_need_preempt_var() = np;
 }
@@ -647,6 +654,11 @@ template class timer<steady_clock_type>;
 template class timer<lowres_clock>;
 template class timer<manual_clock>;
 
+#ifdef SEASTAR_BUILD_SHARED_LIBS
+thread_local lowres_clock::time_point lowres_clock::_now;
+thread_local lowres_system_clock::time_point lowres_system_clock::_now;
+#endif
+
 reactor::signals::signals() : _pending_signals(0) {
 }
 
@@ -719,23 +731,6 @@ void reactor::signals::failed_to_handle(int signo) {
 
 void reactor::handle_signal(int signo, noncopyable_function<void ()>&& handler) {
     _signals.handle_signal(signo, std::move(handler));
-}
-
-// Fills a buffer with a hexadecimal representation of an integer
-// and returns a pointer to the first character.
-// For example, convert_hex_safe(buf, 4, uint16_t(12)) fills the buffer with "   c".
-template<typename Integral>
-SEASTAR_CONCEPT( requires std::is_integral_v<Integral> )
-char* convert_hex_safe(char *buf, size_t bufsz, Integral n) noexcept {
-    const char *digits = "0123456789abcdef";
-    memset(buf, ' ', bufsz);
-    auto* p = buf + bufsz;
-    do {
-        assert(p > buf);
-        *--p = digits[n & 0xf];
-        n >>= 4;
-    } while (n);
-    return p;
 }
 
 // Accumulates an in-memory backtrace and flush to stderr eventually.
@@ -1129,14 +1124,17 @@ void cpu_stall_detector::maybe_report() {
 //
 // We can do it a cheaper if we don't report suppressed backtraces.
 void cpu_stall_detector::on_signal() {
-    if (reap_event_and_check_spuriousness()) {
-        return;
-    }
     auto tasks_processed = engine().tasks_processed();
     auto last_seen = _last_tasks_processed_seen.load(std::memory_order_relaxed);
     if (!last_seen) {
         return; // stall detector in not active
-    } else if (last_seen == tasks_processed) { // no task was processed - report
+    } else if (last_seen == tasks_processed) {
+        // we defer to the check of spuriousness to inside this unlikely condition
+        // since the check itself can be costly, involving a syscall (reactor::now())
+        if (is_spurious_signal()) {
+            return;
+        }
+        // no task was processed - report unless supressed
         maybe_report();
         _report_at <<= 1;
     } else {
@@ -1159,9 +1157,14 @@ void cpu_stall_detector::report_suppressions(sched_clock::time_point now) {
             buf.append("\n");
             buf.flush();
         }
-        _reported = 0;
-        _minute_mark = now;
+        reset_suppression_state(now);
     }
+}
+
+void
+cpu_stall_detector::reset_suppression_state(sched_clock::time_point now) {
+    _reported = 0;
+    _minute_mark = now;
 }
 
 void cpu_stall_detector_posix_timer::arm_timer() {
@@ -1217,11 +1220,27 @@ cpu_stall_detector_linux_perf_event::~cpu_stall_detector_linux_perf_event() {
 
 void
 cpu_stall_detector_linux_perf_event::arm_timer() {
-    uint64_t ns = (_threshold * _report_at + _slack) / 1ns;
+    auto period = _threshold * _report_at + _slack;
+    uint64_t ns =  period / 1ns;
+    _next_signal_time = reactor::now() + period;
+    
+    // clear out any existing records in the ring buffer, so when we get interrupted next time
+    // we have only the stack associated with that interrupt, and so we don't overflow.
+    data_area_reader(*this).skip_all();
     if (__builtin_expect(_enabled && _current_period == ns, 1)) {
         // Common case - we're re-arming with the same period, the counter
         // is already enabled.
-        _fd.ioctl(PERF_EVENT_IOC_RESET, 0);
+
+        // We want to set the next interrupt to ns from now, and somewhat oddly the
+        // way to do this is PERF_EVENT_IOC_PERIOD, even with the same period as
+        // already configured, see the code at:
+        //
+        // https://elixir.bootlin.com/linux/v5.15.86/source/kernel/events/core.c#L5636
+        //
+        // Ths change is intentional: kernel commit bad7192b842c83e580747ca57104dd51fe08c223
+        // so we can resumably rely on it.
+        _fd.ioctl(PERF_EVENT_IOC_PERIOD, ns);
+
     } else {
         // Uncommon case - we're moving from disabled to enabled, or changing
         // the period. Issue more calls and be careful.
@@ -1241,12 +1260,12 @@ cpu_stall_detector_linux_perf_event::start_sleep() {
 }
 
 bool
-cpu_stall_detector_linux_perf_event::reap_event_and_check_spuriousness() {
-    struct read_format {
-        uint64_t value;
-    } buf;
-    _fd.read(&buf, sizeof(read_format));
-    return buf.value < _current_period;
+cpu_stall_detector_linux_perf_event::is_spurious_signal() {
+    // If the current time is before the expected signal time, it is
+    // probably a spurious signal. One reason this could occur is that
+    // PERF_EVENT_IOC_PERIOD does not reset the current overflow point
+    // on kernels prior to 3.14 (or 3.7 on Arm).
+    return reactor::now() < _next_signal_time;
 }
 
 void
@@ -1322,10 +1341,26 @@ cpu_stall_detector_linux_perf_event::try_make(cpu_stall_detector_config cfg) {
 
 
 std::unique_ptr<cpu_stall_detector> make_cpu_stall_detector(cpu_stall_detector_config cfg) {
+    bool was_eaccess_failure = false;
     try {
-        return cpu_stall_detector_linux_perf_event::try_make(cfg);
+        try {
+            return cpu_stall_detector_linux_perf_event::try_make(cfg);
+        } catch (std::system_error& e) {
+            // This failure occurs when /proc/sys/kernel/perf_event_paranoid is set
+            // to 2 or higher, and is expected since most distributions set it to that
+            // way as of 2023. In this case we log a different message and only at INFO
+            // level on shard 0.
+            was_eaccess_failure = e.code() == std::error_code(EACCES, std::system_category());
+            throw;
+        }
     } catch (...) {
-        seastar_logger.warn("Creation of perf_event based stall detector failed, falling back to posix timer: {}", std::current_exception());
+        if (was_eaccess_failure) {
+            seastar_logger.info0("Perf-based stall detector creation failed (EACCESS), "
+                    "try setting /proc/sys/kernel/perf_event_paranoid to 1 or less to "
+                    "enable kernel backtraces: falling back to posix timer.");
+        } else {
+            seastar_logger.warn("Creation of perf_event based stall detector failed: falling back to posix timer: {}", std::current_exception());
+        }
         return std::make_unique<cpu_stall_detector_posix_timer>(cfg);
     }
 }
@@ -1370,6 +1405,7 @@ reactor::set_stall_detector_report_function(std::function<void ()> report) {
     auto cfg = _cpu_stall_detector->get_config();
     cfg.report = std::move(report);
     _cpu_stall_detector->update_config(std::move(cfg));
+    _cpu_stall_detector->reset_suppression_state(reactor::now());
 }
 
 std::function<void ()>
@@ -1966,6 +2002,11 @@ reactor::spawn(std::string_view pathname,
                 std::get<pipefd_read_end>(cin_pipe).spawn_actions_add_close(&actions);
                 std::get<pipefd_write_end>(cout_pipe).spawn_actions_add_close(&actions);
                 std::get<pipefd_write_end>(cerr_pipe).spawn_actions_add_close(&actions);
+                // tools like "cat" expect a fd opened in blocking mode when performing I/O
+                std::get<pipefd_read_end>(cin_pipe).template ioctl<int>(FIONBIO, 0);
+                std::get<pipefd_write_end>(cout_pipe).template ioctl<int>(FIONBIO, 0);
+                std::get<pipefd_write_end>(cerr_pipe).template ioctl<int>(FIONBIO, 0);
+
                 r = ::posix_spawnattr_init(&attr);
                 throw_pthread_error(r);
                 // make sure the following signals are not ignored by the child process
@@ -3668,7 +3709,7 @@ reactor_options::reactor_options(program_options::option_group* parent_group)
                 " This makes strace output more useful, but slows down the application")
     , dump_memory_diagnostics_on_alloc_failure_kind(*this, "dump-memory-diagnostics-on-alloc-failure-kind", memory::alloc_failure_kind::critical,
                 "Dump diagnostics of the seastar allocator state on allocation failure."
-                 " Accepted values: never, critical (default), always. When set to critical, only allocations marked as critical will trigger diagnostics dump."
+                 " Accepted values: none, critical (default), all. When set to critical, only allocations marked as critical will trigger diagnostics dump."
                  " The diagnostics will be written to the seastar_memory logger, with error level."
                  " Note that if the seastar_memory logger is set to debug or trace level, the diagnostics will be logged irrespective of this setting.")
     , reactor_backend(*this, "reactor-backend", backend_selector_candidates(), reactor_backend_selector::default_backend().name(),
@@ -3697,10 +3738,8 @@ smp_options::smp_options(program_options::option_group* parent_group)
     , lock_memory(*this, "lock-memory", {}, "lock all memory (prevents swapping)")
     , thread_affinity(*this, "thread-affinity", true, "pin threads to their cpus (disable for overprovisioning)")
 #ifdef SEASTAR_HAVE_HWLOC
-    , num_io_queues(*this, "num-io-queues", {}, "Number of IO queues. Each IO unit will be responsible for a fraction of the IO requests. Defaults to the number of threads")
     , num_io_groups(*this, "num-io-groups", {}, "Number of IO groups. Each IO group will be responsible for a fraction of the IO requests. Defaults to the number of NUMA nodes")
 #else
-    , num_io_queues(*this, "num-io-queues", program_options::unused{})
     , num_io_groups(*this, "num-io-groups", program_options::unused{})
 #endif
     , io_properties_file(*this, "io-properties-file", {}, "path to a YAML file describing the characteristics of the I/O Subsystem")
@@ -3908,8 +3947,6 @@ public:
             if (!_num_io_groups) {
                 throw std::runtime_error("num-io-groups must be greater than zero");
             }
-        } else if (smp_opts.num_io_queues) {
-            seastar_logger.warn("the --num-io-queues option is deprecated, switch to --num-io-groups instead");
         }
         if (smp_opts.io_properties_file && smp_opts.io_properties) {
             throw std::runtime_error("Both io-properties and io-properties-file specified. Don't know which to trust!");
@@ -4080,9 +4117,7 @@ void smp::configure(const smp_options& smp_opts, const reactor_options& reactor_
 
     resource::configuration rc;
 
-    smp::count = 1;
     smp::_tmain = std::this_thread::get_id();
-    auto nr_cpus = resource::nr_processing_units(rc);
     resource::cpuset cpu_set = get_current_cpuset();
 
     if (smp_opts.cpuset) {
@@ -4106,13 +4141,11 @@ void smp::configure(const smp_options& smp_opts, const reactor_options& reactor_
     }
 
     if (smp_opts.smp) {
-        nr_cpus = smp_opts.smp.get_value();
+        smp::count = smp_opts.smp.get_value();
     } else {
-        nr_cpus = cpu_set.size();
+        smp::count = cpu_set.size();
     }
-    smp::count = nr_cpus;
-    logger::set_shard_field_width(std::ceil(std::log10(smp::count)));
-    std::vector<reactor*> reactors(nr_cpus);
+    std::vector<reactor*> reactors(smp::count);
     if (smp_opts.memory) {
         rc.total_memory = parse_memory_size(smp_opts.memory.get_value());
 #ifdef SEASTAR_HAVE_DPDK
@@ -4139,7 +4172,7 @@ void smp::configure(const smp_options& smp_opts, const reactor_options& reactor_
     if (smp_opts.reserve_memory) {
         rc.reserve_memory = parse_memory_size(smp_opts.reserve_memory.get_value());
     }
-    rc.reserve_additional_memory = smp_opts.reserve_additional_memory;
+    rc.reserve_additional_memory_per_shard = smp_opts.reserve_additional_memory_per_shard;
     std::optional<std::string> hugepages_path;
     if (smp_opts.hugepages) {
         hugepages_path = smp_opts.hugepages.get_value();
@@ -4183,6 +4216,7 @@ void smp::configure(const smp_options& smp_opts, const reactor_options& reactor_
 #endif
 
     auto resources = resource::allocate(rc);
+    logger::set_shard_field_width(std::ceil(std::log10(smp::count)));
     std::vector<resource::cpu> allocations = std::move(resources.cpus);
     if (thread_affinity) {
         smp::pin(allocations[0].cpu_id);
@@ -4192,7 +4226,7 @@ void smp::configure(const smp_options& smp_opts, const reactor_options& reactor_
     }
 
     if (reactor_opts.abort_on_seastar_bad_alloc) {
-        memory::enable_abort_on_allocation_failure();
+        memory::set_abort_on_allocation_failure(true);
     }
 
     if (reactor_opts.dump_memory_diagnostics_on_alloc_failure_kind) {
@@ -4620,6 +4654,20 @@ reactor::allocate_scheduling_group_specific_data(scheduling_group sg, scheduling
 }
 
 future<>
+reactor::rename_scheduling_group_specific_data(scheduling_group sg) {
+    return with_scheduling_group(sg, [this, sg] {
+        auto& sg_data = _scheduling_group_specific_data;
+        auto& this_sg = sg_data.per_scheduling_group_data[sg._id];
+        for (size_t i = 0; i < sg_data.scheduling_group_key_configs.size(); ++i) {
+            auto &c = sg_data.scheduling_group_key_configs[i];
+            if (c.rename) {
+                (c.rename)(this_sg.specific_vals[i]);
+            }
+        }
+    });
+}
+
+future<>
 reactor::init_scheduling_group(seastar::scheduling_group sg, sstring name, float shares) {
     auto& sg_data = _scheduling_group_specific_data;
     auto& this_sg = sg_data.per_scheduling_group_data[sg._id];
@@ -4678,10 +4726,30 @@ reactor::destroy_scheduling_group(scheduling_group sg) noexcept {
 
 }
 
+#ifdef SEASTAR_BUILD_SHARED_LIBS
+namespace internal {
+
+scheduling_group_specific_thread_local_data** get_scheduling_group_specific_thread_local_data_ptr() noexcept {
+    static thread_local scheduling_group_specific_thread_local_data* data;
+    return &data;
+}
+
+}
+#endif
+
 void
 internal::no_such_scheduling_group(scheduling_group sg) {
     throw std::invalid_argument(format("The scheduling group does not exist ({})", internal::scheduling_group_index(sg)));
 }
+
+#ifdef SEASTAR_BUILD_SHARED_LIBS
+scheduling_group*
+internal::current_scheduling_group_ptr() noexcept {
+    // Slow unless constructor is constexpr
+    static thread_local scheduling_group sg;
+    return &sg;
+}
+#endif
 
 const sstring&
 scheduling_group::name() const noexcept {
@@ -4746,6 +4814,7 @@ rename_scheduling_group(scheduling_group sg, sstring new_name) noexcept {
     }
     return smp::invoke_on_all([sg, new_name] {
         engine()._task_queues[sg._id]->rename(new_name);
+        return engine().rename_scheduling_group_specific_data(sg);
     });
 }
 
