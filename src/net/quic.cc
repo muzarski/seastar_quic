@@ -21,6 +21,7 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/shared_future.hh>
 #include <seastar/core/shared_ptr.hh>
+#include <seastar/core/weak_ptr.hh>
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/core/queue.hh>
 #include <seastar/net/api.hh>
@@ -308,6 +309,10 @@ public:
     }
 
     future<> close() {
+        if (_closed) {
+            return seastar::make_ready_future<>();
+        }
+
         _closed = true;
         _channel.shutdown_input();
         return _read_fiber.handle_exception([this] (const std::exception_ptr& e) {
@@ -390,9 +395,10 @@ private:
         virtual void init() = 0;
         virtual future<> handle_connection_closing(const connection_id& cid) = 0;
         virtual std::string name() = 0;
+        virtual future<> close() = 0;
     };
 
-    class quic_instance {
+    class quic_instance : public weakly_referencable<quic_instance> {
     private:
         std::unique_ptr<quic_instance_impl> _impl;
 
@@ -420,6 +426,9 @@ private:
         }
         std::string name() {
             return _impl->name();
+        }
+        future<> close() {
+            return _impl->close();
         }
     };
 
@@ -475,6 +484,8 @@ private:
         // Best if we could use std::colony (C++23) or some equivalent of it.
         std::unordered_map<connection_id, lw_shared_ptr<connection>>  _connections;
         future<>                                            _send_queue;
+        future<>                                            _service_loop;
+        closing_marker                                      _is_closing;
 
     public:
         explicit quic_server_instance(quic& q, const socket_address& sa, const std::string& cert, const std::string& key,
@@ -484,6 +495,7 @@ private:
                 , _channel_manager(make_lw_shared<quic_udp_channel_manager>(sa))
                 , _buffer(MAX_DATAGRAM_SIZE)
                 , _send_queue(make_ready_future<>())
+                , _service_loop(seastar::make_ready_future())
         {}
 
         explicit quic_server_instance(quic& q, const std::string& cert, const std::string& key,
@@ -493,11 +505,11 @@ private:
                 , _channel_manager(make_lw_shared<quic_udp_channel_manager>())
                 , _buffer(MAX_DATAGRAM_SIZE)
                 , _send_queue(make_ready_future<>())
+                , _service_loop(seastar::make_ready_future())
         {}
 
         ~quic_server_instance() override = default;
 
-        future<> service_loop();
         future<> send(send_payload &&payload) override;
         future<> handle_connection_closing(const connection_id &cid) override;
 
@@ -506,8 +518,10 @@ private:
         void register_connection(const lw_shared_ptr<connection> &_conn) override;
         void init() override;
         std::string name() override;
+        future<> close() override;
 
     private:
+        future<> service_loop();
         future<> handle_datagram(udp_datagram&& datagram);
         future<> handle_post_hs_connection(const lw_shared_ptr<connection>& conn, udp_datagram&& datagram);
         // TODO: Change this function to something proper, less C-like.
@@ -543,13 +557,14 @@ private:
                 , _connection()
                 , _receive_fiber(make_ready_future<>())
                 , _closing_marker() {}
-                
+
         future<> send(send_payload&& payload) override;
         future<> handle_connection_closing(const connection_id &cid) override;
         connection_data connect(socket_address sa) override;
         void register_connection(const lw_shared_ptr<connection> &_conn) override;
         void init() override;
         std::string name() override;
+        future<> close() override;
 
         [[nodiscard]] socket_address local_address() const override {
             return _channel_manager->local_address();
@@ -693,7 +708,7 @@ public:
         // and no further clean-up is needed.
         quiche_conn*                                    _connection{};
         // The socket via which communication with the network is performed.
-        lw_shared_ptr<quic_instance>                           _socket;
+        weak_ptr<quic_instance>                         _socket;
         std::vector<quic_byte_type>                     _buffer;
 
         const socket_address                            _peer_address;
@@ -725,9 +740,8 @@ public:
         bool is_closing() const noexcept;
         future<> stream_recv_loop();
         future<> wait_send_available(quic_stream_id stream_id);
-
     public:
-        connection(quiche_conn* connection, lw_shared_ptr<quic_instance> socket,
+        connection(quiche_conn* connection, weak_ptr<quic_instance> socket,
         const socket_address& pa, const connection_id &id)
         : _connection(connection)
         , _socket(std::move(socket))
@@ -943,17 +957,30 @@ private:
         uint16_t local_port = ntohs(instance_key.as_posix_sockaddr_in().sin_port);
         auto _listener = _listening.find(local_port);
         if (_listener != _listening.end()) {
-            _listener->second->_q.push(make_lw_shared<connection>(data._conn, _instance->second, data._pa, data._id));
+            _listener->second->_q.push(make_lw_shared<connection>(data._conn, _instance->second->weak_from_this(), data._pa, data._id));
         }
     }
-    
+
 public:
     quic() = default;
     quic(const quic &other) = delete;
     quic& operator=(const quic &other) = delete;
     
     static quic &quic_engine() {
+        static bool cleanup_initialized = false;
         static thread_local quic _quic;
+        if (!cleanup_initialized) {
+            engine().at_exit(([] {
+                future<> close_tasks = seastar::make_ready_future();
+                for (auto& instance : _quic._instances) {
+                    close_tasks = close_tasks.then([instance = instance.second] {
+                        return instance->close();
+                    });
+                }
+                return close_tasks;
+            }));
+            cleanup_initialized = true;
+        }
         return _quic;
     }
     
@@ -982,7 +1009,7 @@ public:
         // fmt::print("Initiated quic client instance.\n");
         
         _instances.emplace(_quic_instance->local_address(), _quic_instance);
-        return make_lw_shared<connection>(_data._conn, _quic_instance, sa, _data._id);
+        return make_lw_shared<connection>(_data._conn, _quic_instance->weak_from_this(), sa, _data._id);
     }
 };
 
@@ -1000,6 +1027,23 @@ std::string quic::quic_server_instance::name() {
     return "server";
 }
 
+future<> quic::quic_server_instance::close() {
+    future<> close_tasks = seastar::make_ready_future<>();
+    for (auto& conn : _connections) {
+        close_tasks = close_tasks.then([conn = std::move(conn.second)] {
+            conn->close();
+            return conn->ensure_closed();
+        });
+    }
+
+    return close_tasks.then([this] {
+        _channel_manager->abort_queues(std::make_exception_ptr(user_closed_connection_exception()));
+        return _service_loop.handle_exception([this] (const std::exception_ptr& e) {
+            return _channel_manager->close();
+        });
+    });
+}
+
 quic::connection_data quic::quic_server_instance::connect(socket_address sa) {
     throw std::runtime_error("Internal API error - bad state.");
 }
@@ -1015,11 +1059,14 @@ void quic::quic_server_instance::register_connection(const lw_shared_ptr<connect
 future<> quic::quic_server_instance::service_loop() {
     // TODO: Consider changing this to seastar::repeat and passing a stop toket to it
     // once the destructor of the class has been called.
-    return keep_doing([this] {
-        return _channel_manager->read().then([this] (udp_datagram datagram) {
-            return handle_datagram(std::move(datagram));
-        });
-    });
+    return do_until(
+            [this] { return bool(_is_closing); },
+            [this] {
+                return _channel_manager->read().then([this] (udp_datagram datagram) {
+                    return handle_datagram(std::move(datagram));
+                });
+            }
+    ).then([this] { return _channel_manager->close(); });
 }
 
 future<> quic::quic_server_instance::send(send_payload &&payload) {
@@ -1032,7 +1079,7 @@ socket_address quic::quic_server_instance::local_address() const {
 
 void quic::quic_server_instance::init() {
     _channel_manager->init();
-    (void) service_loop();
+    _service_loop = service_loop();
 }
 
 future<> quic::quic_server_instance::handle_datagram(udp_datagram&& datagram) {
@@ -1269,6 +1316,10 @@ future<> quic::quic_server_instance::handle_connection_closing(const connection_
 
 std::string quic::quic_client_instance::name() {
     return "client";
+}
+
+future<> quic::quic_client_instance::close() {
+    return seastar::make_ready_future<>();
 }
 
 
@@ -1698,7 +1749,6 @@ void quic::connection::close() {
             zis->_timeout_timer.cancel();
             zis->_read_marker.mark_as_ready();
             // fmt::print("Flushed after close.\n");
-            
             for (auto &[key, stream] : zis->_streams) {
                 stream.read_queue.abort(std::make_exception_ptr(std::runtime_error("Connection is closed.")));
             }
@@ -1707,7 +1757,6 @@ void quic::connection::close() {
                 // fmt::print("Closed stream rcv fiber.\n");
                 return zis->_socket->handle_connection_closing(zis->_connection_id).then([&zis] {
                     // fmt::print("Socket handle connection finished.\n");
-                    zis->_socket.release();
                     zis->_ensure_closed_promise.set_value();
                 });
             });
