@@ -1578,8 +1578,10 @@ void quic::connection::receive(udp_datagram&& datagram) {
         // fmt::print("[Write] Writing to a stream has failed with message: {}\n", written);
     }
 
-    if (!std::cmp_equal(written, qb.size())) {
-        qb.trim_front(written);
+    const auto actually_written = static_cast<size_t>(written);
+
+    if (actually_written != qb.size()) {
+        qb.trim_front(actually_written);
         // TODO: Can a situation like this happen that Quiche keeps track
         // of a stream but we don't store it in the map? Investigate it.
         // In such a case, we should catch an exception here and report it.
@@ -1637,8 +1639,10 @@ void quic::connection::send_outstanding_data_in_streams_if_possible() {
                 // fmt::print("[Send outstanding] Writing to a stream has failed with message: {}\n", written);
             }
 
-            if (!std::cmp_equal(written, qb.size())) {
-                qb.trim_front(static_cast<size_t>(written));
+            const auto actually_written = static_cast<size_t>(written);
+
+            if (actually_written != qb.size()) {
+                qb.trim_front(actually_written);
                 queue.push_front(std::move(qb));
                 break;
             }
@@ -1661,12 +1665,9 @@ future<> quic::connection::quic_flush() {
     return repeat([this] {
         // Converts a time point stored as `timespec` to `send_time_point`.
         constexpr auto get_send_time = [](const timespec& at) constexpr -> send_time_point {
-            // TODO: Ditch modulo here when the library has fixed the issue with `timespec`.
-            // See: `https://github.com/cloudflare/quiche/pull/1403`.
-            using nsec_type = decltype(at.tv_nsec);
             return send_time_point(
                     std::chrono::duration_cast<send_time_duration>(
-                            std::chrono::seconds(at.tv_sec) + std::chrono::nanoseconds(at.tv_nsec % static_cast<nsec_type>(1e9))
+                            std::chrono::seconds(at.tv_sec) + std::chrono::nanoseconds(at.tv_nsec)
                     )
             );
         };
