@@ -19,6 +19,7 @@
 
 #include <seastar/core/seastar.hh>
 #include <seastar/core/iostream.hh>
+#include <seastar/net/socket_defs.hh>
 
 #include <cstddef>
 
