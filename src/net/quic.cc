@@ -712,6 +712,7 @@ public:
         // The socket via which communication with the network is performed.
         weak_ptr<quic_instance>                         _socket;
         std::vector<quic_byte_type>                     _buffer;
+        std::vector<quic_byte_type>                     _out_buffer;
 
         const socket_address                            _peer_address;
 
@@ -748,6 +749,7 @@ public:
         : _connection(connection)
         , _socket(std::move(socket))
         , _buffer(MAX_DATAGRAM_SIZE)
+        , _out_buffer(MAX_DATAGRAM_SIZE)
         , _peer_address(pa)
         , _send_timer()
         , _timeout_timer()
@@ -765,6 +767,7 @@ public:
         : _connection(std::exchange(other._connection, nullptr))
         , _socket(std::move(other._socket))
         , _buffer(std::move(other._buffer))
+        , _out_buffer(std::move(other._out_buffer))
         , _peer_address(other._peer_address)
         , _send_timer(std::move(other._send_timer))
         , _timeout_timer(std::move(other._timeout_timer))
@@ -1661,9 +1664,6 @@ void quic::connection::send_outstanding_data_in_streams_if_possible() {
 }
 
 future<> quic::connection::quic_flush() {
-    // TODO: Why not use `_buffer` instead?
-    static uint8_t out[MAX_DATAGRAM_SIZE];
-
     return repeat([this] {
         // Converts a time point stored as `timespec` to `send_time_point`.
         constexpr auto get_send_time = [](const timespec& at) constexpr -> send_time_point {
@@ -1675,7 +1675,7 @@ future<> quic::connection::quic_flush() {
         };
 
         quiche_send_info send_info;
-        const auto written = quiche_conn_send(_connection, out, sizeof(out), &send_info);
+        const auto written = quiche_conn_send(_connection, reinterpret_cast<uint8_t *>(_out_buffer.data()), _out_buffer.size(), &send_info);
 
         if (written == QUICHE_ERR_DONE) {
             return make_ready_future<stop_iteration>(stop_iteration::yes);
@@ -1685,7 +1685,7 @@ future<> quic::connection::quic_flush() {
             throw std::runtime_error("Failed to create a packet.");
         }
 
-        quic_buffer qb{reinterpret_cast<quic_byte_type*>(out), static_cast<size_t>(written)};
+        quic_buffer qb{_out_buffer.data(), static_cast<size_t>(written)};
         send_payload payload{std::move(qb), send_info.to, send_info.to_len};
 
         const send_time_point send_time = get_send_time(send_info.at);
