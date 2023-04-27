@@ -74,7 +74,7 @@ class user_closed_connection_exception : public std::exception {
 class quiche_configuration final {
 private:
     // TODO: For the time being, store these statically to make development easier.
-    constexpr static const char PROTOCOL_LIST[] = "\x0ahq-interop\x05hq-29\x05hq-28\x05hq-27\x08http/0.9";
+    //constexpr static const char PROTOCOL_LIST[] = "\x0ahq-interop\x05hq-29\x05hq-28\x05hq-27\x08http/0.9";
 
 private:
     quiche_config* _config = nullptr;
@@ -103,8 +103,8 @@ public:
         // TODO check return value
         quiche_config_set_application_protos(
             _config,
-            reinterpret_cast<const uint8_t*>(PROTOCOL_LIST),
-            sizeof(PROTOCOL_LIST) - 1
+            reinterpret_cast<const uint8_t*>(QUICHE_H3_APPLICATION_PROTOCOL),
+            sizeof(QUICHE_H3_APPLICATION_PROTOCOL) - 1
         );
 
         constexpr auto convert_cc = [](quic_cc_algorithm cc) constexpr noexcept -> quiche_cc_algorithm {
@@ -139,7 +139,7 @@ public:
             constexpr decltype(return_code) OK_CODE = 0;
             if (return_code != OK_CODE) {
                 // TODO: For the time being, to make development a bit easier.
-                // fmt::print(stderr, "Error while initializing the QUIC configuration: \"{}\"", msg);
+                fmt::print(stderr, "Error while initializing the QUIC configuration: \"{}\"", msg);
                 throw std::runtime_error("Could not initialize a quiche configuration.");
             }
         };
@@ -646,6 +646,143 @@ public:
             bool                            shutdown_output = false;
         };
 
+        // It's only proof of concept! The final design will be different.
+        class http3_connection {
+        private:
+            quiche_h3_config* h3_config;
+            quiche_h3_conn* h3_conn;
+            quiche_conn* conn;
+        public:
+            bool do_flush = false;
+            http3_connection() = default;
+            explicit http3_connection(quiche_conn* conn) : conn(conn) {
+                h3_config = quiche_h3_config_new();
+                if (h3_config == nullptr) {
+                    fmt::print("failed to create HTTP/3 config\n");
+                }
+                h3_conn = quiche_h3_conn_new_with_transport(conn, h3_config);
+                fmt::print("Created new HTTP/3 connection.\n");
+            }
+
+            ~http3_connection() {
+                fmt::print("Destroying HTTP/3 connection.\n");
+//                quiche_h3_config_free(h3_config);
+//                quiche_h3_conn_free(h3_conn);
+            }
+
+            static int for_each_header(uint8_t *name, size_t name_len,
+                                       uint8_t *value, size_t value_len,
+                                       void *argp) {
+                fmt::print("DEBUG:HEADER\n");
+                fprintf(stderr, "got HTTP header: %.*s=%.*s\n",
+                        (int) name_len, name, (int) value_len, value);
+
+                return 0;
+            }
+
+            future<> http3_handle() {
+//                if (h3_config != nullptr && conn != nullptr && h3_conn != nullptr) {
+//                    fmt::print("Sanity check\n");
+//                }
+//                return seastar::make_ready_future<>();
+                do_flush = false;
+                if (conn == nullptr) {
+                    fmt::print("It's NULL\n");
+                }
+                if (!quiche_conn_is_established(conn) && conn != nullptr) {
+                    return seastar::make_ready_future<>();
+                }
+                return repeat([this] {
+                    quiche_h3_event *ev;
+                    int64_t s = quiche_h3_conn_poll(h3_conn, conn, &ev);
+                    if (s < 0) {
+                        return make_ready_future<stop_iteration>(stop_iteration::yes);
+                    }
+                    fmt::print("POLL RES = {}\n", s);
+                    do_flush = true;
+
+
+
+
+                    switch (quiche_h3_event_type(ev)) {
+                        case QUICHE_H3_EVENT_HEADERS: {
+                            fmt::print("QUICHE_H3_EVENT_HEADERS\n");
+                            quiche_h3_header headers[] = {
+                                    {
+                                            .name = (const uint8_t *) ":status",
+                                            .name_len = sizeof(":status") - 1,
+
+                                            .value = (const uint8_t *) "200",
+                                            .value_len = sizeof("200") - 1,
+                                    },
+
+                                    {
+                                            .name = (const uint8_t *) "server",
+                                            .name_len = sizeof("server") - 1,
+
+                                            .value = (const uint8_t *) "quiche",
+                                            .value_len = sizeof("quiche") - 1,
+                                    },
+
+                                    {
+                                            .name = (const uint8_t *) "content-length",
+                                            .name_len = sizeof("content-length") - 1,
+
+                                            .value = (const uint8_t *) "5",
+                                            .value_len = sizeof("5") - 1,
+                                    },
+                            };
+
+                            auto res = quiche_h3_send_response(h3_conn, conn,
+                                                               s, headers, 3, false);
+                            fmt::print("quiche_h3_send_response: {}\n", res);
+
+                            char response_body[] = "<b>You're using HTTP over QUIC!<b>\n";
+                            size_t response_body_len = strlen(response_body);
+
+                            res = quiche_h3_send_body(h3_conn, conn,
+                                                      s, (uint8_t *) response_body, response_body_len, true);
+                            fmt::print("QUICHE_H3_send_body: {}\n", res);
+                            break;
+                        }
+
+                        case QUICHE_H3_EVENT_DATA: {
+                            fmt::print("QUICHE_H3_EVENT_DATA\n");
+                            break;
+                        }
+
+                        case QUICHE_H3_EVENT_FINISHED:
+                            fmt::print("QUICHE_H3_EVENT_FINISHED\n");
+                            break;
+
+                        case QUICHE_H3_EVENT_RESET:
+                            fmt::print("QUICHE_H3_EVENT_RESET\n");
+                            break;
+
+                        case QUICHE_H3_EVENT_PRIORITY_UPDATE:
+                            fmt::print("QUICHE_H3_EVENT_PRIORITY_UPDATE\n");
+                            break;
+
+                        case QUICHE_H3_EVENT_DATAGRAM:
+                            fmt::print("QUICHE_H3_EVENT_DATAGRAM\n");
+                            break;
+
+                        case QUICHE_H3_EVENT_GOAWAY: {
+                            fmt::print("QUICHE_H3_EVENT_GOAWAY\n");
+                            break;
+                        }
+                    }
+
+                    quiche_h3_event_free(ev);
+
+                    return make_ready_future<stop_iteration>(stop_iteration::no);
+                }).then([] {
+                   return seastar::make_ready_future<>();
+                });
+            }
+
+        };
+
         // Class providing a way to mark data if there is some data
         // to be processed by the streams.
         class read_marker {
@@ -654,13 +791,19 @@ public:
             // a means to mark if there may be some data to be processed by
             // the streams, and to check the marker.
             shared_promise<>    _readable         = shared_promise<>{};
+            shared_promise<>    _h3_readable      = shared_promise<>{};
             // Equals to `true` if and only if the promise `_readable`
             // has been assigned a value.
             bool                _promise_resolved = false;
+            bool                _h3_promise_resolved = false;
 
         public:
             decltype(auto) get_shared_future() const noexcept {
                 return _readable.get_shared_future();
+            }
+
+            decltype(auto) get_h3_shared_future() const noexcept {
+                return _h3_readable.get_shared_future();
             }
 
             void mark_as_ready() noexcept {
@@ -670,10 +813,24 @@ public:
                 }
             }
 
+            void mark_as_h3_ready() noexcept {
+                if (!_h3_promise_resolved) {
+                    _h3_readable.set_value();
+                    _h3_promise_resolved = true;
+                }
+            }
+
             void reset() noexcept {
                 if (_promise_resolved) {
                     _readable = shared_promise<>{};
                     _promise_resolved = false;
+                }
+            }
+
+            void h3_reset() noexcept {
+                if (_h3_promise_resolved) {
+                    _h3_readable = shared_promise<>{};
+                    _h3_promise_resolved = false;
                 }
             }
         };
@@ -714,6 +871,10 @@ public:
         const socket_address                            _peer_address;
 
         std::unordered_map<quic_stream_id, quic_stream> _streams;
+    public:
+        http3_connection                                _http3_conn;
+        bool                                            _http3_conn_init = false;
+    private:
 
         send_timer                                      _send_timer;
         timeout_timer                                   _timeout_timer;
@@ -764,6 +925,7 @@ public:
         , _socket(std::move(other._socket))
         , _buffer(std::move(other._buffer))
         , _peer_address(other._peer_address)
+        , _http3_conn(other._http3_conn)
         , _send_timer(std::move(other._send_timer))
         , _timeout_timer(std::move(other._timeout_timer))
         , _send_queue(std::move(other._send_queue))
@@ -820,6 +982,13 @@ public:
         socket_address remote_address();
         future<> connect_done();
         connection_id cid();
+
+        // to make development easier
+        future <> wait_h3_readable();
+        bool is_readable();
+        void h3_ready();
+        void h3_reset();
+
     };
     
     class listener {
@@ -876,7 +1045,7 @@ public:
                 , _stream_id(stream_id) {}
 
         future<quic_buffer> get() override {
-            // fmt::print("Called get.\n");
+            fmt::print("Called get.\n");
             return _connection->read(_stream_id);
         }
     };
@@ -935,6 +1104,28 @@ public:
         void shutdown_output(quic_stream_id stream_id) override {
             _connection->shutdown_output(stream_id);
         }
+
+        future<> h3_poll() override {
+
+
+
+            if (_connection->_http3_conn_init) {
+                return _connection->_http3_conn.http3_handle().then([this] {
+                    if (_connection->is_readable()) {
+                        _connection->h3_reset();
+                    }
+                    if (_connection->_http3_conn.do_flush) {
+                        fmt::print("Flush after http3 action\n");
+                        return _connection->quic_flush();
+                    } else {
+                        return seastar::make_ready_future<>();
+                    }
+                });
+            }
+            fmt::print("WARN -- HTTP3 CONN NOT INITIALIZED YET\n");
+            return seastar::make_ready_future<>();
+
+        }
         
         ~quiche_quic_connected_socket_impl() noexcept override {
             _connection->close();
@@ -950,7 +1141,7 @@ private:
     void add_accepted_connection(const socket_address& instance_key, connection_data&& data) {
         auto _instance = _instances.find(instance_key);
         if (_instance == _instances.end()) {
-            // fmt::print("Finding an instance has failed.\n");
+            fmt::print("Finding an instance has failed.\n");
             return;
         }
         
@@ -992,7 +1183,7 @@ public:
         auto instance = make_lw_shared<quic_instance>(
                 std::make_unique<quic_server_instance>(*this, sa, cert_file, cert_key, quic_config));
         instance->init();
-        // fmt::print("Initiated quic server instance.\n");
+        fmt::print("Initiated quic server instance.\n");
         _instances.emplace(sa, std::move(instance));
         return listener{*this, ntohs(sa.as_posix_sockaddr_in().sin_port), queue_length, sa};
     }
@@ -1006,7 +1197,7 @@ public:
             throw std::runtime_error("quiche_conn has failed.");
         }
         _quic_instance->init();
-        // fmt::print("Initiated quic client instance.\n");
+        fmt::print("Initiated quic client instance.\n");
         
         _instances.emplace(_quic_instance->local_address(), _quic_instance);
         return make_lw_shared<connection>(_data._conn, _quic_instance->weak_from_this(), sa, _data._id);
@@ -1105,7 +1296,7 @@ future<> quic::quic_server_instance::handle_datagram(udp_datagram&& datagram) {
     );
 
     if (parse_header_result < 0) {
-        // fmt::print(stderr, "Failed to parse a QUIC header: {}\n", parse_header_result);
+        fmt::print(stderr, "Failed to parse a QUIC header: {}\n", parse_header_result);
         return make_ready_future<>();
     }
 
@@ -1159,12 +1350,12 @@ future<> quic::quic_server_instance::handle_pre_hs_connection(quic_header_info& 
                                                                   connection_id& key)
 {
     if (!quiche_version_is_supported(header_info.version)) {
-        // fmt::print("Negotiating the version...\n");
+        fmt::print("Negotiating the version...\n");
         return negotiate_version(header_info, std::move(datagram));
     }
 
     if (header_info.token.size == 0) {
-        // fmt::print("quic_retry...\n");
+        fmt::print("quic_retry...\n");
         return quic_retry(header_info, std::move(datagram));
     }
 
@@ -1186,7 +1377,7 @@ future<> quic::quic_server_instance::handle_pre_hs_connection(quic_header_info& 
     );
 
     if (!validated_token) {
-        // fmt::print(stderr, "Invalid address validation token.\n");
+        fmt::print(stderr, "Invalid address validation token.\n");
         return make_ready_future<>();
     }
 
@@ -1203,7 +1394,7 @@ future<> quic::quic_server_instance::handle_pre_hs_connection(quic_header_info& 
     );
 
     if (connection == nullptr) {
-        // fmt::print(stderr, "Creating a connection has failed.\n");
+        fmt::print(stderr, "Creating a connection has failed.\n");
         return make_ready_future<>();
     }
     
@@ -1226,7 +1417,7 @@ future<> quic::quic_server_instance::negotiate_version(const quic_header_info& h
     );
 
     if (written < 0) {
-        // fmt::print(stderr, "negotiate_version: failed to created a packet. Return value: {}\n", written);
+        fmt::print(stderr, "negotiate_version: failed to created a packet. Return value: {}\n", written);
         return make_ready_future<>();
     }
 
@@ -1263,7 +1454,7 @@ future<> quic::quic_server_instance::quic_retry(const quic_header_info& header_i
     );
 
     if (written < 0) {
-        // fmt::print(stderr, "Failed to create a retry QUIC packet. Return value: {}\n", written);
+        fmt::print(stderr, "Failed to create a retry QUIC packet. Return value: {}\n", written);
         return make_ready_future<>();
     }
 
@@ -1399,6 +1590,23 @@ future<> quic::connection::ensure_closed() {
     return _ensure_closed_promise.get_future();
 }
 
+bool quic::connection::is_readable() {
+    return quiche_conn_is_readable(_connection);
+}
+
+future<> quic::connection::wait_h3_readable() {
+    return _read_marker.get_h3_shared_future();
+}
+
+void quic::connection::h3_ready() {
+    return _read_marker.mark_as_h3_ready();
+}
+
+void quic::connection::h3_reset() {
+    return _read_marker.h3_reset();
+}
+
+
 future<> quic::connection::connect_done() {
     return _connect_done_promise->get_future();
 }
@@ -1414,7 +1622,7 @@ future<> quic::connection::stream_recv_loop() {
 
                 // TODO for danmas: think about it
                 if (quiche_conn_stream_finished(_connection, stream_id)) {
-                    // fmt::print("LOL.\n");
+                    fmt::print("LOL.\n");
                     stream.read_queue.push(temporary_buffer<char>("", 0));
                     continue;
                 }
@@ -1429,9 +1637,12 @@ future<> quic::connection::stream_recv_loop() {
                             &fin
                     );
 
+                    _buffer[_buffer.size()] = '\0';
+                    std::cout << "Recv: " << _buffer.data() << "\n";
+
                     if (recv_result < 0) {
                         // TODO: Handle this properly.
-                        // fmt::print(stderr, "Reading from a stream has failed with message: {}\n", recv_result);
+                        fmt::print(stderr, "Reading from a stream has failed with message: {}\n", recv_result);
                     } else {
                         quic_buffer message{_buffer.data(), static_cast<size_t>(recv_result)};
                         // TODO: Wrap this in some kind of `not_full` future
@@ -1445,11 +1656,11 @@ future<> quic::connection::stream_recv_loop() {
             quiche_stream_iter_free(iter);
 
             if (!quiche_conn_is_readable(_connection)) {
-                // fmt::print("Read marker reset.\n");
+                fmt::print("Read marker reset.\n");
                 _read_marker.reset();
             }
             else {
-                // fmt::print("READABLE?\n");
+                fmt::print("READABLE?\n");
             }
 
             return quic_flush();
@@ -1500,7 +1711,7 @@ void quic::connection::init() {
     _timeout_timer.set_callback([this] {
         quiche_conn_on_timeout(_connection);
         if (is_closed()) {
-            // fmt::print("Conn is closed after on_timeout {}.\n", _socket->name());
+            fmt::print("Conn is closed after on_timeout {}.\n", _socket->name());
             close();
             return;
         }
@@ -1514,6 +1725,10 @@ void quic::connection::init() {
 }
 
 void quic::connection::receive(udp_datagram&& datagram) {
+
+    static int num = 0;
+    fmt::print("quic::connection::receive num={}\n", num++);
+
     auto* fa = datagram.get_data().fragment_array();
     auto pa = _peer_address.as_posix_sockaddr();
     auto la = _socket->local_address().as_posix_sockaddr();
@@ -1532,24 +1747,34 @@ void quic::connection::receive(udp_datagram&& datagram) {
             &recv_info
     );
 
+    fmt::print("QUICHE_CONN_RECV\n");
+
     if (recv_result < 0) {
-        // fmt::print(stderr, "Failed to process a QUIC packet. Return value: {}\n", recv_result);
+        fmt::print(stderr, "Failed to process a QUIC packet. Return value: {}\n", recv_result);
         return;
     }
     if (is_closed()) {
-        // fmt::print("Conn is closed after receive {}.\n", _socket->name());
+        fmt::print("Conn is closed after receive {}.\n", _socket->name());
         close();
         return;
+    }
+
+    if (quiche_conn_is_established(_connection) && !this->_http3_conn_init) {
+        this->_http3_conn = http3_connection(_connection);
+        this->_http3_conn_init = true;
+        fmt::print("SET HTTP3\n");
     }
     
     if (_connect_done_promise && quiche_conn_is_established(_connection)) {
         _connect_done_promise->set_value();
         _connect_done_promise = std::nullopt;
     }
-        
+
     if (quiche_conn_is_readable(_connection)) {
-        // fmt::print("SET READABLE.\n");
-        _read_marker.mark_as_ready();
+        fmt::print("SET READABLE.\n");
+//        _read_marker.mark_as_ready();
+        _read_marker.mark_as_h3_ready();
+
     }
 }
 
@@ -1575,7 +1800,7 @@ void quic::connection::receive(udp_datagram&& datagram) {
 
     if (written < 0) {
         // TODO: Handle the error.
-        // fmt::print("[Write] Writing to a stream has failed with message: {}\n", written);
+        fmt::print("[Write] Writing to a stream has failed with message: {}\n", written);
     }
 
     const auto actually_written = static_cast<size_t>(written);
@@ -1636,7 +1861,7 @@ void quic::connection::send_outstanding_data_in_streams_if_possible() {
 
             if (written < 0) {
                 // TODO: Handle quiche error.
-                // fmt::print("[Send outstanding] Writing to a stream has failed with message: {}\n", written);
+                fmt::print("[Send outstanding] Writing to a stream has failed with message: {}\n", written);
             }
 
             const auto actually_written = static_cast<size_t>(written);
@@ -1749,15 +1974,15 @@ void quic::connection::close() {
             zis->_send_timer.cancel();
             zis->_timeout_timer.cancel();
             zis->_read_marker.mark_as_ready();
-            // fmt::print("Flushed after close.\n");
+            fmt::print("Flushed after close.\n");
             for (auto &[key, stream] : zis->_streams) {
                 stream.read_queue.abort(std::make_exception_ptr(std::runtime_error("Connection is closed.")));
             }
 
             return zis->_stream_recv_fiber.then([&zis] {
-                // fmt::print("Closed stream rcv fiber.\n");
+                fmt::print("Closed stream rcv fiber.\n");
                 return zis->_socket->handle_connection_closing(zis->_connection_id).then([&zis] {
-                    // fmt::print("Socket handle connection finished.\n");
+                    fmt::print("Socket handle connection finished.\n");
                     zis->_ensure_closed_promise.set_value();
                 });
             });
@@ -1855,6 +2080,10 @@ output_stream<quic_byte_type> quic_connected_socket::output(quic_stream_id id, s
 
 void quic_connected_socket::shutdown_output(quic_stream_id id) {
     return _impl->shutdown_output(id);
+}
+
+future<> quic_connected_socket::h3_poll() {
+    return _impl->h3_poll();
 }
 
 void quic_enable_logging() {

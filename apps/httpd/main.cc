@@ -42,20 +42,25 @@ class handl : public httpd::handler_base {
 public:
     virtual future<std::unique_ptr<http::reply> > handle(const sstring& path,
             std::unique_ptr<http::request> req, std::unique_ptr<http::reply> rep) {
-        rep->_content = "hello";
+        rep->_content = "<b>You're using HTTP over TCP!<b>\n";
         rep->done("html");
+        rep->add_header("Alt-Svc", "h3=\":1234\"; ma=86400, h3-29=\":1234\"; ma=86400");
+
         return make_ready_future<std::unique_ptr<http::reply>>(std::move(rep));
     }
 };
 
 void set_routes(routes& r) {
-    function_handler* h1 = new function_handler([](const_req req) {
-        return "hello";
-    });
+//    function_handler* h1 = new function_handler([](const_req req) {
+//        return "hello";
+//    });
     function_handler* h2 = new function_handler([](std::unique_ptr<http::request> req) {
         return make_ready_future<json::json_return_type>("json-future");
     });
-    r.add(operation_type::GET, url("/"), h1);
+
+    handl* quic = new handl();
+
+    r.add(operation_type::GET, url("/"), quic);
     r.add(operation_type::GET, url("/jf"), h2);
     r.add(operation_type::GET, url("/file").remainder("path"),
             new directory_handler("/"));
@@ -75,7 +80,7 @@ int main(int ac, char** av) {
     prometheus::config pctx;
     app_template app;
 
-    app.add_options()("port", bpo::value<uint16_t>()->default_value(10000), "HTTP Server port");
+    app.add_options()("port", bpo::value<uint16_t>()->default_value(443), "HTTP Server port");
     app.add_options()("prometheus_port", bpo::value<uint16_t>()->default_value(9180), "Prometheus port. Set to zero in order to disable.");
     app.add_options()("prometheus_address", bpo::value<sstring>()->default_value("0.0.0.0"), "Prometheus address");
     app.add_options()("prometheus_prefix", bpo::value<sstring>()->default_value("seastar_httpd"), "Prometheus metrics prefix");
@@ -108,6 +113,24 @@ int main(int ac, char** av) {
             uint16_t port = config["port"].as<uint16_t>();
             auto server = new http_server_control();
             auto rb = make_shared<api_registry_builder>("apps/httpd/");
+
+            seastar::shared_ptr<seastar::tls::credentials_builder> creds = seastar::make_shared<seastar::tls::credentials_builder>();
+            sstring ms_cert = "/home/daniel/Desktop/seastar_quic/cmake-build-debug/apps/httpd/localhost.pem";
+            sstring ms_key = "/home/daniel/Desktop/seastar_quic/cmake-build-debug/apps/httpd/localhost-key.pem";
+
+            creds->set_dh_level(seastar::tls::dh_params::level::MEDIUM);
+
+            creds->set_x509_key_file(ms_cert, ms_key, seastar::tls::x509_crt_format::PEM).get();
+            creds->set_system_trust().get();
+            std::cout << "set keys\n";
+
+
+            server->server().invoke_on_all([creds](http_server& server) {
+                server.set_tls_credentials(creds->build_server_credentials());
+                return make_ready_future<>();
+            }).get();
+
+
             server->start().get();
             server->set_routes(set_routes).get();
             server->set_routes([rb](routes& r){rb->set_api_doc(r);}).get();

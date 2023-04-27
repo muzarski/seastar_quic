@@ -28,36 +28,26 @@
 #include <seastar/net/quic.hh>
 #include <seastar/core/sleep.hh>
 
-constexpr static std::uint64_t STREAM_ID = 4;
 
-static size_t rcv_bytes = 0;
 static size_t accepted_conns = 0;
 
 std::vector<seastar::future<>> vec;
 
 seastar::future<> handle_connection(seastar::net::quic_accept_result accept_result) {
     std::cout << "Accepted connection!" << std::endl;
-    auto conn = std::move(accept_result.connection);
-    auto in = conn.input(STREAM_ID);
-    return seastar::do_with(std::move(conn), std::move(in), [](auto &conn, auto &in) {
-         return seastar::do_until([&in] () { return in.eof(); }, [&in]() {
-            return in.read().then([](seastar::temporary_buffer<char> buf) {
-                if (buf.empty()) {
-                    return seastar::make_ready_future<>();
-                }
-
-                rcv_bytes += buf.size();
-                std::cout << "Received " << buf.size() << " bytes, total " << (double) rcv_bytes / 1000000.0 << "MB" << std::endl;
-                return seastar::make_ready_future();
-            });
+    // just let quic do its stuff
+    return seastar::do_with(std::move(accept_result.connection), [](auto& conn) {
+        return seastar::keep_doing([&conn] () {
+           return conn.h3_poll();
         });
     });
+
 }
 
 seastar::future<> service_loop() {
     // TODO: Either add keys to the repo or generate them here.
-    std::string cert_file = "/home/muzarski/sem5/zpp/seastar_quic/quiche/quiche/examples/cert.crt";
-    std::string key_file = "/home/muzarski/sem5/zpp/seastar_quic/quiche/quiche/examples/cert.key";
+    std::string cert_file = "/home/daniel/Desktop/seastar_quic/cmake-build-debug/apps/httpd/localhost.pem";
+    std::string key_file = "/home/daniel/Desktop/seastar_quic/cmake-build-debug/apps/httpd/localhost-key.pem";
 
     return seastar::do_with(seastar::net::quic_listen(seastar::make_ipv4_address({1234}), cert_file, key_file),
                             [](auto &listener) {
