@@ -681,6 +681,7 @@ public:
             }
 
             future<> http3_handle() {
+                fmt::print("IN HANDLER\n");
 //                if (h3_config != nullptr && conn != nullptr && h3_conn != nullptr) {
 //                    fmt::print("Sanity check\n");
 //                }
@@ -728,8 +729,8 @@ public:
                                             .name = (const uint8_t *) "content-length",
                                             .name_len = sizeof("content-length") - 1,
 
-                                            .value = (const uint8_t *) "5",
-                                            .value_len = sizeof("5") - 1,
+                                            .value = (const uint8_t *) "36",
+                                            .value_len = sizeof("36") - 1,
                                     },
                             };
 
@@ -1106,20 +1107,19 @@ public:
         }
 
         future<> h3_poll() override {
-
-
-
             if (_connection->_http3_conn_init) {
-                return _connection->_http3_conn.http3_handle().then([this] {
-                    if (_connection->is_readable()) {
-                        _connection->h3_reset();
-                    }
-                    if (_connection->_http3_conn.do_flush) {
-                        fmt::print("Flush after http3 action\n");
-                        return _connection->quic_flush();
-                    } else {
-                        return seastar::make_ready_future<>();
-                    }
+                return _connection->wait_h3_readable().then([this] {
+                    return _connection->_http3_conn.http3_handle().then([this] {
+                        if (!_connection->is_readable()) {
+                            _connection->h3_reset();
+                        }
+                        if (_connection->_http3_conn.do_flush) {
+                            fmt::print("Flush after http3 action\n");
+                            return _connection->quic_flush();
+                        } else {
+                            return seastar::make_ready_future<>();
+                        }
+                    });
                 });
             }
             fmt::print("WARN -- HTTP3 CONN NOT INITIALIZED YET\n");

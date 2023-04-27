@@ -49,9 +49,9 @@ seastar::future<> service_loop() {
     std::string cert_file = "/home/daniel/Desktop/seastar_quic/cmake-build-debug/apps/httpd/localhost.pem";
     std::string key_file = "/home/daniel/Desktop/seastar_quic/cmake-build-debug/apps/httpd/localhost-key.pem";
 
-    return seastar::do_with(seastar::net::quic_listen(seastar::make_ipv4_address({1234}), cert_file, key_file),
+    return seastar::do_with(seastar::net::quic_listen(seastar::make_ipv4_address({12345}), cert_file, key_file),
                             [](auto &listener) {
-                                return seastar::do_until([] () { return accepted_conns >= 3; }, [&listener]() {
+                                return seastar::do_until([] () { return accepted_conns >= 100; }, [&listener]() {
                                     return listener.accept().then([](seastar::net::quic_accept_result result) {
                                         accepted_conns++;
                                         vec.push_back(handle_connection(std::move(result)));
