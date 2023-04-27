@@ -116,7 +116,9 @@ public:
             return QUICHE_CC_RENO;
         };
 
-        quiche_config_set_max_idle_timeout(_config, config.max_idle_timeout);
+        if (config.max_idle_timeout) {
+            quiche_config_set_max_idle_timeout(_config, config.max_idle_timeout.value());
+        }
         quiche_config_set_max_recv_udp_payload_size(_config, config.max_recv_udp_payload_size);
         quiche_config_set_max_send_udp_payload_size(_config, config.max_send_udp_payload_size);
         quiche_config_set_initial_max_data(_config, config.initial_max_data);

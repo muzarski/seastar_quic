@@ -33,20 +33,20 @@ enum class quic_cc_algorithm {
 };
 
 struct quic_connection_config {
-    uint64_t            max_idle_timeout                    =      5'000;
-    size_t              max_datagram_size                   =     65'507;
-    size_t              max_recv_udp_payload_size           =     65'507;
-    size_t              max_send_udp_payload_size           =     65'507;
-    uint64_t            initial_max_data                    = 10'000'000;
-    uint64_t            initial_max_stream_data_bidi_local  =  1'000'000;
-    uint64_t            initial_max_stream_data_bidi_remote =  1'000'000;
-    uint64_t            initial_max_stream_data_uni         =  1'000'000;
-    uint64_t            initial_max_streams_bidi            =      1'000;
-    uint64_t            initial_max_streams_uni             =      1'000;
-    bool                disable_active_migration            =      false;
-    quic_cc_algorithm   congestion_control_algorithm        = quic_cc_algorithm::RENO;
-    uint64_t            max_stream_window                   = 16'000'000;
-    uint64_t            max_connection_window               = 24'000'000;
+    std::optional<uint64_t>     max_idle_timeout                    =      std::nullopt;
+    size_t                      max_datagram_size                   =     65'507;
+    size_t                      max_recv_udp_payload_size           =     65'507;
+    size_t                      max_send_udp_payload_size           =     65'507;
+    uint64_t                    initial_max_data                    = 10'000'000;
+    uint64_t                    initial_max_stream_data_bidi_local  =  1'000'000;
+    uint64_t                    initial_max_stream_data_bidi_remote =  1'000'000;
+    uint64_t                    initial_max_stream_data_uni         =  1'000'000;
+    uint64_t                    initial_max_streams_bidi            =      1'000;
+    uint64_t                    initial_max_streams_uni             =      1'000;
+    bool                        disable_active_migration            =      false;
+    quic_cc_algorithm           congestion_control_algorithm        = quic_cc_algorithm::RENO;
+    uint64_t                    max_stream_window                   = 16'000'000;
+    uint64_t                    max_connection_window               = 24'000'000;
 };
 
 using quic_stream_id = uint64_t;
