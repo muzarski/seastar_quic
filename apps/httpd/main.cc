@@ -22,13 +22,10 @@
 #include <seastar/http/httpd.hh>
 #include <seastar/http/handlers.hh>
 #include <seastar/http/function_handlers.hh>
-#include <seastar/http/file_handler.hh>
-#include <seastar/core/seastar.hh>
 #include <seastar/core/reactor.hh>
 #include "demo.json.hh"
 #include <seastar/http/api_docs.hh>
 #include <seastar/core/thread.hh>
-#include <seastar/core/prometheus.hh>
 #include <seastar/core/print.hh>
 #include <seastar/net/inet_address.hh>
 #include "../lib/stop_signal.hh"
@@ -44,75 +41,29 @@ public:
             std::unique_ptr<http::request> req, std::unique_ptr<http::reply> rep) {
         rep->_content = "<b>You're using HTTP over TCP!<b>\n";
         rep->done("html");
-        rep->add_header("Alt-Svc", "h3=\":1234\"; ma=86400, h3-29=\":1234\"; ma=86400");
+        rep->add_header("Alt-Svc", "h3=\":3333\"");
 
         return make_ready_future<std::unique_ptr<http::reply>>(std::move(rep));
     }
 };
 
 void set_routes(routes& r) {
-//    function_handler* h1 = new function_handler([](const_req req) {
-//        return "hello";
-//    });
-    function_handler* h2 = new function_handler([](std::unique_ptr<http::request> req) {
-        return make_ready_future<json::json_return_type>("json-future");
-    });
-
     handl* quic = new handl();
-
     r.add(operation_type::GET, url("/"), quic);
-    r.add(operation_type::GET, url("/jf"), h2);
-    r.add(operation_type::GET, url("/file").remainder("path"),
-            new directory_handler("/"));
-    demo_json::hello_world.set(r, [] (const_req req) {
-        demo_json::my_object obj;
-        obj.var1 = req.param.at("var1");
-        obj.var2 = req.param.at("var2");
-        demo_json::ns_hello_world::query_enum v = demo_json::ns_hello_world::str2query_enum(req.query_parameters.at("query_enum"));
-        // This demonstrate enum conversion
-        obj.enum_var = v;
-        return obj;
-    });
 }
 
 int main(int ac, char** av) {
-    httpd::http_server_control prometheus_server;
-    prometheus::config pctx;
     app_template app;
 
-    app.add_options()("port", bpo::value<uint16_t>()->default_value(443), "HTTP Server port");
-    app.add_options()("prometheus_port", bpo::value<uint16_t>()->default_value(9180), "Prometheus port. Set to zero in order to disable.");
-    app.add_options()("prometheus_address", bpo::value<sstring>()->default_value("0.0.0.0"), "Prometheus address");
-    app.add_options()("prometheus_prefix", bpo::value<sstring>()->default_value("seastar_httpd"), "Prometheus metrics prefix");
+    app.add_options()("port", bpo::value<uint16_t>()->default_value(3334), "HTTP Server port");
 
     return app.run_deprecated(ac, av, [&] {
         return seastar::async([&] {
             seastar_apps_lib::stop_signal stop_signal;
             auto&& config = app.configuration();
-            httpd::http_server_control prometheus_server;
-
-            uint16_t pport = config["prometheus_port"].as<uint16_t>();
-            if (pport) {
-                prometheus::config pctx;
-                net::inet_address prom_addr(config["prometheus_address"].as<sstring>());
-
-                pctx.metric_help = "seastar::httpd server statistics";
-                pctx.prefix = config["prometheus_prefix"].as<sstring>();
-
-                std::cout << "starting prometheus API server" << std::endl;
-                prometheus_server.start("prometheus").get();
-
-                prometheus::start(prometheus_server, pctx).get();
-
-                prometheus_server.listen(socket_address{prom_addr, pport}).handle_exception([prom_addr, pport] (auto ep) {
-                    std::cerr << seastar::format("Could not start Prometheus API server on {}:{}: {}\n", prom_addr, pport, ep);
-                    return make_exception_future<>(ep);
-                }).get();
-            }
 
             uint16_t port = config["port"].as<uint16_t>();
             auto server = new http_server_control();
-            auto rb = make_shared<api_registry_builder>("apps/httpd/");
 
             seastar::shared_ptr<seastar::tls::credentials_builder> creds = seastar::make_shared<seastar::tls::credentials_builder>();
             sstring ms_cert = "/home/daniel/Desktop/seastar_quic/cmake-build-debug/apps/httpd/localhost.pem";
@@ -123,7 +74,7 @@ int main(int ac, char** av) {
             creds->set_x509_key_file(ms_cert, ms_key, seastar::tls::x509_crt_format::PEM).get();
             creds->set_system_trust().get();
             std::cout << "set keys\n";
-
+            server->start().get();
 
             server->server().invoke_on_all([creds](http_server& server) {
                 server.set_tls_credentials(creds->build_server_credentials());
@@ -131,24 +82,13 @@ int main(int ac, char** av) {
             }).get();
 
 
-            server->start().get();
+
             server->set_routes(set_routes).get();
-            server->set_routes([rb](routes& r){rb->set_api_doc(r);}).get();
-            server->set_routes([rb](routes& r) {rb->register_function(r, "demo", "hello world application");}).get();
             server->listen(port).get();
 
             std::cout << "Seastar HTTP server listening on port " << port << " ...\n";
-            engine().at_exit([&prometheus_server, server, pport] {
-                return [pport, &prometheus_server] {
-                    if (pport) {
-                        std::cout << "Stoppping Prometheus server" << std::endl;
-                        return prometheus_server.stop();
-                    }
-                    return make_ready_future<>();
-                }().finally([server] {
-                    std::cout << "Stoppping HTTP server" << std::endl;
-                    return server->stop();
-                });
+            engine().at_exit([server] {
+               return server->stop();
             });
 
             stop_signal.wait().get();
