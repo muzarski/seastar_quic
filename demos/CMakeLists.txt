@@ -134,3 +134,6 @@ seastar_add_demo (quic_receive_big_chunk_of_data
 
 seastar_add_demo (quic_send_big_chunk_of_data
         SOURCES quic_send_big_chunk_of_data.cc)
+
+seastar_add_demo (http3_server
+        SOURCES http3_demo.cc)

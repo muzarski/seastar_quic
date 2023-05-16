@@ -30,9 +30,19 @@ namespace seastar {
 namespace http3 {
 
 class http3_server {
-    
+private:
+    friend class http3_server_control;
+
+private:
+    httpd::routes _routes;
+    gate _task_gate;
+
+public:
+    future<> listen(socket_address addr, const std::string& cert_file, const std::string& cert_key,
+                    const net::quic_connection_config& quic_config);
+    future<> stop();
 };
-    
+
 class http3_server_control {
 private:
     httpd::http_server_control _alt_svc_server;
@@ -40,6 +50,8 @@ private:
 
 private:
     static sstring generate_server_name();
+    
+    future<> setup_alt_svc_server(socket_address addr, const std::string& cert_file, const std::string& cert_key);
 public:
     http3_server_control()
     : _alt_svc_server()
@@ -47,7 +59,7 @@ public:
 
     future<> start(const sstring& name = generate_server_name());
     future<> stop();
-    future<> set_routes(std::function<void(httpd::routes& r)> fun);
+    future<> set_routes(const std::function<void(httpd::routes& r)>& fun);
     future<> listen(socket_address addr, const std::string& cert_file, const std::string& cert_key,
                     const net::quic_connection_config& quic_config = net::quic_connection_config());
 };
