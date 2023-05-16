@@ -691,6 +691,7 @@ add_library (seastar
   src/http/common.cc
   src/http/file_handler.cc
   src/http/httpd.cc
+  src/http/http3.cc
   src/http/json_path.cc
   src/http/matcher.cc
   src/http/mime_types.cc
