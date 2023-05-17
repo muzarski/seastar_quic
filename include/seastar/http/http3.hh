@@ -27,6 +27,46 @@
 
 namespace seastar {
 
+namespace net {
+
+// For dawmd to make it clearer what kind of API should be exposed by the quic-http3 backend.
+
+struct quic_h3_request {
+    int64_t _stream_id;
+    http::request _req; 
+};
+
+struct quic_h3_reply {
+    int64_t _stream_id;
+    http::reply _resp;
+};
+
+class quic_http3_connected_socket {
+private:
+    // quic_http3_connected_socket will probably wrap some connection class which exposes quic backend API.
+    class quic_http3_connection;
+    std::shared_ptr<quic_http3_connection> _conn;
+
+public:
+    future<std::unique_ptr<quic_h3_request>> read(); // return _conn->read();
+    future<> write(std::unique_ptr<quic_h3_reply> reply); // return _conn->write(reply);
+};
+
+class http3_listener {
+private:
+    // http3_listener may as well wrap some backend listener if it's necessary
+    class quic_http3_listener;
+    lw_shared_ptr<quic_http3_listener> _l;
+public:
+    future<quic_http3_connected_socket> accept(); // return _l->accept();
+};
+
+// This would start the quic-h3 server instance under the hood and return the listener.
+http3_listener quic_http3_listen(socket_address addr, const std::string& cert_file, const std::string& cert_key,
+                                 const net::quic_connection_config& quic_config);
+
+} // namespace net
+
 namespace http3 {
 
 class http3_server {
@@ -50,7 +90,7 @@ private:
 
 private:
     static sstring generate_server_name();
-    
+
     future<> setup_alt_svc_server(socket_address addr, const std::string& cert_file, const std::string& cert_key);
 public:
     http3_server_control()
