@@ -166,7 +166,7 @@ public:
     bool get_content_streaming() const;
 
     void set_content_streaming(bool b);
-    
+
     void set_http3_alt_svc_port(uint16_t p);
 
     future<> listen(socket_address addr, listen_options lo);

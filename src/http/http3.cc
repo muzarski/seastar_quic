@@ -29,15 +29,55 @@ logger h3logger("http3");
 
 namespace http3 {
 
+void connection::on_new_connection() {
+    _server._connections.push_back(*this);
+}
+
+connection::~connection() {
+    _server._connections.erase(_server._connections.iterator_to(*this));
+}
+
 future<> http3_server::listen(socket_address addr, const std::string &cert_file, const std::string &cert_key,
                                   [[maybe_unused]] const net::quic_connection_config &quic_config)
 {
     fmt::print("Called http3_server::listen with: {}, {}, {}", addr, cert_file, cert_key);
+    _listener = net::quic_http3_listen(addr, cert_file, cert_key, quic_config);
+    do_accepts();
     return make_ready_future<>();
 }
 
+void http3_server::do_accepts() {
+    // Start accepting incoming connections.
+    (void) try_with_gate(_task_gate, [this] () {
+        return keep_doing([this] () {
+            return try_with_gate(_task_gate, [this] () {
+                return accept_one();
+            });
+        }).handle_exception_type([] (const gate_closed_exception& e) {});
+    }).handle_exception_type([] (const gate_closed_exception& e) {});
+}
+
+future<> http3_server::accept_one() {
+    return _listener.accept().then([this] (net::quic_http3_connected_socket&& socket) mutable {
+        auto conn = std::make_unique<connection>(*this, std::move(socket));
+        (void) try_with_gate(_task_gate, [conn = std::move(conn)] () mutable {
+            return conn->process().handle_exception([] (const std::exception_ptr& e) {
+                h3logger.debug("Connection processing error: {}", e);
+            });
+        }).handle_exception_type([] (const gate_closed_exception& e) {});
+        return make_ready_future<>();
+    }).handle_exception([] (const std::exception_ptr& e) {
+        h3logger.debug("Accept error: {}", e);
+    });
+}
+
 future<> http3_server::stop() {
-    return make_ready_future<>();
+    future<> closed = _task_gate.close();
+    _listener.abort_accept();
+    for (auto&& conn : _connections) {
+        conn.stop();
+    }
+    return closed;
 }
 
 sstring http3_server_control::generate_server_name() {
@@ -69,14 +109,14 @@ future<> http3_server_control::stop() {
             std::get<0>(completed).get();
         }
         catch (...) {
-            fmt::print("Error during stopping the httpd service: {}", std::current_exception());
+            h3logger.debug("Error during stopping the httpd service: {}", std::current_exception());
         }
 
         try {
             std::get<1>(completed).get();
         }
         catch (...) {
-            fmt::print("Error during stopping the http3 service: {}", std::current_exception());
+            h3logger.debug("Error during stopping the http3 service: {}", std::current_exception());
         }
         return make_ready_future<>();
     });

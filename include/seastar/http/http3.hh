@@ -33,7 +33,7 @@ namespace net {
 
 struct quic_h3_request {
     int64_t _stream_id;
-    http::request _req; 
+    http::request _req;
 };
 
 struct quic_h3_reply {
@@ -56,9 +56,10 @@ class http3_listener {
 private:
     // http3_listener may as well wrap some backend listener if it's necessary
     class quic_http3_listener;
-    lw_shared_ptr<quic_http3_listener> _l;
+    shared_ptr<quic_http3_listener> _l;
 public:
     future<quic_http3_connected_socket> accept(); // return _l->accept();
+    void abort_accept() noexcept;
 };
 
 // This would start the quic-h3 server instance under the hood and return the listener.
@@ -69,13 +70,43 @@ http3_listener quic_http3_listen(socket_address addr, const std::string& cert_fi
 
 namespace http3 {
 
+class http3_server;
+
+class connection {
+private:
+    http3_server& _server;
+    net::quic_http3_connected_socket _socket;
+
+private:
+    void on_new_connection();
+
+public:
+    connection(http3_server &server, net::quic_http3_connected_socket &&socket)
+    : _server(server)
+    , _socket(std::move(socket)) {
+        on_new_connection();
+    };
+
+    ~connection();
+
+    future<> process();
+    void stop();
+};
+
 class http3_server {
 private:
     friend class http3_server_control;
+    friend class connection;
 
 private:
+    net::http3_listener _listener;
     httpd::routes _routes;
     gate _task_gate;
+    boost::intrusive::list<connection> _connections;
+
+private:
+    void do_accepts();
+    future<> accept_one();
 
 public:
     future<> listen(socket_address addr, const std::string& cert_file, const std::string& cert_key,
