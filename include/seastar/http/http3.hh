@@ -76,6 +76,9 @@ class connection {
 private:
     http3_server& _server;
     net::quic_http3_connected_socket _socket;
+    queue<std::unique_ptr<seastar::net::quic_h3_reply>> _replies { 10 };
+    std::unique_ptr<seastar::net::quic_h3_reply> _resp;
+    bool _done = false;
 
 private:
     void on_new_connection();
@@ -90,7 +93,13 @@ public:
     ~connection();
 
     future<> process();
-    void stop();
+    future<> read();
+    future<> read_one();
+    future<> respond();
+    future<> do_response_loop();
+    void set_headers(seastar::net::quic_h3_reply& resp);
+    future<> start_response();
+    future<bool> generate_reply(std::unique_ptr<seastar::net::quic_h3_request> req);
 };
 
 class http3_server {

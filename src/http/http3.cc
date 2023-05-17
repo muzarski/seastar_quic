@@ -37,6 +37,120 @@ connection::~connection() {
     _server._connections.erase(_server._connections.iterator_to(*this));
 }
 
+future<> connection::process() {
+    return when_all(read(), respond()).then([] (std::tuple<future<>, future<>> joined) {
+        try {
+            std::get<0>(joined).get();
+        } catch (...) {
+            h3logger.debug("Read exception encountered: {}", std::current_exception());
+        }
+        try {
+            std::get<1>(joined).get();
+        } catch (...) {
+            h3logger.debug("Response exception encountered: {}", std::current_exception());
+        }
+        return make_ready_future<>();
+    });
+}
+
+
+future<> connection::read() {
+    return do_until([this] {return _done;}, [this] {
+        return read_one();
+    }).then_wrapped([this] (future<> f) {
+        f.ignore_ready_future();
+        return _replies.push_eventually({});
+    });
+}
+
+future<> connection::read_one() {
+    return _socket.read().then([this](std::unique_ptr<seastar::net::quic_h3_request> req) {
+        if (!req) {
+            _done = true;
+            return make_ready_future<>();
+        }
+        req->_req.protocol_name = "https";
+
+        sstring length_header = req->_req.get_header("Content-Length");
+        req->_req.content_length = strtol(length_header.c_str(), nullptr, 10);
+
+        auto maybe_reply_continue = [this, req = std::move(req)]() mutable {
+            if (http::request::case_insensitive_cmp()(req->_req.get_header("Expect"), "100-continue")) {
+                return _replies.not_full().then([req = std::move(req), this]() mutable {
+                    auto continue_reply = std::make_unique<seastar::net::quic_h3_reply>();
+                    set_headers(*continue_reply);
+                    continue_reply->_resp.set_version(req->_req._version);
+                    continue_reply->_resp.set_status(http::reply::status_type::continue_).done();
+                    this->_replies.push(std::move(continue_reply));
+                    return make_ready_future<std::unique_ptr<seastar::net::quic_h3_request>>(std::move(req));
+                });
+            } else {
+                return make_ready_future<std::unique_ptr<seastar::net::quic_h3_request>>(std::move(req));
+            }
+        };
+        return maybe_reply_continue().then([this] (std::unique_ptr<seastar::net::quic_h3_request> req) {
+            return _replies.not_full().then([this, req = std::move(req)] () mutable {
+                return generate_reply(std::move(req));
+            }).then([this](bool done) {
+                _done = done;
+                return seastar::make_ready_future<>();
+            });
+        });
+    });
+}
+
+future<bool> connection::generate_reply(std::unique_ptr<seastar::net::quic_h3_request> req) {
+    auto resp = std::make_unique<seastar::net::quic_h3_reply>();
+    resp->_resp.set_version(req->_req._version);
+    set_headers(*resp);
+    bool keep_alive = req->_req.should_keep_alive();
+    if (keep_alive) {
+        resp->_resp._headers["Connection"] = "Keep-Alive";
+    }
+
+    sstring url = req->_req.parse_query_param();
+    sstring version = req->_req._version;
+    return _server._routes.handle(url, std::unique_ptr<http::request>(&req->_req), std::unique_ptr<http::reply>(&resp->_resp)).
+            then([this, keep_alive , version = std::move(version), stream_id = req->_stream_id](std::unique_ptr<http::reply> rep) {
+        rep->set_version(version).done();
+        auto reply = std::make_unique<seastar::net::quic_h3_reply>();
+        reply->_resp = std::move(*rep);
+        reply->_stream_id = stream_id;
+        _replies.push(std::move(reply));
+        return make_ready_future<bool>(!keep_alive);
+    });
+}
+
+void connection::set_headers(seastar::net::quic_h3_reply& resp) {
+    resp._resp._headers["Server"] = "Seastar httpd3";
+}
+
+future<> connection::respond() {
+    return do_response_loop().then_wrapped([] (future<> f) {
+        f.ignore_ready_future();
+        return seastar::make_ready_future();
+    });
+}
+
+future<> connection::do_response_loop() {
+    return _replies.pop_eventually().then([this] (std::unique_ptr<seastar::net::quic_h3_reply> reply) {
+        if (!reply) {
+            return make_ready_future<>();
+        }
+        _resp = std::move(reply);
+        return start_response().then([this] {
+            return do_response_loop();
+        });
+    });
+}
+
+future<> connection::start_response() {
+    set_headers(*_resp);
+    _resp->_resp._headers["Content-Length"] = to_sstring(
+            _resp->_resp._content.size());
+    return _socket.write(std::move(_resp));
+}
+
 future<> http3_server::listen(socket_address addr, const std::string &cert_file, const std::string &cert_key,
                                   [[maybe_unused]] const net::quic_connection_config &quic_config)
 {
