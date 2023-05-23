@@ -81,8 +81,8 @@ void set_routes(routes& r) {
     r.add(operation_type::GET, url("/"), quic);
 }
 
-const std::string ms_cert_default = "/home/julias/mim/clean_zpp/seastar_quic/localhost.pem";
-const std::string ms_key_default = "/home/julias/mim/clean_zpp/seastar_quic/localhost-key.pem";
+const std::string ms_cert_default = "/home/danmas/studia/zpp/seastar_quic/localhost.pem";
+const std::string ms_key_default = "/home/danmas/studia/zpp/seastar_quic/localhost-key.pem";
 
 int main(int ac, char** av) {
     app_template app;

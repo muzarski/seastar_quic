@@ -98,8 +98,11 @@ private:
     std::unique_ptr<quic_h3_connected_socket_impl> _impl;
 
 public:
-    quic_h3_connected_socket(std::unique_ptr<quic_h3_connected_socket_impl> impl) noexcept : _impl(std::move(impl)) {}
+    quic_h3_connected_socket(std::unique_ptr<quic_h3_connected_socket_impl> impl) noexcept : _impl(std::move(impl)) {
+        std::cout << "quic_h3_connected_socket CREATING" << std::endl;
+    }
     ~quic_h3_connected_socket() {
+
         std::cout << "quic_h3_connected_socket DELETING" << std::endl;
     }
     quic_h3_connected_socket(quic_h3_connected_socket&&) = default;
@@ -172,7 +175,6 @@ public:
     ~quic_h3_server_socket() noexcept = default;
 
     future<quic_h3_accept_result> accept() {
-        std::cout << "Got HTTP3 accept" << std::endl;
         return _impl->accept();
     }
 

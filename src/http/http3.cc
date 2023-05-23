@@ -35,64 +35,69 @@ void connection::on_new_connection() {
 }
 
 connection::~connection() {
-    std::cout << "http3 connection DELETING" << std::endl;
+
+    // std::cout << "http3 connection DELETING" << std::endl;
     _server._connections.erase(_server._connections.iterator_to(*this));
 }
 
 future<> connection::process() {
-    std::cout << "got connection process" << std::endl;
+    h3logger.info("Connection accepted, about to process.");
 
     return when_all(read(), respond()).then([] (std::tuple<future<>, future<>> joined) {
         try {
-            std::cout << "got connection process - processing read" << std::endl;
+            // std::cout << "got connection process - processing read" << std::endl;
             std::get<0>(joined).get();
 
         } catch (...) {
-            std::cout << "Read exception encountered" << std::endl;
+            // std::cout << "Read exception encountered" << std::endl;
 
-            h3logger.debug("Read exception encountered: {}", std::current_exception());
+            h3logger.info("Read exception encountered: {}", std::current_exception());
         }
-        std::cout << "got connection process - processed read" << std::endl;
+        // std::cout << "got connection process - processed read" << std::endl;
         try {
             std::get<1>(joined).get();
 
         } catch (...) {
-            std::cout << "Response exception encountered" << std::endl;
+            // std::cout << "Response exception encountered" << std::endl;
 
-            h3logger.debug("Response exception encountered: {}", std::current_exception());
+            h3logger.info("Response exception encountered: {}", std::current_exception());
         }
-        std::cout << "got connection process - processed respond" << std::endl;
+        // std::cout << "got connection process - processed respond" << std::endl;
 
-        std::cout << "got connection process - processed all" << std::endl;
-
+        // std::cout << "got connection process - processed all" << std::endl;
+        h3logger.info("Finished processing.");
         return make_ready_future<>();
     });
 }
 
 
 future<> connection::read() {
-    std::cout << "entering connection::read" << std::endl;
-
+    h3logger.info("Starting reading.");
     return do_until([this] {return _done;}, [this] {
         return read_one();
     }).then_wrapped([this] (future<> f) {
-        std::cout << "entering read - do unitl finished" << std::endl;
+        // std::cout << "entering read - do unitl finished" << std::endl;
         f.ignore_ready_future();
         return _replies.push_eventually({});
     });
 }
 
 future<> connection::read_one() {
-    std::cout << "entering connection::read_one" << std::endl;
+    // std::cout << "entering connection::read_one" << std::endl;
 
     return _socket.read().then([this](std::unique_ptr<seastar::net::quic_h3_request> req) {
-        std::cout << "got through read in read_one" << std::endl;
-
         if (!req) {
             _done = true;
             return make_ready_future<>();
         }
-        std::cout << "got q_h3_request in read_one" << std::endl;
+
+
+        req->_req._method = req->_req.get_header("method");
+        req->_req.protocol_name = req->_req.get_header("scheme");
+        req->_req._url = req->_req.get_header("authority"); // + path
+
+        auto method = req->_req._method;
+        h3logger.info("Reading HTTP3 request, method: {}", method);
 
         req->_req.protocol_name = "https";
 
@@ -101,7 +106,7 @@ future<> connection::read_one() {
 
         auto maybe_reply_continue = [this, req = std::move(req)]() mutable {
             if (http::request::case_insensitive_cmp()(req->_req.get_header("Expect"), "100-continue")) {
-                std::cout << "got expect - 100 continue in read_one" << std::endl;
+                // std::cout << "got expect - 100 continue in read_one" << std::endl;
                 return _replies.not_full().then([req = std::move(req), this]() mutable {
                     auto continue_reply = std::make_unique<seastar::net::quic_h3_reply>();
                     set_headers(*continue_reply);
@@ -114,14 +119,16 @@ future<> connection::read_one() {
                 return make_ready_future<std::unique_ptr<seastar::net::quic_h3_request>>(std::move(req));
             }
         };
-        std::cout << "maybe reply from read_one" << std::endl;
+        // std::cout << "maybe reply from read_one" << std::endl;
         return maybe_reply_continue().then([this] (std::unique_ptr<seastar::net::quic_h3_request> req) {
+            h3logger.info("DEBUGDEBUG");
             return _replies.not_full().then([this, req = std::move(req)] () mutable {
-                std::cout << "generating reply in read_one" << std::endl;
+                // std::cout << "generating reply in read_one" << std::endl;
+                h3logger.info("About to generate reply");
                 return generate_reply(std::move(req));
             }).then([this](bool done) {
                 _done = done;
-                std::cout << "read_one is done" << std::endl;
+                // std::cout << "read_one is done" << std::endl;
                 return seastar::make_ready_future<>();
             });
         });
@@ -139,20 +146,17 @@ future<bool> connection::generate_reply(std::unique_ptr<seastar::net::quic_h3_re
 
     sstring url = req->_req.parse_query_param();
     sstring version = req->_req._version;
-    std::cout << "generating reply" << std::endl;
-    return _server._routes.handle(url, std::unique_ptr<http::request>(&req->_req), std::unique_ptr<http::reply>(&resp->_resp)).
-            then([this, keep_alive , version = std::move(version), stream_id = req->_stream_id](std::unique_ptr<http::reply> rep) {
-        std::cout << "server routes handled" << std::endl;
 
-        rep->set_version(version).done();
-        auto reply = std::make_unique<seastar::net::quic_h3_reply>();
-        reply->_resp = std::move(*rep);
-        reply->_stream_id = stream_id;
-        _replies.push(std::move(reply));
-        std::cout << "reply pushed" << std::endl;
+    // std::cout << "generating reply" << std::endl;
+    auto reply = std::make_unique<seastar::net::quic_h3_reply>();
+    reply->_resp._status = http::reply::status_type::ok;
+    reply->_resp.add_header("Content-Length", "5");
+    reply->_resp.content_length = 5;
+    reply->_resp._content = "lalal";
 
-        return make_ready_future<bool>(!keep_alive);
-    });
+    reply->_stream_id = req->_stream_id;
+    _replies.push(std::move(reply));
+    return seastar::make_ready_future<bool>(true);
 }
 
 void connection::set_headers(seastar::net::quic_h3_reply& resp) {
@@ -196,54 +200,54 @@ future<> http3_server::listen(socket_address addr, const std::string &cert_file,
 
 void http3_server::do_accepts() {
     // Start accepting incoming connections.
-    std::cout << "do accepts" << std::endl;
+    // std::cout << "do accepts" << std::endl;
 
     (void) try_with_gate(_task_gate, [this] () {
         return keep_doing([this] () {
             return try_with_gate(_task_gate, [this] () {
-                std::cout << "in do accepts" << std::endl;
+                // std::cout << "in do accepts" << std::endl;
 
                 return accept_one();
             });
         }).handle_exception_type([] (const gate_closed_exception& e) {
-            std::cout << "got error in do_accepts 1" << std::endl;
+            // std::cout << "got error in do_accepts 1" << std::endl;
 
         });
     }).handle_exception_type([] (const gate_closed_exception& e) {
-        std::cout << "got error in do_accepts 2" << std::endl;
+        // std::cout << "got error in do_accepts 2" << std::endl;
 
     });
 }
 
 future<> http3_server::accept_one() {
-    std::cout << "got accept_one" << std::endl;
+    // std::cout << "got accept_one" << std::endl;
 
-    return _listener.accept().then([this] (net::quic_h3_accept_result&& result) mutable {
-        std::cout << "got accept_one in listener" << std::endl;
+    return _listener.accept().then([this] (net::quic_h3_accept_result result) mutable {
+        // std::cout << "got accept_one in listener" << std::endl;
 
-        auto conn = std::make_unique<connection>(*this, std::move(result.connection));
-        std::cout << "got accept_one made connection" << std::endl;
-
-        (void) try_with_gate(_task_gate, [conn = std::move(conn)] () mutable {
-            return conn->process().handle_exception([] (const std::exception_ptr& e) {
-                std::cout << "got accept_one error in conn->process: " <<  e <<std::endl;
-
+        _current_conn = std::make_unique<connection>(*this, std::move(result.connection));
+        (void) try_with_gate(_task_gate, [this] () mutable {
+            return _current_conn->process().handle_exception([] (const std::exception_ptr& e) {
                 h3logger.debug("Connection processing error: {}", e);
+            }).then([] {
+                h3logger.info("Finished processing.");
             });
         }).handle_exception_type([] (const gate_closed_exception& e) {
-            std::cout << "got accept_one error in try with gate" << std::endl;
+            // std::cout << "got accept_one error in try with gate" << std::endl;
 
         });
         return make_ready_future<>();
     }).handle_exception([] (const std::exception_ptr& e) {
-        std::cout << "got accept_one other error: " <<  e << std::endl;
+        // std::cout << "got accept_one other error: " <<  e << std::endl;
 
         h3logger.debug("Accept error: {}", e);
+    }).then([] {
+       h3logger.info("Finished handling accept.");
     });
 }
 
 future<> http3_server::stop() {
-    std::cout << "http4_server stopping" << std::endl;
+    // std::cout << "http4_server stopping" << std::endl;
     future<> closed = _task_gate.close();
     _listener.abort_accept();
     // TODO: implement close in http3 connection
@@ -273,19 +277,19 @@ future<> http3_server_control::set_routes(const std::function<void(httpd::routes
 }
 
 future<> http3_server_control::start(const sstring &name) {
-    std::cout << "Seastar HTTP server start1" << std::endl;
+    // std::cout << "Seastar HTTP server start1" << std::endl;
     return _alt_svc_server.start(name);
 }
 
 future<> http3_server_control::stop() {
-    std::cout << "http3_server_control stopping" << std::endl;
+    // std::cout << "http3_server_control stopping" << std::endl;
 
     return when_all(_alt_svc_server.stop(), _server.stop()).then([] (std::tuple<future<>, future<>> completed) {
         try {
             std::get<0>(completed).get();
         }
         catch (...) {
-            std::cout << "Error during stopping the httpd service: " <<  std::current_exception() << std::endl;
+            // std::cout << "Error during stopping the httpd service: " <<  std::current_exception() << std::endl;
 
             h3logger.debug("Error during stopping the httpd service: {}", std::current_exception());
         }
@@ -294,7 +298,7 @@ future<> http3_server_control::stop() {
             std::get<1>(completed).get();
         }
         catch (...) {
-            std::cout << "Error during stopping the httpd service2: " <<  std::current_exception() << std::endl;
+            // std::cout << "Error during stopping the httpd service2: " <<  std::current_exception() << std::endl;
             h3logger.debug("Error during stopping the http3 service: {}", std::current_exception());
         }
         return make_ready_future<>();
@@ -309,7 +313,7 @@ future<> http3_server_control::setup_alt_svc_server(socket_address addr, const s
        creds->set_dh_level(tls::dh_params::level::MEDIUM);
        creds->set_x509_key_file(cert_file, cert_key, tls::x509_crt_format::PEM).get();
        creds->set_system_trust().get();
-       std::cout << "set keys\n";
+       // std::cout << "set keys\n";
 
        _alt_svc_server.server().invoke_on_all([alt_svc_port = addr.port() + 1, creds] (httpd::http_server &server) {
            server.set_tls_credentials(creds->build_server_credentials());

@@ -71,6 +71,7 @@ private:
     httpd::routes _routes;
     gate _task_gate;
     boost::intrusive::list<connection> _connections;
+    std::unique_ptr<connection> _current_conn; // TODO: IT'S WRONG, ONLY FOR TESTING PURPOSES!
 
 private:
     void do_accepts();
