@@ -27,55 +27,14 @@
 
 namespace seastar {
 
-namespace net {
-
-// For dawmd to make it clearer what kind of API should be exposed by the quic-http3 backend.
-
-struct quic_h3_request {
-    int64_t _stream_id;
-    http::request _req;
-};
-
-struct quic_h3_reply {
-    int64_t _stream_id;
-    http::reply _resp;
-};
-
-class quic_http3_connected_socket {
-private:
-    // quic_http3_connected_socket will probably wrap some connection class which exposes quic backend API.
-    class quic_http3_connection;
-    std::shared_ptr<quic_http3_connection> _conn;
-
-public:
-    future<std::unique_ptr<quic_h3_request>> read(); // return _conn->read();
-    future<> write(std::unique_ptr<quic_h3_reply> reply); // return _conn->write(reply);
-};
-
-class http3_listener {
-private:
-    // http3_listener may as well wrap some backend listener if it's necessary
-    class quic_http3_listener;
-    shared_ptr<quic_http3_listener> _l;
-public:
-    future<quic_http3_connected_socket> accept(); // return _l->accept();
-    void abort_accept() noexcept;
-};
-
-// This would start the quic-h3 server instance under the hood and return the listener.
-http3_listener quic_http3_listen(socket_address addr, const std::string& cert_file, const std::string& cert_key,
-                                 const net::quic_connection_config& quic_config);
-
-} // namespace net
-
 namespace http3 {
 
 class http3_server;
 
-class connection {
+class connection : public boost::intrusive::list_base_hook<> {
 private:
     http3_server& _server;
-    net::quic_http3_connected_socket _socket;
+    net::quic_h3_connected_socket _socket;
     queue<std::unique_ptr<seastar::net::quic_h3_reply>> _replies { 10 };
     std::unique_ptr<seastar::net::quic_h3_reply> _resp;
     bool _done = false;
@@ -84,7 +43,7 @@ private:
     void on_new_connection();
 
 public:
-    connection(http3_server &server, net::quic_http3_connected_socket &&socket)
+    connection(http3_server &server, net::quic_h3_connected_socket &&socket)
     : _server(server)
     , _socket(std::move(socket)) {
         on_new_connection();
@@ -108,7 +67,7 @@ private:
     friend class connection;
 
 private:
-    net::http3_listener _listener;
+    net::quic_h3_server_socket _listener;
     httpd::routes _routes;
     gate _task_gate;
     boost::intrusive::list<connection> _connections;
@@ -135,7 +94,9 @@ private:
 public:
     http3_server_control()
     : _alt_svc_server()
-    , _server() {}
+    , _server() {
+        std::cout << "Seastar HTTP3 server" << std::endl;
+    }
 
     future<> start(const sstring& name = generate_server_name());
     future<> stop();

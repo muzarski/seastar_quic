@@ -67,6 +67,8 @@ class handl : public httpd::handler_base {
 public:
     virtual future<std::unique_ptr<http::reply> > handle(const sstring& path,
                                                          std::unique_ptr<http::request> req, std::unique_ptr<http::reply> rep) {
+        std::cout << "\n Got some request" << std::endl;
+
         rep->_content = "<b>You're using HTTP over TCP!<b>\n";
         rep->done("html");
 
@@ -79,8 +81,8 @@ void set_routes(routes& r) {
     r.add(operation_type::GET, url("/"), quic);
 }
 
-const std::string ms_cert_default = "/home/muzarski/sem5/zpp/seastar_quic/cmake-build-debug/demos/localhost.pem";
-const std::string ms_key_default = "/home/muzarski/sem5/zpp/seastar_quic/cmake-build-debug/demos/localhost-key.pem";
+const std::string ms_cert_default = "/home/julias/mim/clean_zpp/seastar_quic/localhost.pem";
+const std::string ms_key_default = "/home/julias/mim/clean_zpp/seastar_quic/localhost-key.pem";
 
 int main(int ac, char** av) {
     app_template app;
@@ -96,16 +98,16 @@ int main(int ac, char** av) {
 
             uint16_t port = config["port"].as<uint16_t>();
             auto server = new http3_server_control();
-            
+
             sstring ms_cert = config["cert_file"].as<std::string>();
             sstring ms_key = config["cert_key"].as<std::string>();
-            
+
             server->start().get();
 
             server->set_routes(set_routes).get();
             server->listen(port, ms_cert, ms_key).get();
 
-            std::cout << "Seastar HTTP server listening on port " << port << " ...\n";
+            std::cout << "Seastar HTTP server listening on port " << port << std::endl;
             engine().at_exit([server] {
                 return server->stop();
             });

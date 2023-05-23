@@ -20,6 +20,8 @@
 #include <seastar/core/seastar.hh>
 #include <seastar/core/iostream.hh>
 #include <seastar/net/socket_defs.hh>
+#include <seastar/http/reply.hh>
+#include <seastar/http/request.hh>
 
 #include <cstddef>
 #include <string_view>
@@ -53,6 +55,17 @@ struct quic_connection_config {
 using quic_stream_id = uint64_t;
 using quic_byte_type = char;
 
+struct quic_h3_request {
+    int64_t _stream_id;
+    seastar::http::request _req;
+};
+
+struct quic_h3_reply {
+    int64_t _stream_id;
+    seastar::http::reply _resp;
+};
+
+
 class quic_connected_socket_impl {
 public:
     virtual ~quic_connected_socket_impl() {}
@@ -72,8 +85,36 @@ public:
     void shutdown_output(quic_stream_id id);
 };
 
+class quic_h3_connected_socket_impl {
+public:
+    virtual ~quic_h3_connected_socket_impl() {}
+    virtual future<std::unique_ptr<quic_h3_request>> read() = 0;
+    virtual future<> write(std::unique_ptr<quic_h3_reply> reply) = 0;
+};
+
+
+class quic_h3_connected_socket {
+private:
+    std::unique_ptr<quic_h3_connected_socket_impl> _impl;
+
+public:
+    quic_h3_connected_socket(std::unique_ptr<quic_h3_connected_socket_impl> impl) noexcept : _impl(std::move(impl)) {}
+    ~quic_h3_connected_socket() {
+        std::cout << "quic_h3_connected_socket DELETING" << std::endl;
+    }
+    quic_h3_connected_socket(quic_h3_connected_socket&&) = default;
+
+    future<std::unique_ptr<quic_h3_request>> read();
+    future<> write(std::unique_ptr<quic_h3_reply> reply);
+};
+
 struct quic_accept_result {
     quic_connected_socket connection;
+    socket_address remote_address;
+};
+
+struct quic_h3_accept_result {
+    quic_h3_connected_socket connection;
     socket_address remote_address;
 };
 
@@ -103,18 +144,58 @@ public:
     [[nodiscard]] socket_address local_address() const noexcept {
         return _impl->local_address();
     }
-    
+
     void abort_accept() noexcept {
         _impl->abort_accept();
     };
 };
 
+class quic_h3_server_socket_impl {
+public:
+    virtual ~quic_h3_server_socket_impl() {}
+    virtual future<quic_h3_accept_result> accept() = 0;
+    virtual socket_address local_address() const = 0;
+    virtual void abort_accept() noexcept = 0;
+};
+
+class quic_h3_server_socket {
+private:
+    std::unique_ptr<quic_h3_server_socket_impl> _impl;
+
+public:
+    quic_h3_server_socket() noexcept = default;
+    explicit quic_h3_server_socket(std::unique_ptr<quic_h3_server_socket_impl> impl) noexcept
+            : _impl(std::move(impl)) {}
+    quic_h3_server_socket(quic_h3_server_socket&& qss) noexcept = default;
+    quic_h3_server_socket & operator=(quic_h3_server_socket&& qss) noexcept = default;
+
+    ~quic_h3_server_socket() noexcept = default;
+
+    future<quic_h3_accept_result> accept() {
+        std::cout << "Got HTTP3 accept" << std::endl;
+        return _impl->accept();
+    }
+
+    [[nodiscard]] socket_address local_address() const noexcept {
+        return _impl->local_address();
+    }
+
+    void abort_accept() noexcept {
+        _impl->abort_accept();
+    };
+};
+
+
 // Initiate the quic server, provide certs, choose version etc.
 quic_server_socket quic_listen(const socket_address &sa, const std::string_view cert_file,
         const std::string_view cert_key, const quic_connection_config& quic_config = quic_connection_config());
 
+quic_h3_server_socket quic_h3_listen(const socket_address &sa, const std::string_view cert_file,
+                                     const std::string_view cert_key, const quic_connection_config& quic_config = quic_connection_config());
+
+
 // Initiate connection to the server, choose version etc.
-future<quic_connected_socket> 
+future<quic_connected_socket>
 quic_connect(const socket_address &sa, const quic_connection_config& quic_config = quic_connection_config());
 
 // Quiche raw logs
