@@ -57,12 +57,12 @@ using quic_byte_type = char;
 
 struct quic_h3_request {
     int64_t _stream_id;
-    seastar::http::request _req;
+    std::unique_ptr<seastar::http::request> _req;
 };
 
 struct quic_h3_reply {
     int64_t _stream_id;
-    seastar::http::reply _resp;
+    std::unique_ptr<seastar::http::reply> _resp;
 };
 
 

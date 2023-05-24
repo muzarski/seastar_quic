@@ -25,6 +25,7 @@
 #include <seastar/http/handlers.hh>
 #include <seastar/http/common.hh>
 #include <seastar/http/reply.hh>
+#include <seastar/net/quic.hh>
 
 #include <boost/program_options/variables_map.hpp>
 #include <unordered_map>

@@ -1084,7 +1084,11 @@ private:
         char _value[value_len + 1];
         strncpy(_value, reinterpret_cast<const char *>(value), value_len);
         _value[value_len] = '\0';
-        request_in_callback->_req._headers[to_sstring(_name)] = to_sstring(_value); // TODO check if to_sstring actually works
+        request_in_callback->_req->_headers[to_sstring(_name)] = to_sstring(_value); // TODO check if to_sstring actually works
+
+
+
+
         fprintf(stderr, "got HTTP header: %.*s=%.*s\n",
                 (int) name_len, name, (int) value_len, value);
 
@@ -2223,9 +2227,7 @@ void h3_connection<QI>::init() {
 
 template<typename QI>
 void h3_connection<QI>::close() {
-
-    std::cout << "calling h3_connection close" << std::endl;
-    return; // FOR SOME REASON, THE H3 CONNECTION IS GETTING CLOSED.
+    qlogger.info("About to close H3 connection");
     if (this->_closing_marker) {
         return;
     }
@@ -2291,6 +2293,7 @@ future<> h3_connection<QI>::h3_recv_loop() {
                     goto spaghetti_code_dont_kill_me;
                 }
                 auto new_req = std::make_unique<seastar::net::quic_h3_request>();
+                new_req->_req = std::make_unique<http::request>();
                 new_req->_stream_id = s;
                 qlogger.info("Got request on stream {}", s);
                 switch (quiche_h3_event_type(ev)) {
@@ -2301,9 +2304,21 @@ future<> h3_connection<QI>::h3_recv_loop() {
                         int rc = quiche_h3_event_for_each_header(ev, for_each_header,
                                                                  new_req.get());
 
+                        for (auto& h : new_req->_req->_headers) {
+                            std::cout << "XX: " << h.first << ", " << h.second << std::endl;
+                        }
+
+                        new_req->_req->_url = new_req->_req->_headers[":path"];
+
+                        std::cout << "PATH: " << new_req->_req->_url << std::endl;
+
+                        new_req->_req->_method = new_req->_req->_headers[":method"];
+                        new_req->_req->_version = new_req->_req->_headers[":scheme"];
+
                         if (rc != 0) {
                             fprintf(stderr, "failed to process headers");
                         }
+                        read_queue.push(std::move(new_req));
                         break;
                     }
 
@@ -2318,8 +2333,9 @@ future<> h3_connection<QI>::h3_recv_loop() {
                         }
 //                        printf("GOT: %.*s", (int) len, buf);
 
-                        new_req->_req.content_length = len;
-                        new_req->_req.content = to_sstring(buf);
+                        new_req->_req->content_length = len;
+                        new_req->_req->content = to_sstring(buf);
+                        read_queue.push(std::move(new_req));
                         break;
                     }
 
@@ -2344,7 +2360,7 @@ future<> h3_connection<QI>::h3_recv_loop() {
                         break;
                     }
                 }
-                read_queue.push(std::move(new_req));
+
                 quiche_h3_event_free(ev);
 
             }
@@ -2385,9 +2401,9 @@ future<> h3_connection<QI>::write(std::unique_ptr<quic_h3_reply> reply) {
             .value_len = 3
     };
     headers.push_back(status);
-
-    for (const auto& h : reply->_resp._headers) {
-        std::cout << "Header: " << h.first << ", value: " << h.second << std::endl;
+    qlogger.info("Writing the reply.");
+    for (const auto& h : reply->_resp->_headers) {
+        qlogger.info("Reply header: {}, value: {}", h.first, h.second);
         headers.push_back({
                                   .name = (const uint8_t *) h.first.c_str(),
                                   .name_len = h.first.size(),
@@ -2398,11 +2414,20 @@ future<> h3_connection<QI>::write(std::unique_ptr<quic_h3_reply> reply) {
     }
 
 
+
     quiche_h3_send_response(_h3_conn, this->_connection,
                             reply->_stream_id, headers.data(), headers.size(), false);
 
+    qlogger.info("Reply body: {}", reply->_resp->_content);
+
+    uint8_t body[reply->_resp->content_length];
+    memcpy(body, reply->_resp->_content.c_str(), reply->_resp->content_length);
+    for(size_t i = 0; i < reply->_resp->content_length; i++) {
+        std::cout << "C: " << (char) body[i] << " ";
+    }
+
     const auto written = quiche_h3_send_body(_h3_conn, this->_connection,
-                                             reply->_stream_id, (uint8_t *) reply->_resp._content.c_str(), reply->_resp.content_length, true);
+                                             reply->_stream_id, (uint8_t *) reply->_resp->_content.c_str(), reply->_resp->content_length, true);
 
     if (written < 0) {
         // TODO: Handle the error.
@@ -2412,7 +2437,7 @@ future<> h3_connection<QI>::write(std::unique_ptr<quic_h3_reply> reply) {
     // TODO bufor
     const auto actually_written = static_cast<size_t>(written);
 
-    if (actually_written != reply->_resp.content_length) {
+    if (actually_written != reply->_resp->content_length) {
 
     }
 

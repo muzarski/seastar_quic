@@ -67,9 +67,7 @@ class handl : public httpd::handler_base {
 public:
     virtual future<std::unique_ptr<http::reply> > handle(const sstring& path,
                                                          std::unique_ptr<http::request> req, std::unique_ptr<http::reply> rep) {
-        std::cout << "\n Got some request" << std::endl;
-
-        rep->_content = "<b>You're using HTTP over TCP!<b>\n";
+        rep->_content = "<b>It's some random page<b>\n";
         rep->done("html");
 
         return make_ready_future<std::unique_ptr<http::reply>>(std::move(rep));
