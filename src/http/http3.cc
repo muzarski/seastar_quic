@@ -32,6 +32,7 @@ namespace seastar {
 logger h3logger("http3");
 
 namespace net {
+namespace {
 
 template<typename QI>
 class h3_connection final
@@ -85,6 +86,7 @@ using h3_server_connection = quic_basic_connection<h3_server>;
 
 using h3_engine = quic_engine<h3_server>;
 
+} // anonymous namespace
 } // namespace net
 
 namespace http3 {

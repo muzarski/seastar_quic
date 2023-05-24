@@ -134,9 +134,8 @@ private:
 // Fields.
 protected:
     quiche_configuration                                                   _quiche_configuration;
-    // TODO: Check if keeping this as a pointer is necessary.
-    lw_shared_ptr<quic_udp_channel_manager>                                _channel_manager;
-    std::vector<char>                                                      _buffer;
+    quic_udp_channel_manager                                               _channel_manager;
+    std::vector<quic_byte_type>                                            _buffer;
     std::unordered_map<quic_connection_id, lw_shared_ptr<connection_type>> _connections;
     queue<lw_shared_ptr<connection_type>>                                  _waiting_queue;
     future<>                                                               _send_queue;
@@ -149,7 +148,7 @@ public:
             const std::string_view key, const quic_connection_config& quic_config,
             const size_t queue_length)
     : _quiche_configuration(cert, key, quic_config)
-    , _channel_manager(make_lw_shared<quic_udp_channel_manager>(sa))
+    , _channel_manager(sa)
     , _buffer(MAX_DATAGRAM_SIZE)
     , _waiting_queue(queue_length)
     , _send_queue(make_ready_future<>())
@@ -158,7 +157,7 @@ public:
     explicit quic_server_instance(const std::string_view cert, const std::string_view key,
             const quic_connection_config& quic_config, const size_t queue_length)
     : _quiche_configuration(cert, key, quic_config)
-    , _channel_manager(make_lw_shared<quic_udp_channel_manager>())
+    , _channel_manager()
     , _buffer(MAX_DATAGRAM_SIZE)
     , _waiting_queue(queue_length)
     , _send_queue(make_ready_future<>())
@@ -176,7 +175,7 @@ public:
 
     [[nodiscard]] connection_data connect(const socket_address& sa);
     [[nodiscard]] socket_address local_address() const {
-        return _channel_manager->local_address();
+        return _channel_manager.local_address();
     }
     void register_connection(lw_shared_ptr<connection_type> conn);
     void init();
@@ -190,13 +189,15 @@ private:
     future<> handle_datagram(udp_datagram&& datagram);
     future<> handle_post_hs_connection(lw_shared_ptr<connection_type> conn, udp_datagram&& datagram);
     // TODO: Check if we cannot provide const references here instead.
-    future<> handle_pre_hs_connection(quic_header_info& header_info, udp_datagram&& datagram, quic_connection_id& key);
+    future<> handle_pre_hs_connection(quic_header_info& header_info, udp_datagram&& datagram,
+            const quic_connection_id& key);
     future<> negotiate_version(const quic_header_info& header_info, udp_datagram&& datagram);
     future<> quic_retry(const quic_header_info& header_info, udp_datagram&& datagram);
     quic_connection_id generate_new_cid();
     
 
-    static header_token mint_token(const quic_header_info& header_info, const ::sockaddr_storage* addr, ::socklen_t addr_len);
+    static header_token mint_token(const quic_header_info& header_info, const ::sockaddr_storage* addr,
+            ::socklen_t addr_len);
     // TODO: Change this function to something proper, less C-like.
     static bool validate_token(const uint8_t* token, size_t token_len, const ::sockaddr_storage* addr,
             ::socklen_t addr_len, uint8_t* odcid, size_t* odcid_len);
@@ -218,7 +219,7 @@ private:
 
 template<template<typename> typename CT>
 future<> quic_server_instance<CT>::send(send_payload&& payload) {
-    return _channel_manager->send(std::move(payload));
+    return _channel_manager.send(std::move(payload));
 }
 
 template<template<typename> typename CT>
@@ -255,7 +256,7 @@ void quic_server_instance<CT>::register_connection(lw_shared_ptr<connection_type
 
 template<template<typename> typename CT>
 void quic_server_instance<CT>::init() {
-    _channel_manager->init();
+    _channel_manager.init();
     _service_loop = service_loop();
 }
 
@@ -276,9 +277,9 @@ future<> quic_server_instance<CT>::close() {
     }
 
     return close_tasks.then([this] {
-        _channel_manager->abort_queues(std::make_exception_ptr(user_closed_connection_exception()));
+        _channel_manager.abort_queues(std::make_exception_ptr(user_closed_connection_exception()));
         return _service_loop.handle_exception([this] (const std::exception_ptr& e) {
-            return _channel_manager->close();
+            return _channel_manager.close();
         });
     });
 }
@@ -290,11 +291,11 @@ future<> quic_server_instance<CT>::service_loop() {
     return do_until(
             [this] { return bool(_is_closing); },
             [this] {
-                return _channel_manager->read().then([this] (udp_datagram datagram) {
+                return _channel_manager.read().then([this] (udp_datagram datagram) {
                     return handle_datagram(std::move(datagram));
                 });
             }
-    ).then([this] { return _channel_manager->close(); });
+    ).then([this] { return _channel_manager.close(); });
 }
 
 template<template<typename> typename CT>
@@ -344,7 +345,8 @@ future<> quic_server_instance<CT>::handle_post_hs_connection(lw_shared_ptr<conne
 
 // TODO: Check if we cannot provide const references here instead.
 template<template<typename> typename CT>
-future<> quic_server_instance<CT>::handle_pre_hs_connection(quic_header_info& header_info, udp_datagram&& datagram, quic_connection_id& key) {
+future<> quic_server_instance<CT>::handle_pre_hs_connection(quic_header_info& header_info,
+        udp_datagram&& datagram, const quic_connection_id& key) {
     if (!quiche_version_is_supported(header_info.version)) {
         // fmt::print("Negotiating the version...\n");
         return negotiate_version(header_info, std::move(datagram));
@@ -420,7 +422,7 @@ future<> quic_server_instance<CT>::negotiate_version(const quic_header_info& hea
     temporary_buffer<quic_byte_type> tb{reinterpret_cast<quic_byte_type*>(_buffer.data()), static_cast<size_t>(written)};
     send_payload payload{std::move(tb), datagram.get_src()};
 
-    return _channel_manager->send(std::move(payload));
+    return _channel_manager.send(std::move(payload));
 }
 
 template<template<typename> typename CT>
@@ -457,7 +459,7 @@ future<> quic_server_instance<CT>::quic_retry(const quic_header_info& header_inf
     temporary_buffer<quic_byte_type> tb{reinterpret_cast<quic_byte_type*>(_buffer.data()), static_cast<size_t>(written)};
     send_payload payload(std::move(tb), datagram.get_src());
 
-    return _channel_manager->send(std::move(payload));
+    return _channel_manager.send(std::move(payload));
 }
 
 template<template<typename> typename CT>

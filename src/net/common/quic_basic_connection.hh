@@ -32,6 +32,7 @@
 
 // STD.
 #include <chrono>       // Pacing.
+#include <memory>       // std::destroy_at
 #include <optional>
 #include <queue>        // std::priority_queue
 #include <stdexcept>

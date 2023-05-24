@@ -60,16 +60,16 @@ public:
 
 // Fields.
 protected:
-    lw_shared_ptr<quic_udp_channel_manager> _channel_manager;
-    quiche_configuration                    _quiche_configuration;
-    lw_shared_ptr<connection_type>          _connection;
-    future<>                                _receive_fiber;
-    bool                                    _closing_marker;
+    quic_udp_channel_manager       _channel_manager;
+    quiche_configuration           _quiche_configuration;
+    lw_shared_ptr<connection_type> _connection;
+    future<>                       _receive_fiber;
+    bool                           _closing_marker;
 
 // Constructors and the destructor.
 public:
     explicit quic_client_instance(const quic_connection_config& quic_config)
-    : _channel_manager(make_lw_shared<quic_udp_channel_manager>())
+    : _channel_manager()
     , _quiche_configuration(quic_config)
     , _connection()
     , _receive_fiber(make_ready_future<>())
@@ -88,7 +88,7 @@ public:
     [[nodiscard]] std::string name();
     future<> close();
     [[nodiscard]] socket_address local_address() const {
-        return _channel_manager->local_address();
+        return _channel_manager.local_address();
     }
 
 // Private methods.
@@ -113,21 +113,21 @@ private:
 
 template<template<typename> typename CT>
 future<> quic_client_instance<CT>::send(send_payload&& payload) {
-    return _channel_manager->send(std::move(payload));
+    return _channel_manager.send(std::move(payload));
 }
 
 template<template<typename> typename CT>
 future<> quic_client_instance<CT>::handle_connection_closing(const quic_connection_id& cid) {
     _closing_marker = true;
-    _channel_manager->abort_queues(std::make_exception_ptr(user_closed_connection_exception()));
+    _channel_manager.abort_queues(std::make_exception_ptr(user_closed_connection_exception()));
     return _receive_fiber.handle_exception([this] (const std::exception_ptr& e) {
-        return _channel_manager->close();
+        return _channel_manager.close();
     });
 }
 
 template<template<typename> typename CT>
 [[nodiscard]] connection_data quic_client_instance<CT>::connect(const socket_address& sa) {
-    const socket_address la = _channel_manager->local_address();
+    const socket_address la = _channel_manager.local_address();
     quic_connection_id cid = quic_connection_id::generate();
 
     auto* connection_ptr = quiche_connect(
@@ -155,7 +155,7 @@ void quic_client_instance<CT>::register_connection(lw_shared_ptr<connection_type
 
 template<template<typename> typename CT>
 void quic_client_instance<CT>::init() {
-    _channel_manager->init();
+    _channel_manager.init();
     _receive_fiber = receive_loop();
 }
 
@@ -175,12 +175,12 @@ future<> quic_client_instance<CT>::receive_loop() {
     return do_until(
             [this] { return _closing_marker; },
             [this] { return receive(); }
-    ).then([this] { return _channel_manager->close(); });
+    ).then([this] { return _channel_manager.close(); });
 }
 
 template<template<typename> typename CT>
 future<> quic_client_instance<CT>::receive() {
-    return _channel_manager->read().then([this] (udp_datagram&& datagram) {
+    return _channel_manager.read().then([this] (udp_datagram&& datagram) {
         _connection->receive(std::move(datagram));
         _connection->send_outstanding_data_in_streams_if_possible();
         return _connection->quic_flush();
