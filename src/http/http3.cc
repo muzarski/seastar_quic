@@ -23,9 +23,69 @@
 #include <seastar/core/when_all.hh>
 #include <seastar/core/thread.hh>
 
+#include "../net/common/quic_basic_connection.hh"
+#include "../net/common/quic_engine.hh"
+#include "../net/common/quic_server_instance.hh"
+
 namespace seastar {
 
 logger h3logger("http3");
+
+namespace net {
+
+template<typename QI>
+class h3_connection final
+        : public quic_basic_connection<QI>
+        , public enable_lw_shared_from_this<h3_connection<QI>>
+{
+// Local definitions.
+public:
+    using type          = h3_connection<QI>;
+    using instance_type = QI;
+private:
+    using super_type    = quic_basic_connection<QI>;
+    
+// Constructors + the destructor.
+public:
+    template<typename... Args>
+    h3_connection(Args&&... args)
+    : super_type(std::forward<Args>(args)...)
+    {
+        this->_socket->register_connection(this->shared_from_this());
+        // TODO: Init!
+    }
+
+    ~h3_connection() = default;
+
+// Public methods.
+public:
+    void close() override;
+    future<std::unique_ptr<quic_h3_request>> read();
+    future<> write(std::unique_ptr<quic_h3_reply> reply);
+};
+
+template<typename QI>
+void h3_connection<QI>::close() {
+    // TODO
+}
+
+template<typename QI>
+future<std::unique_ptr<quic_h3_request>> h3_connection<QI>::read() {
+    // TODO
+    return make_ready_future<std::unique_ptr<quic_h3_request>>();
+}
+
+template<typename QI>
+future<> h3_connection<QI>::write(std::unique_ptr<quic_h3_reply> reply) {
+    // TODO
+}
+
+using h3_server            = quic_server_instance<h3_connection>;
+using h3_server_connection = quic_basic_connection<h3_server>;
+
+using h3_engine = quic_engine<h3_server>;
+
+} // namespace net
 
 namespace http3 {
 
