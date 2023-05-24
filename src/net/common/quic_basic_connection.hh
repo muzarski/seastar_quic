@@ -237,7 +237,7 @@ public:
         return *this;
     }
 
-    virtual ~quic_basic_connection() noexcept {
+    ~quic_basic_connection() noexcept {
         if (_connection) {
             quiche_conn_free(std::exchange(_connection, nullptr));
         }
@@ -251,14 +251,12 @@ public:
     // Pass a datagram to process by the connection.
     void receive(udp_datagram&& datagram);
     
-    // Virtualization doesn't hurt us here -- the method
-    // is only going to be called once.
-    //
-    // It CANNOT be a pure virtual function, however.
-    // Otherwise, we won't be able to instantiate the class,
-    // while leaving it without a definition would cause
-    // a linking error.
-    virtual void close() {}
+    decltype(auto) close() {
+        // CRTP.
+        static_assert(std::is_base_of_v<quic_basic_connection<QI>, connection_type>,
+                "Invalid connection type");
+        return static_cast<connection_type*>(this)->close();
+    }
     bool is_closed() const noexcept;
 
     future<> quic_flush();

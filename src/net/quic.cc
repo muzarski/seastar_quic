@@ -86,9 +86,9 @@ private:
     struct quic_stream {
     public:
         // Data to be read from the stream.
-        queue<temporary_buffer<quic_byte_type>>              read_queue = queue<temporary_buffer<quic_byte_type>>(STREAM_READ_QUEUE_SIZE);
+        queue<temporary_buffer<quic_byte_type>>      read_queue = queue<temporary_buffer<quic_byte_type>>(STREAM_READ_QUEUE_SIZE);
         // Data to be sent via the stream.
-        std::deque<temporary_buffer<quic_byte_type>>         write_queue;
+        std::deque<temporary_buffer<quic_byte_type>> write_queue;
         // A field used for providing the user of the API
         // with the information when they will be able to
         // send data via the stream again (by producing
@@ -100,10 +100,10 @@ private:
         // to `std::nullopt` except when the stream
         // is cluttered and cannot accept more data,
         // in which case it holds a promise.
-        std::optional<shared_promise<>> maybe_writable = std::nullopt;
+        std::optional<shared_promise<>>              maybe_writable = std::nullopt;
         // Flag signalizing whether output has been shutdown on the stream.
         // Used as a guard for future writes.
-        bool                            shutdown_output = false;
+        bool                                         shutdown_output = false;
     };
 
     // Class providing a way to mark data if there is some data
@@ -160,7 +160,7 @@ public:
 // Public methods.
 public:
     void init();
-    void close() override;
+    void close();
 
     // Send a message via a stream.
     future<> write(temporary_buffer<quic_byte_type> tb, quic_stream_id stream_id);

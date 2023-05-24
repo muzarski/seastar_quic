@@ -60,7 +60,7 @@ public:
 
 // Public methods.
 public:
-    void close() override;
+    void close();
     future<std::unique_ptr<quic_h3_request>> read();
     future<> write(std::unique_ptr<quic_h3_reply> reply);
 };
