@@ -464,6 +464,7 @@ future<> connection::read_one() {
                     set_headers(*continue_reply);
                     continue_reply->_resp->set_version(req->_req->_version);
                     continue_reply->_resp->set_status(http::reply::status_type::continue_).done();
+                    continue_reply->_stream_id = req->_stream_id;
                     this->_replies.push(std::move(continue_reply));
                     return make_ready_future<std::unique_ptr<seastar::net::quic_h3_request>>(std::move(req));
                 });
