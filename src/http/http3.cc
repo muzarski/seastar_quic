@@ -108,7 +108,7 @@ void h3_connection<QI>::init() {
     if (!_h3_config) {
         throw std::runtime_error("Could not initialize config");
     }
-    
+
     _stream_recv_fiber = this->connect_done().then([this] {
         _h3_conn = quiche_h3_conn_new_with_transport(this->_connection, _h3_config);
         if (!_h3_conn) {
@@ -235,7 +235,7 @@ future<> h3_connection<QI>::h3_recv_loop() {
                     std::cout << "poll res: " << s << std::endl;
                     return make_ready_future<>();
                 }
-                    
+
                 auto new_req = std::make_unique<quic_h3_request>();
                 new_req->_req       = std::make_unique<http::request>();
                 new_req->_stream_id = s;
@@ -263,7 +263,7 @@ future<> h3_connection<QI>::h3_recv_loop() {
                                 s,
                                 buf,
                                 sizeof(buf));
-                        
+
                         if (len <= 0) {
                             break;
                         }
@@ -487,6 +487,7 @@ future<bool> connection::generate_reply(std::unique_ptr<seastar::net::quic_h3_re
     auto resp = std::make_unique<seastar::net::quic_h3_reply>();
     resp->_resp = std::make_unique<http::reply>();
     resp->_resp->set_version(req->_req->_version);
+    resp->_stream_id = req->_stream_id;
     set_headers(*resp);
     bool keep_alive = req->_req->should_keep_alive();
     if (keep_alive) {
