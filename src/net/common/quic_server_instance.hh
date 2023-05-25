@@ -399,7 +399,7 @@ future<> quic_server_instance<CT>::handle_pre_hs_connection(quic_header_info& he
     auto conn = make_lw_shared<connection_type>(connection, this->weak_from_this(),
             datagram.get_src(), key);
     _waiting_queue.push(lw_shared_ptr(conn));
-    conn->init();
+    conn->init(); // TODO: to be checked
     return handle_post_hs_connection(conn, std::move(datagram));
 }
 
