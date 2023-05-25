@@ -19,13 +19,22 @@
  * Copyright 2015 Cloudius Systems
  */
 
-#include <seastar/http/http3.hh>
-#include <seastar/core/when_all.hh>
-#include <seastar/core/thread.hh>
 
+// To implement here.
+#include <seastar/http/http3.hh>
+
+// Basic definitions.
 #include "../net/common/quic_basic_connection.hh"
 #include "../net/common/quic_engine.hh"
 #include "../net/common/quic_server_instance.hh"
+
+// Seastar features.
+#include <seastar/core/when_all.hh>
+#include <seastar/core/thread.hh>
+
+// Third-party API.
+#include <quiche.h>
+
 
 namespace seastar {
 
@@ -42,39 +51,26 @@ class h3_connection final
 // Constants.
 private:
     constexpr static size_t H3_READ_QUEUE_SIZE = 10'000;
+
 // Local definitions.
 public:
     using type          = h3_connection<QI>;
     using instance_type = QI;
 private:
     using super_type    = quic_basic_connection<QI>;
+
 // Quiche HTTP3 specific fields.
 private:
-    quiche_h3_config* h3_config = nullptr;
-    quiche_h3_conn* h3_conn = nullptr;
+    quiche_h3_config* _h3_config = nullptr;
+    quiche_h3_conn*   _h3_conn   = nullptr;
 
-    static int for_each_header(uint8_t *name, size_t name_len,
-                               uint8_t *value, size_t value_len,
-                               void *argp) {
-        auto *request_in_callback = static_cast<seastar::net::quic_h3_request*>(argp);
-
-        char _name[name_len + 1];
-        strncpy(_name, reinterpret_cast<const char *>(name), name_len);
-        _name[name_len] = '\0';
-
-        char _value[value_len + 1];
-        strncpy(_value, reinterpret_cast<const char *>(value), value_len);
-        _value[value_len] = '\0';
-        request_in_callback->_req->_headers[to_sstring(_name)] = to_sstring(_value);
-        return 0;
-    }
 // Fields.
 private:
     future<>         _stream_recv_fiber;
     shared_promise<> _h3_connect_done_promise{};
 public:
     // Data to be read from the stream.
-    queue< std::unique_ptr<quic_h3_request>> read_queue = queue< std::unique_ptr<quic_h3_request>>(H3_READ_QUEUE_SIZE);
+    queue<std::unique_ptr<quic_h3_request>> read_queue = queue<std::unique_ptr<quic_h3_request>>(H3_READ_QUEUE_SIZE);
     // Data to be sent via the stream.
     // std::deque<quic_buffer>         write_queue; TODO: implement buffering (not only quic_buffer, but also headers!)
 
@@ -107,18 +103,19 @@ private:
 template<typename QI>
 void h3_connection<QI>::init() {
     super_type::init();
-    h3_config = quiche_h3_config_new();
-    if (h3_config == nullptr) {
+
+    _h3_config = quiche_h3_config_new();
+    if (!_h3_config) {
         throw std::runtime_error("Could not initialize config");
     }
-    this->_stream_recv_fiber = this->connect_done().then([this] {
-        if (h3_conn == nullptr) {
-            h3_conn = quiche_h3_conn_new_with_transport(this->_connection, h3_config);
-            if (h3_conn == nullptr) {
-                throw std::runtime_error("Could not create HTTP3 connection.");
-            }
-            _h3_connect_done_promise.set_value();
+    
+    _stream_recv_fiber = this->connect_done().then([this] {
+        _h3_conn = quiche_h3_conn_new_with_transport(this->_connection, _h3_config);
+        if (!_h3_conn) {
+            throw std::runtime_error("Could not create HTTP3 connection.");
         }
+
+        _h3_connect_done_promise.set_value();
         return this->quic_flush();
     }).then([this] {
         return h3_recv_loop();
@@ -156,121 +153,146 @@ future<std::unique_ptr<quic_h3_request>> h3_connection<QI>::read() {
 
 template<typename QI>
 future<> h3_connection<QI>::write(std::unique_ptr<quic_h3_reply> reply) {
-        if (this->_closing_marker) {
-            return make_exception_future<>(std::runtime_error("The connection has been closed."));
-        }
+    if (this->_closing_marker) {
+        return make_exception_future<>(std::runtime_error("The connection has been closed."));
+    }
 
-        std::vector<quiche_h3_header> headers;
+    std::vector<quiche_h3_header> headers;
 
-        // TODO: get status from Seastar handler
-        quiche_h3_header status = {
-                .name = (const uint8_t *) ":status",
-                .name_len = sizeof(":status") - 1,
+    // TODO: get status from Seastar handler
+    quiche_h3_header status = {
+            .name      = reinterpret_cast<const uint8_t*>(":status"),
+            .name_len  = sizeof(":status") - 1,
+            .value     = reinterpret_cast<const uint8_t *>("200"),
+            .value_len = sizeof("200") - 1
+    };
+    headers.push_back(status);
 
-                .value = reinterpret_cast<const uint8_t *>("200"),
-                .value_len = 3
-        };
-        headers.push_back(status);
+    for (const auto& h : reply->_resp->_headers) {
+        headers.push_back({
+            .name      = reinterpret_cast<const uint8_t*>(h.first.c_str()),
+            .name_len  = h.first.size(),
+            .value     = reinterpret_cast<const uint8_t*>(h.second.c_str()),
+            .value_len = h.second.size(),
+        });
+    }
 
-        for (const auto& h : reply->_resp->_headers) {
-            headers.push_back({
-                                      .name = (const uint8_t *) h.first.c_str(),
-                                      .name_len = h.first.size(),
+    // TODO: check result
+    quiche_h3_send_response(
+            _h3_conn,
+            this->_connection,
+            reply->_stream_id,
+            headers.data(),
+            headers.size(),
+            false
+    );
 
-                                      .value = (const uint8_t *) h.second.c_str(),
-                                      .value_len = h.second.size(),
-                              });
-        }
-
-
-        // TODO: check result
-        quiche_h3_send_response(h3_conn, this->_connection,
-                                reply->_stream_id, headers.data(), headers.size(), false);
-
-
-
-        // TODO: check result
-        quiche_h3_send_body(h3_conn, this->_connection,
-                                                 reply->_stream_id, (uint8_t *) reply->_resp->_content.c_str(), reply->_resp->content_length, true);
+    // TODO: check result
+    quiche_h3_send_body(
+            _h3_conn,
+            this->_connection,
+            reply->_stream_id,
+            reinterpret_cast<uint8_t*>(reply->_resp->_content.data()),
+            reply->_resp->content_length,
+            true
+    );
 
         // TODO: buffering
 //        if (written != reply->_resp->content_length) {
 //
 //        }
 
-        return this->quic_flush();
+    return this->quic_flush();
+}
+
+[[maybe_unused]] // Unnecessary, but Clang complains.
+int for_each_header(uint8_t *name, size_t name_len, uint8_t *value, size_t value_len, void *argp) {
+    auto* request_in_callback = static_cast<quic_h3_request*>(argp);
+
+    const auto* cname = reinterpret_cast<const char*>(name);
+    const auto* cvalue = reinterpret_cast<const char*>(value);
+
+    auto key = sstring(cname, name_len);
+    auto val = sstring(cvalue, value_len);
+
+    request_in_callback->_req->_headers[std::move(key)] = std::move(val);
+    return 0;
 }
 
 template <typename QI>
 future<> h3_connection<QI>::h3_recv_loop() {
-        return do_until([this] {
-            return this->is_closing(); }, [this] {
-            return this->_read_marker.get_shared_future().then([this] {
-                if (quiche_conn_is_established(this->_connection)) {
-                    if (h3_conn == nullptr) {
-                        throw std::runtime_error("Invalid state");
-                    }
+    return do_until([this] { return this->is_closing(); }, [this] {
+        return this->_read_marker.get_shared_future().then([this] {
+            if (quiche_conn_is_established(this->_connection)) {
+                if (_h3_conn == nullptr) {
+                    throw std::runtime_error("Invalid state");
+                }
 
-                    quiche_h3_event *ev;
+                quiche_h3_event* ev;
 
-                    int64_t s = quiche_h3_conn_poll(h3_conn, this->_connection, &ev);
-                    if (s < 0) {
-                        std::cout << "poll res: " << s << std::endl;
-                        return seastar::make_ready_future<>();
-                    }
+                auto s = quiche_h3_conn_poll(_h3_conn, this->_connection, &ev);
+                if (s < 0) {
+                    std::cout << "poll res: " << s << std::endl;
+                    return make_ready_future<>();
+                }
                     
-                    auto new_req = std::make_unique<seastar::net::quic_h3_request>();
-                    new_req->_req = std::make_unique<http::request>();
-                    new_req->_stream_id = s;
-                    switch (quiche_h3_event_type(ev)) {
-                        case QUICHE_H3_EVENT_HEADERS: {
-                            int rc = quiche_h3_event_for_each_header(ev, for_each_header,
-                                                                     new_req.get());
-                            new_req->_req->_url = new_req->_req->_headers[":path"];
-                            new_req->_req->_method = new_req->_req->_headers[":method"];
-                            new_req->_req->_version = new_req->_req->_headers[":scheme"];
+                auto new_req = std::make_unique<quic_h3_request>();
+                new_req->_req       = std::make_unique<http::request>();
+                new_req->_stream_id = s;
 
-                            if (rc != 0) {
-                                fprintf(stderr, "failed to process headers");
-                            }
-                            read_queue.push(std::move(new_req));
-                            break;
+                switch (quiche_h3_event_type(ev)) {
+                    case QUICHE_H3_EVENT_HEADERS: {
+                        const auto rc = quiche_h3_event_for_each_header(ev, for_each_header, new_req.get());
+                        new_req->_req->_url     = new_req->_req->_headers[":path"];
+                        new_req->_req->_method  = new_req->_req->_headers[":method"];
+                        new_req->_req->_version = new_req->_req->_headers[":scheme"];
+
+                        if (rc != 0) {
+                            fmt::print(stderr, "failed to process headers\n");
                         }
-
-                        case QUICHE_H3_EVENT_DATA: {
-                            static uint8_t buf[MAX_DATAGRAM_SIZE];
-
-                            ssize_t len = quiche_h3_recv_body(h3_conn, this->_connection, s, buf, sizeof(buf));
-
-                            if (len <= 0) {
-                                break;
-                            }
-
-                            new_req->_req->content_length = len;
-                            new_req->_req->content = to_sstring(reinterpret_cast<const char*>(buf));
-                            read_queue.push(std::move(new_req));
-                            break;
-                        }
-
-                        case QUICHE_H3_EVENT_FINISHED:
-                        case QUICHE_H3_EVENT_RESET:
-                        case QUICHE_H3_EVENT_PRIORITY_UPDATE:
-                        case QUICHE_H3_EVENT_DATAGRAM:
-                        case QUICHE_H3_EVENT_GOAWAY:
-                            break;
+                        read_queue.push(std::move(new_req));
+                        break;
                     }
 
-                    quiche_h3_event_free(ev);
+                    case QUICHE_H3_EVENT_DATA: {
+                        static thread_local uint8_t buf[MAX_DATAGRAM_SIZE];
+
+                        const auto len = quiche_h3_recv_body(
+                                _h3_conn,
+                                this->_connection,
+                                s,
+                                buf,
+                                sizeof(buf));
+                        
+                        if (len <= 0) {
+                            break;
+                        }
+
+                        new_req->_req->content        = sstring(reinterpret_cast<const char*>(buf), len);
+                        new_req->_req->content_length = len;
+                        read_queue.push(std::move(new_req));
+                        break;
+                    }
+
+                    case QUICHE_H3_EVENT_FINISHED:
+                    case QUICHE_H3_EVENT_RESET:
+                    case QUICHE_H3_EVENT_PRIORITY_UPDATE:
+                    case QUICHE_H3_EVENT_DATAGRAM:
+                    case QUICHE_H3_EVENT_GOAWAY:
+                        break;
                 }
 
-                return seastar::make_ready_future<>();
-            }).then([this] {
-                if (!quiche_conn_is_readable(this->_connection)) {
-                    this->_read_marker.reset();
-                }
-                return this->quic_flush();
-            });
+                quiche_h3_event_free(ev);
+            }
+
+            return make_ready_future<>();
+        }).then([this] {
+            if (!quiche_conn_is_readable(this->_connection)) {
+                this->_read_marker.reset();
+            }
+            return this->quic_flush();
         });
+    });
 }
 
 template <typename QI>
@@ -283,11 +305,11 @@ using h3_server_connection = h3_connection<h3_server>;
 
 using h3_engine = quic_engine<h3_server>;
 
-lw_shared_ptr<h3_server> h3_listen(const socket_address& sa,
-                                   const std::string_view cert_file, const std::string_view cert_key,
-                                   const quic_connection_config& quic_config, const size_t queue_length = 100){
-    auto instance = make_lw_shared<h3_server>(
-            sa, cert_file, cert_key, quic_config, queue_length);
+lw_shared_ptr<h3_server> h3_listen(const socket_address& sa, const std::string_view cert_file,
+        const std::string_view cert_key, const quic_connection_config& quic_config,
+        const size_t queue_length = 100)
+{
+    auto instance = make_lw_shared<h3_server>(sa, cert_file, cert_key, quic_config, queue_length);
     instance->init();
     h3_engine::register_instance(sa, instance);
     return instance;
@@ -335,8 +357,8 @@ private:
 // Constructors + the destructor.
 public:
     quiche_h3_server_socket_impl(const socket_address& sa, const std::string_view cert_file,
-                                 const std::string_view cert_key, const quic_connection_config& quic_config)
-                                 : _listener(h3_listen(sa, cert_file, cert_key, quic_config)) {}
+            const std::string_view cert_key, const quic_connection_config& quic_config)
+    : _listener(h3_listen(sa, cert_file, cert_key, quic_config)) {}
     ~quiche_h3_server_socket_impl() = default;
 
 // Implementation.
@@ -344,15 +366,15 @@ public:
     future<quic_h3_accept_result> accept() override {
         return _listener->accept().then([] (lw_shared_ptr<h3_server_connection> conn) {
             future<> h3_connected = conn->h3_connect_done();
+
             return h3_connected.then([conn = std::move(conn)] {
                 auto impl = std::make_unique<implementation_type>(conn);
+
                 return make_ready_future<quic_h3_accept_result>(quic_h3_accept_result {
                         .connection     = quic_h3_connected_socket(std::move(impl)),
                         .remote_address = conn->remote_address()
                 });
             });
-
-
         });
     }
 
@@ -364,11 +386,14 @@ public:
         return _listener->local_address();
     }
 };
+
 } // anonymous namespace
 
 quic_h3_server_socket quic_h3_listen(const socket_address &sa, const std::string_view cert_file,
-                                     const std::string_view cert_key, const quic_connection_config& quic_config) {
-    return quic_h3_server_socket(std::make_unique<quiche_h3_server_socket_impl>(sa, cert_file, cert_key, quic_config));
+        const std::string_view cert_key, const quic_connection_config& quic_config)
+{
+    return quic_h3_server_socket(std::make_unique<quiche_h3_server_socket_impl>(
+            sa, cert_file, cert_key, quic_config));
 }
 
 future<std::unique_ptr<quic_h3_request>> quic_h3_connected_socket:: read() {
@@ -567,8 +592,8 @@ sstring http3_server_control::generate_server_name() {
     return seastar::format("http-{}", idgen++);
 }
 
-future<> http3_server_control::listen(socket_address addr, const std::string &cert_file, const std::string &cert_key,
-                             const net::quic_connection_config &quic_config)
+future<> http3_server_control::listen(socket_address addr, const std::string &cert_file,
+        const std::string &cert_key, const net::quic_connection_config &quic_config)
 {
     return setup_alt_svc_server(addr, cert_file, cert_key).then([this, addr, cert_key, cert_file, quic_config] () {
         socket_address server_address = {addr.as_posix_sockaddr_in().sin_addr.s_addr, static_cast<uint16_t>(addr.port() + 1)};
@@ -589,23 +614,22 @@ future<> http3_server_control::stop() {
     return when_all(_alt_svc_server.stop(), _server.stop()).then([] (std::tuple<future<>, future<>> completed) {
         try {
             std::get<0>(completed).get();
-        }
-        catch (...) {
+        } catch (...) {
             h3logger.debug("Error during stopping the httpd service: {}", std::current_exception());
         }
 
         try {
             std::get<1>(completed).get();
-        }
-        catch (...) {
+        } catch (...) {
             h3logger.debug("Error during stopping the http3 service: {}", std::current_exception());
         }
+
         return make_ready_future<>();
     });
 }
 
 future<> http3_server_control::setup_alt_svc_server(socket_address addr, const std::string &cert_file,
-                                                        const std::string &cert_key)
+        const std::string &cert_key)
 {
     return async([cert_file, cert_key, addr, this] () {
        seastar::shared_ptr<tls::credentials_builder> creds = seastar::make_shared<tls::credentials_builder>();
@@ -625,5 +649,4 @@ future<> http3_server_control::setup_alt_svc_server(socket_address addr, const s
 }
 
 } // namespace http3
-
 } // namespace seastar
