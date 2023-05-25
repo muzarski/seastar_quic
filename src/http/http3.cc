@@ -248,7 +248,7 @@ future<> h3_connection<QI>::h3_recv_loop() {
                             }
 
                             new_req->_req->content_length = len;
-                            new_req->_req->content = to_sstring(buf);
+                            new_req->_req->content = to_sstring(reinterpret_cast<const char*>(buf));
                             read_queue.push(std::move(new_req));
                             break;
                         }
