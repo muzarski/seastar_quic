@@ -41,30 +41,65 @@ struct quic_h3_reply {
     http::reply _resp;
 };
 
-class quic_http3_connected_socket {
-private:
-    // quic_http3_connected_socket will probably wrap some connection class which exposes quic backend API.
-    class quic_http3_connection;
-    std::shared_ptr<quic_http3_connection> _conn;
-
+class quic_h3_connected_socket_impl {
 public:
-    future<std::unique_ptr<quic_h3_request>> read(); // return _conn->read();
-    future<> write(std::unique_ptr<quic_h3_reply> reply); // return _conn->write(reply);
+    virtual ~quic_h3_connected_socket_impl() {}
+    virtual future<std::unique_ptr<quic_h3_request>> read() = 0;
+    virtual future<> write(std::unique_ptr<quic_h3_reply> reply) = 0;
 };
 
-class http3_listener {
+class quic_h3_connected_socket {
 private:
-    // http3_listener may as well wrap some backend listener if it's necessary
-    class quic_http3_listener;
-    shared_ptr<quic_http3_listener> _l;
+    std::unique_ptr<quic_h3_connected_socket_impl> _impl;
+
 public:
-    future<quic_http3_connected_socket> accept(); // return _l->accept();
-    void abort_accept() noexcept;
+    quic_h3_connected_socket(std::unique_ptr<quic_h3_connected_socket_impl> impl) noexcept : _impl(std::move(impl)) {}
+
+    future<std::unique_ptr<quic_h3_request>> read();
+    future<> write(std::unique_ptr<quic_h3_reply> reply);
 };
 
-// This would start the quic-h3 server instance under the hood and return the listener.
-http3_listener quic_http3_listen(socket_address addr, const std::string& cert_file, const std::string& cert_key,
-                                 const net::quic_connection_config& quic_config);
+struct quic_h3_accept_result {
+    quic_h3_connected_socket connection;
+    socket_address remote_address;
+};
+
+class quic_h3_server_socket_impl {
+public:
+    virtual ~quic_h3_server_socket_impl() {}
+    virtual future<quic_h3_accept_result> accept() = 0;
+    virtual socket_address local_address() const = 0;
+    virtual void abort_accept() noexcept = 0;
+};
+
+class quic_h3_server_socket {
+private:
+    std::unique_ptr<quic_h3_server_socket_impl> _impl;
+
+public:
+    quic_h3_server_socket() noexcept = default;
+    explicit quic_h3_server_socket(std::unique_ptr<quic_h3_server_socket_impl> impl) noexcept
+            : _impl(std::move(impl)) {}
+    quic_h3_server_socket(quic_h3_server_socket&& qss) noexcept = default;
+    quic_h3_server_socket & operator=(quic_h3_server_socket&& qss) noexcept = default;
+
+    ~quic_h3_server_socket() noexcept = default;
+
+    future<quic_h3_accept_result> accept() {
+        return _impl->accept();
+    }
+
+    [[nodiscard]] socket_address local_address() const noexcept {
+        return _impl->local_address();
+    }
+
+    void abort_accept() noexcept {
+        _impl->abort_accept();
+    }
+};
+
+quic_h3_server_socket quic_h3_listen(const socket_address &sa, const std::string_view cert_file,
+                                     const std::string_view cert_key, const quic_connection_config& quic_config = quic_connection_config());
 
 } // namespace net
 
@@ -72,10 +107,10 @@ namespace http3 {
 
 class http3_server;
 
-class connection {
+class connection : public boost::intrusive::list_base_hook<> {
 private:
     http3_server& _server;
-    net::quic_http3_connected_socket _socket;
+    net::quic_h3_connected_socket _socket;
     queue<std::unique_ptr<seastar::net::quic_h3_reply>> _replies { 10 };
     std::unique_ptr<seastar::net::quic_h3_reply> _resp;
     bool _done = false;
@@ -84,7 +119,7 @@ private:
     void on_new_connection();
 
 public:
-    connection(http3_server &server, net::quic_http3_connected_socket &&socket)
+    connection(http3_server &server, net::quic_h3_connected_socket &&socket)
     : _server(server)
     , _socket(std::move(socket)) {
         on_new_connection();
@@ -108,7 +143,7 @@ private:
     friend class connection;
 
 private:
-    net::http3_listener _listener;
+    net::quic_h3_server_socket _listener;
     httpd::routes _routes;
     gate _task_gate;
     boost::intrusive::list<connection> _connections;
