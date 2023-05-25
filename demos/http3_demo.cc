@@ -67,7 +67,7 @@ class handl : public httpd::handler_base {
 public:
     virtual future<std::unique_ptr<http::reply> > handle(const sstring& path,
                                                          std::unique_ptr<http::request> req, std::unique_ptr<http::reply> rep) {
-        rep->_content = "<b>You're using HTTP over TCP!<b>\n";
+        rep->_content = "<b>It's some random page!<b> <button>Click me!</button>\n";
         rep->done("html");
 
         return make_ready_future<std::unique_ptr<http::reply>>(std::move(rep));
@@ -79,8 +79,8 @@ void set_routes(routes& r) {
     r.add(operation_type::GET, url("/"), quic);
 }
 
-const std::string ms_cert_default = "/home/muzarski/sem5/zpp/seastar_quic/cmake-build-debug/demos/localhost.pem";
-const std::string ms_key_default = "/home/muzarski/sem5/zpp/seastar_quic/cmake-build-debug/demos/localhost-key.pem";
+const std::string ms_cert_default = "/home/danmas/studia/zpp/seastar_quic/localhost.pem";
+const std::string ms_key_default = "/home/danmas/studia/zpp/seastar_quic/localhost-key.pem";
 
 int main(int ac, char** av) {
     app_template app;

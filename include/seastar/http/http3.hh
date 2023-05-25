@@ -33,12 +33,12 @@ namespace net {
 
 struct quic_h3_request {
     int64_t _stream_id;
-    http::request _req;
+    std::unique_ptr<http::request> _req;
 };
 
 struct quic_h3_reply {
     int64_t _stream_id;
-    http::reply _resp;
+    std::unique_ptr<http::reply> _resp;
 };
 
 class quic_h3_connected_socket_impl {

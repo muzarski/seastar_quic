@@ -56,48 +56,22 @@ private:
     static int for_each_header(uint8_t *name, size_t name_len,
                                uint8_t *value, size_t value_len,
                                void *argp) {
-
-        // FIXME: There's a bug.
         auto *request_in_callback = static_cast<seastar::net::quic_h3_request*>(argp);
-        request_in_callback->_req._headers[to_sstring(name)] = to_sstring(value); // TODO check if to_sstring actually works
-        fprintf(stderr, "got HTTP header: %.*s=%.*s\n",
-                (int) name_len, name, (int) value_len, value);
+
+        char _name[name_len + 1];
+        strncpy(_name, reinterpret_cast<const char *>(name), name_len);
+        _name[name_len] = '\0';
+
+        char _value[value_len + 1];
+        strncpy(_value, reinterpret_cast<const char *>(value), value_len);
+        _value[value_len] = '\0';
+        request_in_callback->_req->_headers[to_sstring(_name)] = to_sstring(_value);
         return 0;
     }
-// Local structures
-private:
-    class read_marker {
-    private:
-        // A `promise<>` used for generating `future<>`s to provide
-        // a means to mark if there may be some data to be processed and to check the marker.
-        shared_promise<>    _readable         = shared_promise<>{};
-        // Equals to `true` if and only if the promise `_readable`
-        // has been assigned a value.
-        bool                _promise_resolved = false;
-
-    public:
-        decltype(auto) get_shared_future() const noexcept {
-            return _readable.get_shared_future();
-        }
-
-        void mark_as_ready() noexcept {
-            if (!_promise_resolved) {
-                _readable.set_value();
-                _promise_resolved = true;
-            }
-        }
-
-        void reset() noexcept {
-            if (_promise_resolved) {
-                _readable = shared_promise<>{};
-                _promise_resolved = false;
-            }
-        }
-    };
-
 // Fields.
-protected:
+private:
     future<> _stream_recv_fiber;
+    promise<> _h3_connect_done_promise{};
 public:
     // Data to be read from the stream.
     queue< std::unique_ptr<quic_h3_request>> read_queue = queue< std::unique_ptr<quic_h3_request>>(H3_READ_QUEUE_SIZE);
@@ -124,7 +98,9 @@ public:
     future<std::unique_ptr<quic_h3_request>> read();
     future<> write(std::unique_ptr<quic_h3_reply> reply);
     void send_outstanding_data_in_streams_if_possible();
+    future<> h3_connect_done();
 // Private methods.
+private:
     future<> h3_recv_loop();
     // future<> wait_send_available(); TODO: buffering
 };
@@ -136,15 +112,15 @@ void h3_connection<QI>::init() {
     if (h3_config == nullptr) {
         throw std::runtime_error("Could not initialize config");
     }
-    _stream_recv_fiber = this->connect_done().then([this] {
+    this->_stream_recv_fiber = seastar::make_ready_future<>().then([this] {
         if (h3_conn == nullptr) {
             h3_conn = quiche_h3_conn_new_with_transport(this->_connection, h3_config);
             if (h3_conn == nullptr) {
                 throw std::runtime_error("Could not create HTTP3 connection.");
             }
-            // h3_connect_done_promise.set_value(); FIXME: there's a bug
+            _h3_connect_done_promise.set_value();
         }
-        return seastar::make_ready_future<>();
+        return this->quic_flush();
     }).then([this] {
         return h3_recv_loop();
     });
@@ -152,7 +128,6 @@ void h3_connection<QI>::init() {
 
 template<typename QI>
 void h3_connection<QI>::close() {
-    // FIXME: there **may be** a bug.
     if (this->_closing_marker) {
         return;
     }
@@ -171,162 +146,141 @@ void h3_connection<QI>::close() {
 }
 
 template<typename QI>
+void h3_connection<QI>::send_outstanding_data_in_streams_if_possible() {
+    // TODO: buffering
+}
+
+template<typename QI>
 future<std::unique_ptr<quic_h3_request>> h3_connection<QI>::read() {
     return read_queue.pop_eventually();
 }
 
-// FIXME: there's a bug
 template<typename QI>
 future<> h3_connection<QI>::write(std::unique_ptr<quic_h3_reply> reply) {
-    std::vector<quiche_h3_header> headers;
+        if (this->_closing_marker) {
+            return make_exception_future<>(std::runtime_error("The connection has been closed."));
+        }
 
-    quiche_h3_header status = {
-            .name = (const uint8_t *) ":status",
-            .name_len = sizeof(":status") - 1,
+        std::vector<quiche_h3_header> headers;
 
-            .value = (const uint8_t *) reply->_resp._status,
-            .value_len = sizeof(reply->_resp._status) - 1,
-    };
-    headers.push_back(status);
+        // TODO: get status from Seastar handler
+        quiche_h3_header status = {
+                .name = (const uint8_t *) ":status",
+                .name_len = sizeof(":status") - 1,
 
-    for (const auto& h : reply->_resp._headers) {
-        headers.push_back({
-                                  .name = (const uint8_t *) h.first.c_str(),
-                                  .name_len = h.first.size() - 1,
+                .value = reinterpret_cast<const uint8_t *>("200"),
+                .value_len = 3
+        };
+        headers.push_back(status);
 
-                                  .value = (const uint8_t *) h.second.c_str(),
-                                  .value_len = h.second.size() - 1,
-                          });
-    }
+        for (const auto& h : reply->_resp->_headers) {
+            headers.push_back({
+                                      .name = (const uint8_t *) h.first.c_str(),
+                                      .name_len = h.first.size(),
 
-    quiche_h3_send_response(h3_conn, this->_connection,
-                            reply->_stream_id, headers.data(), headers.size(), false);
+                                      .value = (const uint8_t *) h.second.c_str(),
+                                      .value_len = h.second.size(),
+                              });
+        }
 
-    const auto written = quiche_h3_send_body(h3_conn, this->_connection,
-                                             reply->_stream_id, (uint8_t *) reply->_resp._content.c_str(), reply->_resp.content_length, true);
 
-    if (written < 0) {
-        // TODO: Handle the error.
-        fmt::print("[Write] Writing to a stream has failed with message: {}\n", written);
-    }
+        // TODO: check result
+        quiche_h3_send_response(h3_conn, this->_connection,
+                                reply->_stream_id, headers.data(), headers.size(), false);
 
-    // TODO bufor
-    const auto actually_written = static_cast<size_t>(written);
 
-    if (actually_written != reply->_resp.content_length) {
 
-    }
+        // TODO: check result
+        quiche_h3_send_body(h3_conn, this->_connection,
+                                                 reply->_stream_id, (uint8_t *) reply->_resp->_content.c_str(), reply->_resp->content_length, true);
 
-    return this->quic_flush().then([] () {
-//        return wait_send_available(); //TODO
-        return seastar::make_ready_future<>();
-    });
+        // TODO: buffering
+//        if (written != reply->_resp->content_length) {
+//
+//        }
+
+        return this->quic_flush();
 }
 
-// FIXME: There's a bug
 template <typename QI>
 future<> h3_connection<QI>::h3_recv_loop() {
-    std::cout << "H3_connection socket recv_loop" << std::endl;
-
-    return do_until([this] { return this->is_closing(); }, [this] {
-        std::cout << "H3_connection socket recv_loop ENTERING" << std::endl;
-        return this->_read_marker.get_shared_future().then([this] {
-            std::cout << "H3_connection socket recv_loop ENTERED" << std::endl;
-
-            if (quiche_conn_is_established(this->_connection)) {
-                std::cout << "H3_connection socket recv_loop ESTABLISHED" << std::endl;
-
-                if (h3_conn == NULL) {
-                    h3_conn = quiche_h3_conn_new_with_transport(this->_connection, h3_config);
-                    if (h3_conn == NULL) {
-                        fmt::print("failed to create HTTP/3 connection\n");
-                    }
-                }
-
-                quiche_h3_event *ev;
-
-                int64_t s = quiche_h3_conn_poll(h3_conn, this->_connection, &ev);
-                if (s < 0) {
-                    fprintf(stderr, "failed in quicheh3_conn_poll\n");
-                }
-                auto new_req = std::make_unique<seastar::net::quic_h3_request>();
-                new_req->_stream_id = s;
-
-                switch (quiche_h3_event_type(ev)) {
-                    case QUICHE_H3_EVENT_HEADERS: {
-                        fmt::print("QUICHE_H3_EVENT_HEADERS\n");
-
-
-                        int rc = quiche_h3_event_for_each_header(ev, for_each_header,
-                                                                 new_req.get());
-
-                        if (rc != 0) {
-                            fprintf(stderr, "failed to process headers");
-                        }
-                        break;
+        return do_until([this] {
+            return this->is_closing(); }, [this] {
+            return this->_read_marker.get_shared_future().then([this] {
+                if (quiche_conn_is_established(this->_connection)) {
+                    if (h3_conn == nullptr) {
+                        throw std::runtime_error("Invalid state");
                     }
 
-                    case QUICHE_H3_EVENT_DATA: {
-                        fmt::print("QUICHE_H3_EVENT_DATA\n");
-                        static uint8_t buf[MAX_DATAGRAM_SIZE];
+                    quiche_h3_event *ev;
 
-                        ssize_t len = quiche_h3_recv_body(h3_conn, this->_connection, s, buf, sizeof(buf));
+                    int64_t s = quiche_h3_conn_poll(h3_conn, this->_connection, &ev);
+                    if (s < 0) {
+                        std::cout << "poll res: " << s << std::endl;
+                        return seastar::make_ready_future<>();
+                    }
+                    
+                    auto new_req = std::make_unique<seastar::net::quic_h3_request>();
+                    new_req->_req = std::make_unique<http::request>();
+                    new_req->_stream_id = s;
+                    switch (quiche_h3_event_type(ev)) {
+                        case QUICHE_H3_EVENT_HEADERS: {
+                            int rc = quiche_h3_event_for_each_header(ev, for_each_header,
+                                                                     new_req.get());
+                            new_req->_req->_url = new_req->_req->_headers[":path"];
+                            new_req->_req->_method = new_req->_req->_headers[":method"];
+                            new_req->_req->_version = new_req->_req->_headers[":scheme"];
 
-                        if (len <= 0) {
+                            if (rc != 0) {
+                                fprintf(stderr, "failed to process headers");
+                            }
+                            read_queue.push(std::move(new_req));
                             break;
                         }
-//                        printf("GOT: %.*s", (int) len, buf);
 
-                        new_req->_req.content_length = len;
-                        new_req->_req.content = to_sstring(buf);
-                        break;
+                        case QUICHE_H3_EVENT_DATA: {
+                            static uint8_t buf[MAX_DATAGRAM_SIZE];
+
+                            ssize_t len = quiche_h3_recv_body(h3_conn, this->_connection, s, buf, sizeof(buf));
+
+                            if (len <= 0) {
+                                break;
+                            }
+
+                            new_req->_req->content_length = len;
+                            new_req->_req->content = to_sstring(buf);
+                            read_queue.push(std::move(new_req));
+                            break;
+                        }
+
+                        case QUICHE_H3_EVENT_FINISHED:
+                        case QUICHE_H3_EVENT_RESET:
+                        case QUICHE_H3_EVENT_PRIORITY_UPDATE:
+                        case QUICHE_H3_EVENT_DATAGRAM:
+                        case QUICHE_H3_EVENT_GOAWAY:
+                            break;
                     }
 
-                    case QUICHE_H3_EVENT_FINISHED:
-                        fmt::print("QUICHE_H3_EVENT_FINISHED\n");
-                        break;
-
-                    case QUICHE_H3_EVENT_RESET:
-                        fmt::print("QUICHE_H3_EVENT_RESET\n");
-                        break;
-
-                    case QUICHE_H3_EVENT_PRIORITY_UPDATE:
-                        fmt::print("QUICHE_H3_EVENT_PRIORITY_UPDATE\n");
-                        break;
-
-                    case QUICHE_H3_EVENT_DATAGRAM:
-                        fmt::print("QUICHE_H3_EVENT_DATAGRAM\n");
-                        break;
-
-                    case QUICHE_H3_EVENT_GOAWAY: {
-                        fmt::print("QUICHE_H3_EVENT_GOAWAY\n");
-                        break;
-                    }
+                    quiche_h3_event_free(ev);
                 }
-                read_queue.push(std::move(new_req));
-                quiche_h3_event_free(ev);
 
-            }
-            else {
-                std::cout << "H3_connection socket recv_loop NOT ESTABLISHED" << std::endl;
-
-            }
-
-            if (!quiche_conn_is_readable(this->_connection)) {
-                fmt::print("Read marker reset.\n");
-                this->_read_marker.reset();
-            }
-            else {
-                fmt::print("READABLE?\n");
-            }
-
-            return this->quic_flush();
+                return seastar::make_ready_future<>();
+            }).then([this] {
+                if (!quiche_conn_is_readable(this->_connection)) {
+                    this->_read_marker.reset();
+                }
+                return this->quic_flush();
+            });
         });
-    });
+}
+
+template <typename QI>
+future<> h3_connection<QI>::h3_connect_done() {
+    return _h3_connect_done_promise.get_future();
 }
 
 using h3_server            = quic_server_instance<h3_connection>;
-using h3_server_connection = h3_connection<h3_server>; // FIXME: may be a bug
+using h3_server_connection = h3_connection<h3_server>;
 
 using h3_engine = quic_engine<h3_server>;
 
@@ -389,15 +343,17 @@ public:
 // Implementation.
 public:
     future<quic_h3_accept_result> accept() override {
-        // FIXME: there's a bug
-
         return _listener->accept().then([] (lw_shared_ptr<h3_server_connection> conn) {
-            auto impl = std::make_unique<implementation_type>(conn);
-
-            return make_ready_future<quic_h3_accept_result>(quic_h3_accept_result {
-                .connection     = quic_h3_connected_socket(std::move(impl)),
-                .remote_address = conn->remote_address()
+            future<> h3_connected = conn->h3_connect_done();
+            return h3_connected.then([conn = std::move(conn)] {
+                auto impl = std::make_unique<implementation_type>(conn);
+                return make_ready_future<quic_h3_accept_result>(quic_h3_accept_result {
+                        .connection     = quic_h3_connected_socket(std::move(impl)),
+                        .remote_address = conn->remote_address()
+                });
             });
+
+
         });
     }
 
@@ -437,6 +393,7 @@ connection::~connection() {
 }
 
 future<> connection::process() {
+    h3logger.info("ABOUT TO PROCESS");
     return when_all(read(), respond()).then([] (std::tuple<future<>, future<>> joined) {
         try {
             std::get<0>(joined).get();
@@ -468,18 +425,21 @@ future<> connection::read_one() {
             _done = true;
             return make_ready_future<>();
         }
-        req->_req.protocol_name = "https";
 
-        sstring length_header = req->_req.get_header("Content-Length");
-        req->_req.content_length = strtol(length_header.c_str(), nullptr, 10);
+        auto method = req->_req->_method;
+
+        req->_req->protocol_name = "https";
+
+        sstring length_header = req->_req->get_header("Content-Length");
+        req->_req->content_length = strtol(length_header.c_str(), nullptr, 10);
 
         auto maybe_reply_continue = [this, req = std::move(req)]() mutable {
-            if (http::request::case_insensitive_cmp()(req->_req.get_header("Expect"), "100-continue")) {
+            if (http::request::case_insensitive_cmp()(req->_req->get_header("Expect"), "100-continue")) {
                 return _replies.not_full().then([req = std::move(req), this]() mutable {
                     auto continue_reply = std::make_unique<seastar::net::quic_h3_reply>();
                     set_headers(*continue_reply);
-                    continue_reply->_resp.set_version(req->_req._version);
-                    continue_reply->_resp.set_status(http::reply::status_type::continue_).done();
+                    continue_reply->_resp->set_version(req->_req->_version);
+                    continue_reply->_resp->set_status(http::reply::status_type::continue_).done();
                     this->_replies.push(std::move(continue_reply));
                     return make_ready_future<std::unique_ptr<seastar::net::quic_h3_request>>(std::move(req));
                 });
@@ -487,6 +447,7 @@ future<> connection::read_one() {
                 return make_ready_future<std::unique_ptr<seastar::net::quic_h3_request>>(std::move(req));
             }
         };
+        // std::cout << "maybe reply from read_one" << std::endl;
         return maybe_reply_continue().then([this] (std::unique_ptr<seastar::net::quic_h3_request> req) {
             return _replies.not_full().then([this, req = std::move(req)] () mutable {
                 return generate_reply(std::move(req));
@@ -500,28 +461,32 @@ future<> connection::read_one() {
 
 future<bool> connection::generate_reply(std::unique_ptr<seastar::net::quic_h3_request> req) {
     auto resp = std::make_unique<seastar::net::quic_h3_reply>();
-    resp->_resp.set_version(req->_req._version);
+    resp->_resp = std::make_unique<http::reply>();
+    resp->_resp->set_version(req->_req->_version);
     set_headers(*resp);
-    bool keep_alive = req->_req.should_keep_alive();
+    bool keep_alive = req->_req->should_keep_alive();
     if (keep_alive) {
-        resp->_resp._headers["Connection"] = "Keep-Alive";
+        resp->_resp->_headers["Connection"] = "Keep-Alive";
     }
 
-    sstring url = req->_req.parse_query_param();
-    sstring version = req->_req._version;
-    return _server._routes.handle(url, std::unique_ptr<http::request>(&req->_req), std::unique_ptr<http::reply>(&resp->_resp)).
-            then([this, keep_alive , version = std::move(version), stream_id = req->_stream_id](std::unique_ptr<http::reply> rep) {
+    sstring url = req->_req->parse_query_param();
+    sstring version = req->_req->_version;
+    auto http_req = std::move(req->_req);
+    auto http_rep = std::move(resp->_resp);
+
+    return _server._routes.handle(url, std::move(http_req), std::move(http_rep)).
+            then([this, keep_alive , version = std::move(version), resp = std::move(resp)](std::unique_ptr<http::reply> rep) {
         rep->set_version(version).done();
-        auto reply = std::make_unique<seastar::net::quic_h3_reply>();
-        reply->_resp = std::move(*rep);
-        reply->_stream_id = stream_id;
-        _replies.push(std::move(reply));
+        auto new_reply = std::make_unique<seastar::net::quic_h3_reply>();
+        new_reply->_stream_id = resp->_stream_id;
+        new_reply->_resp = std::move(rep);
+        _replies.push(std::move(new_reply));
         return make_ready_future<bool>(!keep_alive);
     });
 }
 
 void connection::set_headers(seastar::net::quic_h3_reply& resp) {
-    resp._resp._headers["Server"] = "Seastar httpd3";
+    resp._resp->_headers["Server"] = "Seastar httpd3";
 }
 
 future<> connection::respond() {
@@ -545,8 +510,9 @@ future<> connection::do_response_loop() {
 
 future<> connection::start_response() {
     set_headers(*_resp);
-    _resp->_resp._headers["Content-Length"] = to_sstring(
-            _resp->_resp._content.size());
+    _resp->_resp->_headers["Content-Length"] = to_sstring(
+            _resp->_resp->_content.size());
+    _resp->_resp->content_length = _resp->_resp->_content.size();
     return _socket.write(std::move(_resp));
 }
 
@@ -571,10 +537,11 @@ void http3_server::do_accepts() {
 }
 
 future<> http3_server::accept_one() {
-    return _listener.accept().then([this] (net::quic_h3_accept_result&& result) mutable {
+    return _listener.accept().then([this] (net::quic_h3_accept_result result) mutable {
+        h3logger.info("ACCEPTED");
         auto conn = std::make_unique<connection>(*this, std::move(result.connection));
         (void) try_with_gate(_task_gate, [conn = std::move(conn)] () mutable {
-            return conn->process().handle_exception([] (const std::exception_ptr& e) {
+            return conn->process().handle_exception([conn = std::move(conn)] (const std::exception_ptr& e) {
                 h3logger.debug("Connection processing error: {}", e);
             });
         }).handle_exception_type([] (const gate_closed_exception& e) {
@@ -589,9 +556,10 @@ future<> http3_server::accept_one() {
 future<> http3_server::stop() {
     future<> closed = _task_gate.close();
     _listener.abort_accept();
-    for (auto&& conn : _connections) {
-        // conn.stop(); TODO: implement stop
-    }
+    // TODO: implement stop
+//    for (auto&& conn : _connections) {
+//        // conn.stop();
+//    }
     return closed;
 }
 

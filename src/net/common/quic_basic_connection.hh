@@ -363,7 +363,7 @@ void quic_basic_connection<QI>::receive(udp_datagram&& datagram) {
     }
 
     if (quiche_conn_is_readable(_connection)) {
-        // fmt::print("SET READABLE.\n");
+        fmt::print("SET READABLE.\n");
         _read_marker.mark_as_ready();
     }
 }
