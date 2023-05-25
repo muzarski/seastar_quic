@@ -33,7 +33,7 @@ class quiche_configuration final {
 // Local definitions.
 private:
     // TODO: For the time being, store these statically to make development easier.
-    constexpr static const char PROTOCOL_LIST[] = "\x0ahq-interop\x05hq-29\x05hq-28\x05hq-27\x08http/0.9";
+    constexpr static const char PROTOCOL_LIST[] = QUICHE_H3_APPLICATION_PROTOCOL;
 
 // Fields.
 private:

@@ -39,30 +39,94 @@ class h3_connection final
         : public quic_basic_connection<QI>
         , public enable_lw_shared_from_this<h3_connection<QI>>
 {
+// Constants.
+private:
+    constexpr static size_t H3_READ_QUEUE_SIZE = 10'000;
 // Local definitions.
 public:
     using type          = h3_connection<QI>;
     using instance_type = QI;
 private:
     using super_type    = quic_basic_connection<QI>;
-    
+// Quiche HTTP3 specific fields.
+private:
+    quiche_h3_config* h3_config = nullptr;
+    quiche_h3_conn* h3_conn = nullptr;
+
+    static int for_each_header(uint8_t *name, size_t name_len,
+                               uint8_t *value, size_t value_len,
+                               void *argp) {
+
+        // FIXME: There's a bug.
+        auto *request_in_callback = static_cast<seastar::net::quic_h3_request*>(argp);
+        request_in_callback->_req._headers[to_sstring(name)] = to_sstring(value); // TODO check if to_sstring actually works
+        fprintf(stderr, "got HTTP header: %.*s=%.*s\n",
+                (int) name_len, name, (int) value_len, value);
+        return 0;
+    }
+// Local structures
+private:
+    class read_marker {
+    private:
+        // A `promise<>` used for generating `future<>`s to provide
+        // a means to mark if there may be some data to be processed and to check the marker.
+        shared_promise<>    _readable         = shared_promise<>{};
+        // Equals to `true` if and only if the promise `_readable`
+        // has been assigned a value.
+        bool                _promise_resolved = false;
+
+    public:
+        decltype(auto) get_shared_future() const noexcept {
+            return _readable.get_shared_future();
+        }
+
+        void mark_as_ready() noexcept {
+            if (!_promise_resolved) {
+                _readable.set_value();
+                _promise_resolved = true;
+            }
+        }
+
+        void reset() noexcept {
+            if (_promise_resolved) {
+                _readable = shared_promise<>{};
+                _promise_resolved = false;
+            }
+        }
+    };
+
+// Fields.
+protected:
+    future<> _stream_recv_fiber;
+public:
+    // Data to be read from the stream.
+    queue< std::unique_ptr<quic_h3_request>> read_queue = queue< std::unique_ptr<quic_h3_request>>(H3_READ_QUEUE_SIZE);
+    // Data to be sent via the stream.
+    // std::deque<quic_buffer>         write_queue; TODO: implement buffering (not only quic_buffer, but also headers!)
+
 // Constructors + the destructor.
 public:
     template<typename... Args>
     h3_connection(Args&&... args)
     : super_type(std::forward<Args>(args)...)
+    , _stream_recv_fiber(seastar::make_ready_future<>())
     {
         this->_socket->register_connection(this->shared_from_this());
-        // TODO: Init!
+        init();
     }
 
     ~h3_connection() = default;
 
 // Public methods.
 public:
+    void init();
     void close();
     future<std::unique_ptr<quic_h3_request>> read();
     future<> write(std::unique_ptr<quic_h3_reply> reply);
+    void send_outstanding_data_in_streams_if_possible();
+// Private methods.
+    future<> h3_recv_loop();
+    // future<> wait_send_available(); TODO: buffering
 };
 
 template<typename QI>
