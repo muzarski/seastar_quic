@@ -389,7 +389,7 @@ public:
 // Implementation.
 public:
     future<quic_h3_accept_result> accept() override {
-        std::cout << "In HTTP3 impl accept" << std::endl;
+        // FIXME: there's a bug
 
         return _listener->accept().then([] (lw_shared_ptr<h3_server_connection> conn) {
             auto impl = std::make_unique<implementation_type>(conn);
@@ -409,8 +409,21 @@ public:
         return _listener->local_address();
     }
 };
-
 } // anonymous namespace
+
+quic_h3_server_socket quic_h3_listen(const socket_address &sa, const std::string_view cert_file,
+                                     const std::string_view cert_key, const quic_connection_config& quic_config) {
+    return quic_h3_server_socket(std::make_unique<quiche_h3_server_socket_impl>(sa, cert_file, cert_key, quic_config));
+}
+
+future<std::unique_ptr<quic_h3_request>> quic_h3_connected_socket:: read() {
+    return future<std::unique_ptr<quic_h3_request>>(_impl->read());
+}
+
+future<> quic_h3_connected_socket::write(std::unique_ptr<quic_h3_reply> reply) {
+    return future<>(_impl->write(std::move(reply)));
+}
+
 } // namespace net
 
 namespace http3 {
