@@ -70,8 +70,8 @@ private:
     }
 // Fields.
 private:
-    future<> _stream_recv_fiber;
-    promise<> _h3_connect_done_promise{};
+    future<>         _stream_recv_fiber;
+    shared_promise<> _h3_connect_done_promise{};
 public:
     // Data to be read from the stream.
     queue< std::unique_ptr<quic_h3_request>> read_queue = queue< std::unique_ptr<quic_h3_request>>(H3_READ_QUEUE_SIZE);
@@ -86,7 +86,6 @@ public:
     , _stream_recv_fiber(seastar::make_ready_future<>())
     {
         this->_socket->register_connection(this->shared_from_this());
-        init();
     }
 
     ~h3_connection() = default;
@@ -112,7 +111,7 @@ void h3_connection<QI>::init() {
     if (h3_config == nullptr) {
         throw std::runtime_error("Could not initialize config");
     }
-    this->_stream_recv_fiber = seastar::make_ready_future<>().then([this] {
+    this->_stream_recv_fiber = this->connect_done().then([this] {
         if (h3_conn == nullptr) {
             h3_conn = quiche_h3_conn_new_with_transport(this->_connection, h3_config);
             if (h3_conn == nullptr) {
@@ -276,7 +275,7 @@ future<> h3_connection<QI>::h3_recv_loop() {
 
 template <typename QI>
 future<> h3_connection<QI>::h3_connect_done() {
-    return _h3_connect_done_promise.get_future();
+    return _h3_connect_done_promise.get_shared_future();
 }
 
 using h3_server            = quic_server_instance<h3_connection>;

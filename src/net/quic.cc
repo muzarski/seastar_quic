@@ -106,38 +106,6 @@ private:
         bool                                         shutdown_output = false;
     };
 
-    // Class providing a way to mark data if there is some data
-    // to be processed by the streams.
-    class read_marker {
-    private:
-        // A `promise<>` used for generating `future<>`s to provide
-        // a means to mark if there may be some data to be processed by
-        // the streams, and to check the marker.
-        shared_promise<>    _readable         = shared_promise<>{};
-        // Equals to `true` if and only if the promise `_readable`
-        // has been assigned a value.
-        bool                _promise_resolved = false;
-
-    public:
-        decltype(auto) get_shared_future() const noexcept {
-            return _readable.get_shared_future();
-        }
-
-        void mark_as_ready() noexcept {
-            if (!_promise_resolved) {
-                _readable.set_value();
-                _promise_resolved = true;
-            }
-        }
-
-        void reset() noexcept {
-            if (_promise_resolved) {
-                _readable = shared_promise<>{};
-                _promise_resolved = false;
-            }
-        }
-    };
-
 // Fields.
 protected:
     std::unordered_map<quic_stream_id, quic_stream> _streams;
@@ -152,7 +120,6 @@ public:
     , _stream_recv_fiber(make_ready_future<>())
     {
         this->_socket->register_connection(this->shared_from_this());
-        init();
     }
 
     ~quic_connection()  = default;
@@ -508,7 +475,7 @@ future<> quic_connection<QI>::stream_recv_loop() {
 
                     if (recv_result < 0) {
                         // TODO: Handle this properly.
-                        // fmt::print(stderr, "Reading from a stream has failed with message: {}\n", recv_result);
+                        fmt::print(stderr, "Reading from a stream has failed with message: {}\n", recv_result);
                     } else {
                         temporary_buffer<quic_byte_type> message{this->_buffer.data(), static_cast<size_t>(recv_result)};
                         // TODO: Wrap this in some kind of `not_full` future
