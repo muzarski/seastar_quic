@@ -217,7 +217,7 @@ future<> http3_server::listen(socket_address addr, const std::string &cert_file,
                                   [[maybe_unused]] const net::quic_connection_config &quic_config)
 {
     fmt::print("Called http3_server::listen with: {}, {}, {}", addr, cert_file, cert_key);
-    _listener = net::quic_http3_listen(addr, cert_file, cert_key, quic_config);
+    _listener = net::quic_h3_listen(addr, cert_file, cert_key, quic_config);
     do_accepts();
     return make_ready_future<>();
 }
@@ -234,13 +234,15 @@ void http3_server::do_accepts() {
 }
 
 future<> http3_server::accept_one() {
-    return _listener.accept().then([this] (net::quic_http3_connected_socket&& socket) mutable {
-        auto conn = std::make_unique<connection>(*this, std::move(socket));
+    return _listener.accept().then([this] (net::quic_h3_accept_result&& result) mutable {
+        auto conn = std::make_unique<connection>(*this, std::move(result.connection));
         (void) try_with_gate(_task_gate, [conn = std::move(conn)] () mutable {
             return conn->process().handle_exception([] (const std::exception_ptr& e) {
                 h3logger.debug("Connection processing error: {}", e);
             });
-        }).handle_exception_type([] (const gate_closed_exception& e) {});
+        }).handle_exception_type([] (const gate_closed_exception& e) {
+            h3logger.debug("Gate closed.");
+        });
         return make_ready_future<>();
     }).handle_exception([] (const std::exception_ptr& e) {
         h3logger.debug("Accept error: {}", e);
@@ -251,7 +253,7 @@ future<> http3_server::stop() {
     future<> closed = _task_gate.close();
     _listener.abort_accept();
     for (auto&& conn : _connections) {
-        conn.stop();
+        // conn.stop(); TODO: implement stop
     }
     return closed;
 }
