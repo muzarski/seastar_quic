@@ -68,6 +68,7 @@ private:
 private:
     future<>         _stream_recv_fiber;
     shared_promise<> _h3_connect_done_promise{};
+    std::vector<quic_byte_type> _buffer;
 public:
     // Data to be read from the stream.
     queue<std::unique_ptr<quic_h3_request>> read_queue = queue<std::unique_ptr<quic_h3_request>>(H3_READ_QUEUE_SIZE);
@@ -80,6 +81,7 @@ public:
     h3_connection(Args&&... args)
     : super_type(std::forward<Args>(args)...)
     , _stream_recv_fiber(seastar::make_ready_future<>())
+    , _buffer(MAX_DATAGRAM_SIZE)
     {
         this->_socket->register_connection(this->shared_from_this());
     }
@@ -255,20 +257,18 @@ future<> h3_connection<QI>::h3_recv_loop() {
                     }
 
                     case QUICHE_H3_EVENT_DATA: {
-                        static thread_local uint8_t buf[MAX_DATAGRAM_SIZE];
-
                         const auto len = quiche_h3_recv_body(
                                 _h3_conn,
                                 this->_connection,
                                 s,
-                                buf,
-                                sizeof(buf));
+                                reinterpret_cast<uint8_t*>(_buffer.data()),
+                                _buffer.size());
 
                         if (len <= 0) {
                             break;
                         }
 
-                        new_req->_req->content        = sstring(reinterpret_cast<const char*>(buf), len);
+                        new_req->_req->content        = sstring(_buffer.data(), len);
                         new_req->_req->content_length = len;
                         read_queue.push(std::move(new_req));
                         break;
