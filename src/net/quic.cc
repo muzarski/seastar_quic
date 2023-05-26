@@ -528,8 +528,8 @@ future<> quic_connection<QI>::wait_send_available(quic_stream_id stream_id) {
 using quic_server = quic_server_instance<quic_connection>;
 using quic_client = quic_client_instance<quic_connection>;
 
-using quic_server_connection = quic_connection<quic_server>;
-using quic_client_connection = quic_connection<quic_client>;
+using quic_server_connection = typename quic_server::connection_type;
+using quic_client_connection = typename quic_client::connection_type;
 
 using quic_engine_type = quic_engine<quic_server, quic_client>;
 

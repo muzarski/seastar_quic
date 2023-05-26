@@ -321,7 +321,7 @@ future<> h3_connection<QI>::h3_connect_done() {
 }
 
 using h3_server            = quic_server_instance<h3_connection>;
-using h3_server_connection = h3_connection<h3_server>;
+using h3_server_connection = typename h3_server::connection_type;
 
 using h3_engine = quic_engine<h3_server>;
 
