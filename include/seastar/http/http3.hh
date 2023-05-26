@@ -29,11 +29,21 @@ namespace seastar {
 
 namespace net {
 
-// For dawmd to make it clearer what kind of API should be exposed by the quic-http3 backend.
-
 struct quic_h3_request {
-    int64_t _stream_id;
+    int64_t _stream_id = 0;
     std::unique_ptr<http::request> _req;
+
+    quic_h3_request() = default;
+
+    explicit quic_h3_request(int64_t stream_id)
+    : _stream_id(stream_id)
+    , _req(std::make_unique<http::request>()) {}
+
+    quic_h3_request(const quic_h3_request& other) = delete;
+    quic_h3_request& operator=(const quic_h3_request& other) = delete;
+
+    quic_h3_request(quic_h3_request&& other) = default;
+    quic_h3_request& operator=(quic_h3_request&& other) = default;
 };
 
 struct quic_h3_reply {
