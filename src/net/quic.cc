@@ -489,7 +489,7 @@ future<> quic_connection<QI>::stream_recv_loop() {
             quiche_stream_iter_free(iter);
 
             if (!quiche_conn_is_readable(this->_connection)) {
-                fmt::print("Read marker reset.\n");
+//                fmt::print("Read marker reset.\n");
                 this->_read_marker.reset();
             }
             else {
@@ -644,6 +644,7 @@ future<quic_connected_socket> quic_connect(const socket_address& sa,
 
     try {
         auto connection = quiche_connect(sa, quic_config);
+        connection->init();
         return connection->connect_done().then([connection] {
             auto impl = std::make_unique<impl_type>(connection);
             return make_ready_future<quic_connected_socket>(std::move(impl));
@@ -662,6 +663,7 @@ output_stream<quic_byte_type> quic_connected_socket::output(quic_stream_id id, s
     opts.batch_flushes = true;
     return {_impl->sink(id), buffer_size};
 }
+
 
 void quic_connected_socket::shutdown_output(quic_stream_id id) {
     return _impl->shutdown_output(id);
