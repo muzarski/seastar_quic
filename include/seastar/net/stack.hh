@@ -24,6 +24,7 @@
 #include <seastar/net/api.hh>
 #include <seastar/core/internal/api-level.hh>
 #include <seastar/core/memory.hh>
+#include <seastar/net/quic.hh>
 
 namespace seastar {
 
@@ -59,6 +60,14 @@ public:
     virtual void shutdown() = 0;
 };
 
+class q_socket_impl {
+public:
+    virtual ~q_socket_impl() {}
+    virtual future<net::quic_connected_socket> connect(socket_address sa, socket_address local, transport proto = transport::TCP) = 0;
+    virtual void set_reuseaddr(bool reuseaddr) = 0;
+    virtual bool get_reuseaddr() const = 0;
+    virtual void shutdown() = 0;
+};
 
 class server_socket_impl {
 public:

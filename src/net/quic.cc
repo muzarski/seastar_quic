@@ -46,7 +46,7 @@
 
 
 namespace seastar::net {
-namespace {
+    namespace {
 
 
 
@@ -68,7 +68,7 @@ namespace {
 template<typename QI>
 class quic_connection final
         : public quic_basic_connection<QI>
-        , public enable_lw_shared_from_this<quic_connection<QI>>
+                , public enable_lw_shared_from_this<quic_connection<QI>>
 {
 // Constants.
 private:
@@ -128,6 +128,12 @@ public:
 public:
     void init();
     void close();
+
+    void shutdown_all_output() {
+        for (auto& [stream_id, _] : _streams) {
+            shutdown_output(stream_id);
+        }
+    }
 
     // Send a message via a stream.
     future<> write(temporary_buffer<quic_byte_type> tb, quic_stream_id stream_id);
@@ -240,6 +246,10 @@ public:
 
 // Public methods.
 public:
+    void shutdown_all_output() override {
+        _connection->shutdown_all_output();
+    }
+
     data_source source(quic_stream_id stream_id) override {
         return data_source(std::make_unique<data_source_type>(_connection, stream_id));
     }
@@ -615,6 +625,30 @@ void quiche_log_printer(const char* line, [[maybe_unused]] void*) {
     std::cout << line << std::endl;
 }
 
+class quiche_q_socket_impl : public q_socket_impl{
+    quiche_configuration                    _config;
+    lw_shared_ptr<quic_client_connection> _conn;
+public:
+
+    explicit quiche_q_socket_impl(const quic_connection_config& quic_config)
+            : _config(quic_config), _conn() {}
+    virtual future<net::quic_connected_socket> connect(socket_address sa) override {
+        return quic_connect(sa);
+    };
+    virtual void set_reuseaddr(bool reuseaddr) override {};
+    virtual bool get_reuseaddr() const override { return false; };
+    virtual void shutdown() override {
+        if (_conn) {
+            //TODO take care of the return value
+            // fmt::print("Connection is closed after shutdown.\n");
+            _conn->close();
+        }
+    }
+};
+
+socket_address shard_aware_address(socket_address sa) {
+    return {ipv4_addr(sa.as_posix_sockaddr_in().sin_addr, sa.port() + this_shard_id())};
+}
 } // anonymous namespace
 
 
@@ -632,18 +666,20 @@ void quiche_log_printer(const char* line, [[maybe_unused]] void*) {
 
 
 quic_server_socket quic_listen(const socket_address& sa, const std::string_view cert_file,
-        const std::string_view cert_key, const quic_connection_config& quic_config)
+                           const std::string_view cert_key, const quic_connection_config& quic_config)
 {
-    return quic_server_socket(std::make_unique<quiche_server_socket_impl>(sa, cert_file, cert_key, quic_config));
+    socket_address _sa = shard_aware_address(sa);
+    return quic_server_socket(std::make_unique<quiche_server_socket_impl>(_sa, cert_file, cert_key, quic_config));
 }
 
 future<quic_connected_socket> quic_connect(const socket_address& sa,
-        const quic_connection_config& quic_config)
+                                       const quic_connection_config& quic_config)
 {
     using impl_type = quiche_quic_connected_socket_impl<quic_client_connection>;
+    socket_address _sa = shard_aware_address(sa);
 
     try {
-        auto connection = quiche_connect(sa, quic_config);
+        auto connection = quiche_connect(_sa, quic_config);
         connection->init();
         return connection->connect_done().then([connection] {
             auto impl = std::make_unique<impl_type>(connection);
@@ -669,8 +705,18 @@ void quic_connected_socket::shutdown_output(quic_stream_id id) {
     return _impl->shutdown_output(id);
 }
 
+void quic_connected_socket::shutdown_all_input() {
+    //TODO
+//    return _impl->shutdown_all_input();
+}
+
 void quic_enable_logging() {
     quiche_enable_debug_logging(quiche_log_printer, nullptr);
 }
 
+q_socket new_q_socket() {
+    return q_socket(std::make_unique<quiche_q_socket_impl>(quic_connection_config()));
+}
+
 } // namespace seastar::net
+

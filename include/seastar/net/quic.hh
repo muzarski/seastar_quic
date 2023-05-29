@@ -58,7 +58,10 @@ public:
     virtual ~quic_connected_socket_impl() {}
     virtual data_source source(quic_stream_id id) = 0;
     virtual data_sink sink(quic_stream_id id) = 0;
-    virtual void shutdown_output(quic_stream_id id) = 0;
+//    virtual void shutdown_input(quic_stream_id id) = 0;
+    virtual void shutdown_output(std::uint64_t id) = 0;
+//    virtual void shutdown_all_input() = 0;
+    virtual void shutdown_all_output() = 0;
 };
 
 class quic_connected_socket {
@@ -66,10 +69,15 @@ private:
     std::unique_ptr<quic_connected_socket_impl> _impl;
 
 public:
-    quic_connected_socket(std::unique_ptr<quic_connected_socket_impl> impl) noexcept : _impl(std::move(impl)) {}
+    explicit quic_connected_socket(std::unique_ptr<quic_connected_socket_impl> impl) noexcept : _impl(std::move(impl)) {}
+    quic_connected_socket() = default;
     input_stream<quic_byte_type> input(quic_stream_id id);
     output_stream<quic_byte_type> output(quic_stream_id id, size_t buffer_size = 8192);
-    void shutdown_output(quic_stream_id id);
+    void shutdown_output(std::uint64_t id);
+    void shutdown_all_input();
+    void shutdown_all_output() {
+        return _impl->shutdown_all_output();
+    }
 };
 
 struct quic_accept_result {
@@ -92,7 +100,7 @@ private:
 public:
     quic_server_socket() noexcept = default;
     explicit quic_server_socket(std::unique_ptr<quic_server_socket_impl> impl) noexcept
-    : _impl(std::move(impl)) {}
+            : _impl(std::move(impl)) {}
     quic_server_socket(quic_server_socket&& qss) noexcept = default;
     ~quic_server_socket() noexcept = default;
 
@@ -103,7 +111,7 @@ public:
     [[nodiscard]] socket_address local_address() const noexcept {
         return _impl->local_address();
     }
-    
+
     void abort_accept() noexcept {
         _impl->abort_accept();
     };
@@ -111,13 +119,15 @@ public:
 
 // Initiate the quic server, provide certs, choose version etc.
 quic_server_socket quic_listen(const socket_address &sa, const std::string_view cert_file,
-        const std::string_view cert_key, const quic_connection_config& quic_config = quic_connection_config());
+                               const std::string_view cert_key, const quic_connection_config& quic_config = quic_connection_config());
 
 // Initiate connection to the server, choose version etc.
-future<quic_connected_socket> 
+future<quic_connected_socket>
 quic_connect(const socket_address &sa, const quic_connection_config& quic_config = quic_connection_config());
 
 // Quiche raw logs
 void quic_enable_logging();
+
+q_socket new_q_socket();
 
 } // namespace seastar::net

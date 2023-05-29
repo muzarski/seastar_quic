@@ -29,6 +29,7 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/net/api.hh>
+#include <seastar/net/quic.hh>
 #include <seastar/core/iostream.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/condition-variable.hh>
@@ -46,7 +47,7 @@ namespace bi = boost::intrusive;
 
 namespace seastar {
 
-namespace rpc {
+    namespace rpc {
 
 /// \defgroup rpc rpc - remote procedure call framework
 ///
@@ -235,7 +236,7 @@ public:
 
 class connection {
 protected:
-    connected_socket _fd;
+    net::quic_connected_socket _fd;
     input_stream<char> _read_buf;
     output_stream<char> _write_buf;
     bool _error = false;
@@ -317,12 +318,12 @@ protected:
     future<> handle_stream_frame();
 
 public:
-    connection(connected_socket&& fd, const logger& l, void* s, connection_id id = invalid_connection_id) : connection(l, s, id) {
+    connection(net::quic_connected_socket&& fd, const logger& l, void* s, connection_id id = invalid_connection_id) : connection(l, s, id) {
         set_socket(std::move(fd));
     }
     connection(const logger& l, void* s, connection_id id = invalid_connection_id) : _logger(l), _serializer(s), _id(id) {}
     virtual ~connection() {}
-    void set_socket(connected_socket&& fd);
+    void set_socket(net::quic_connected_socket&& fd);
     future<> send_negotiation_frame(feature_map features);
     // functions below are public because they are used by external heavily templated functions
     // and I am not smart enough to know how to define them as friends
@@ -417,7 +418,7 @@ public:
 };
 
 class client : public rpc::connection, public weakly_referencable<client> {
-    socket _socket;
+    q_socket _socket;
     id_type _message_id = 1;
     struct reply_handler_base {
         timer<rpc_clock_type> t;
@@ -488,8 +489,8 @@ public:
      * @param local the local address of this client
      * @param socket the socket object use to connect to the remote address
      */
-    client(const logger& l, void* s, socket socket, const socket_address& addr, const socket_address& local = {});
-    client(const logger& l, void* s, client_options options, socket socket, const socket_address& addr, const socket_address& local = {});
+    client(const logger& l, void* s, q_socket socket, const socket_address& addr, const socket_address& local = {});
+    client(const logger& l, void* s, client_options options, q_socket socket, const socket_address& addr, const socket_address& local = {});
 
     stats get_stats() const;
     stats& get_stats_internal() {
@@ -512,7 +513,7 @@ public:
         }
     }
     template<typename Serializer, typename... Out>
-    future<sink<Out...>> make_stream_sink(socket socket) {
+    future<sink<Out...>> make_stream_sink(q_socket socket) {
         return await_connection().then([this, socket = std::move(socket)] () mutable {
             if (!this->get_connection_id()) {
                 return make_exception_future<sink<Out...>>(std::runtime_error("Streaming is not supported by the server"));
@@ -538,7 +539,7 @@ public:
     }
     template<typename Serializer, typename... Out>
     future<sink<Out...>> make_stream_sink() {
-        return make_stream_sink<Serializer, Out...>(make_socket());
+        return make_stream_sink<Serializer, Out...>(net::new_q_socket());
     }
 };
 
@@ -561,7 +562,7 @@ public:
         future<feature_map> negotiate(feature_map requested);
         future<> send_unknown_verb_reply(std::optional<rpc_clock_type::time_point> timeout, int64_t msg_id, uint64_t type);
     public:
-        connection(server& s, connected_socket&& fd, socket_address&& addr, const logger& l, void* seralizer, connection_id id);
+        connection(server& s, net::quic_connected_socket&& fd, socket_address&& addr, const logger& l, void* seralizer, connection_id id);
         future<> process();
         future<> respond(int64_t msg_id, snd_buf&& data, std::optional<rpc_clock_type::time_point> timeout);
         client_info& info() { return _info; }
@@ -599,7 +600,7 @@ public:
     };
 private:
     protocol_base* _proto;
-    server_socket _ss;
+    net::quic_server_socket _ss;
     resource_limits _limits;
     rpc_semaphore _resources_available;
     std::unordered_map<connection_id, shared_ptr<connection>> _conns;
@@ -611,8 +612,8 @@ private:
 public:
     server(protocol_base* proto, const socket_address& addr, resource_limits memory_limit = resource_limits());
     server(protocol_base* proto, server_options opts, const socket_address& addr, resource_limits memory_limit = resource_limits());
-    server(protocol_base* proto, server_socket, resource_limits memory_limit = resource_limits(), server_options opts = server_options{});
-    server(protocol_base* proto, server_options opts, server_socket, resource_limits memory_limit = resource_limits());
+    server(protocol_base* proto, net::quic_server_socket, resource_limits memory_limit = resource_limits(), server_options opts = server_options{});
+    server(protocol_base* proto, server_options opts, net::quic_server_socket, resource_limits memory_limit = resource_limits());
     void accept();
     future<> stop();
     template<typename Func>
@@ -640,7 +641,7 @@ struct rpc_handler {
 class protocol_base {
 public:
     virtual ~protocol_base() {};
-    virtual shared_ptr<server::connection> make_server_connection(rpc::server& server, connected_socket fd, socket_address addr, connection_id id) = 0;
+    virtual shared_ptr<server::connection> make_server_connection(rpc::server& server, net::quic_connected_socket fd, socket_address addr, connection_id id) = 0;
 protected:
     friend class server;
 
@@ -750,9 +751,9 @@ public:
             rpc::server(&proto, addr, memory_limit) {}
         server(protocol& proto, server_options opts, const socket_address& addr, resource_limits memory_limit = resource_limits()) :
             rpc::server(&proto, opts, addr, memory_limit) {}
-        server(protocol& proto, server_socket socket, resource_limits memory_limit = resource_limits(), server_options = server_options{}) :
+        server(protocol& proto, net::quic_server_socket socket, resource_limits memory_limit = resource_limits(), server_options = server_options{}) :
             rpc::server(&proto, std::move(socket), memory_limit) {}
-        server(protocol& proto, server_options opts, server_socket socket, resource_limits memory_limit = resource_limits()) :
+        server(protocol& proto, server_options opts, net::quic_server_socket socket, resource_limits memory_limit = resource_limits()) :
             rpc::server(&proto, opts, std::move(socket), memory_limit) {}
     };
     /// Represents a client side connection.
@@ -777,9 +778,9 @@ public:
          * @param local the local address of this client
          * @param socket the socket object use to connect to the remote address
          */
-        client(protocol& p, socket socket, const socket_address& addr, const socket_address& local = {}) :
+        client(protocol& p, q_socket socket, const socket_address& addr, const socket_address& local = {}) :
             rpc::client(p.get_logger(), &p._serializer, std::move(socket), addr, local) {}
-        client(protocol& p, client_options options, socket socket, const socket_address& addr, const socket_address& local = {}) :
+        client(protocol& p, client_options options, q_socket socket, const socket_address& addr, const socket_address& local = {}) :
             rpc::client(p.get_logger(), &p._serializer, options, std::move(socket), addr, local) {}
     };
 
@@ -869,7 +870,7 @@ public:
         return _logger;
     }
 
-    shared_ptr<rpc::server::connection> make_server_connection(rpc::server& server, connected_socket fd, socket_address addr, connection_id id) override {
+    shared_ptr<rpc::server::connection> make_server_connection(rpc::server& server, net::quic_connected_socket fd, socket_address addr, connection_id id) override {
         return make_shared<rpc::server::connection>(server, std::move(fd), std::move(addr), _logger, &_serializer, id);
     }
 

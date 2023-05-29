@@ -21,6 +21,7 @@
 
 #include <seastar/net/stack.hh>
 #include <seastar/net/inet_address.hh>
+#include "seastar/net/api.hh"
 
 namespace seastar {
 
@@ -216,7 +217,7 @@ network_interface::network_interface(shared_ptr<net::network_interface_impl> imp
 
 network_interface::network_interface(network_interface&&) noexcept = default;
 network_interface& network_interface::operator=(network_interface&&) noexcept = default;
-    
+
 uint32_t network_interface::index() const {
     return _impl->index();
 }
@@ -269,4 +270,19 @@ std::vector<network_interface> network_stack::network_interfaces() {
     return {};
 }
 
+future<net::quic_connected_socket> q_socket::connect(socket_address sa) {
+    return _si->connect(sa);
+}
+
+void q_socket::set_reuseaddr(bool reuseaddr) {
+    _si->set_reuseaddr(reuseaddr);
+}
+
+bool q_socket::get_reuseaddr() const {
+    return _si->get_reuseaddr();
+}
+
+void q_socket::shutdown() {
+    _si->shutdown();
+}
 }
