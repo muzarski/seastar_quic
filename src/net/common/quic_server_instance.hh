@@ -225,7 +225,7 @@ future<> quic_server_instance<CT>::send(send_payload&& payload) {
 template<template<typename> typename CT>
 future<> quic_server_instance<CT>::handle_connection_closing(const quic_connection_id& cid) {
     _connections.erase(cid);
-    fmt::print("Server connection closed. Removed from the map.\n");
+    // fmt::print("Server connection closed. Removed from the map.\n");
     return make_ready_future<>();
 }
 

@@ -316,7 +316,7 @@ void quic_basic_connection<QI>::init() {
     _timeout_timer.set_callback([this] {
         quiche_conn_on_timeout(_connection);
         if (is_closed()) {
-            fmt::print("Conn is closed after on_timeout {}.\n", _socket->name());
+            // fmt::print("Conn is closed after on_timeout {}.\n", _socket->name());
             close();
             return;
         }
@@ -352,7 +352,7 @@ void quic_basic_connection<QI>::receive(udp_datagram&& datagram) {
         return;
     }
     if (is_closed()) {
-        fmt::print("Conn is closed after receive {}.\n", _socket->name());
+        // fmt::print("Conn is closed after receive {}.\n", _socket->name());
         close();
         return;
     }
@@ -363,7 +363,7 @@ void quic_basic_connection<QI>::receive(udp_datagram&& datagram) {
     }
 
     if (quiche_conn_is_readable(_connection)) {
-        fmt::print("SET READABLE.\n");
+        // fmt::print("SET READABLE.\n");
         _read_marker.mark_as_ready();
     }
 }
