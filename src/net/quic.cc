@@ -502,9 +502,9 @@ future<> quic_connection<QI>::stream_recv_loop() {
 //                fmt::print("Read marker reset.\n");
                 this->_read_marker.reset();
             }
-            else {
-                fmt::print("READABLE?\n");
-            }
+            // else {
+            //     fmt::print("READABLE?\n");
+            // }
 
             return this->quic_flush();
         });

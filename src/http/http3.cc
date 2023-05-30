@@ -565,7 +565,7 @@ future<> connection::start_response() {
 future<> http3_server::listen(socket_address addr, const std::string &cert_file, const std::string &cert_key,
                                   [[maybe_unused]] const net::quic_connection_config &quic_config)
 {
-    fmt::print("Called http3_server::listen with: {}, {}, {}", addr, cert_file, cert_key);
+    // fmt::print("Called http3_server::listen with: {}, {}, {}", addr, cert_file, cert_key);
     _listener = net::quic_h3_listen(addr, cert_file, cert_key, quic_config);
     do_accepts();
     return make_ready_future<>();
