@@ -26,6 +26,7 @@
 #include <seastar/core/weak_ptr.hh>         // seastar::weak_ptr
 #include <seastar/net/api.hh>               // seastar::net::udp_datagram
 #include <seastar/net/socket_defs.hh>       // seastar::net::socket_address
+#include <seastar/core/gate.hh>             // seastar::gate
 
 // Third-party API.
 #include <quiche.h>
@@ -88,7 +89,7 @@ private:
     public:
         // Data to be sent.
         send_payload payload;
-    
+
     public:
         paced_payload(send_payload spl, const send_time_point& t)
         : _time(t), payload(std::move(spl)) {}
@@ -115,6 +116,7 @@ private:
         // Equals to `true` if and only if the promise `_readable`
         // has been assigned a value.
         bool                _promise_resolved = false;
+        bool                _aborted = false;
 
     public:
         decltype(auto) get_shared_future() const noexcept {
@@ -122,17 +124,22 @@ private:
         }
 
         void mark_as_ready() noexcept {
-            if (!_promise_resolved) {
+            if (!_promise_resolved && !_aborted) {
                 _readable.set_value();
                 _promise_resolved = true;
             }
         }
 
         void reset() noexcept {
-            if (_promise_resolved) {
+            if (_promise_resolved && !_aborted) {
                 _readable = shared_promise<>{};
                 _promise_resolved = false;
             }
+        }
+
+        void abort() noexcept {
+            _readable.set_exception(std::make_exception_ptr(quic_aborted_exception()));
+            _aborted = true;
         }
     };
 
@@ -142,7 +149,7 @@ private:
     class send_queue_template : public std::priority_queue<Elem, Container, Compare> {
     private:
         using super_type = std::priority_queue<Elem, Container, Compare>;
-    
+
     public:
         Elem fetch_top() {
             std::pop_heap(super_type::c.begin(), super_type::c.end(), super_type::comp);
@@ -250,13 +257,14 @@ public:
 
     // Pass a datagram to process by the connection.
     void receive(udp_datagram&& datagram);
-    
-    decltype(auto) close() {
+
+    decltype(auto) abort() {
         // CRTP.
         static_assert(std::is_base_of_v<quic_basic_connection<QI>, connection_type>,
-                "Invalid connection type");
-        return static_cast<connection_type*>(this)->close();
+                      "Invalid connection type");
+        return static_cast<connection_type*>(this)->abort();
     }
+
     bool is_closed() const noexcept;
 
     future<> quic_flush();
@@ -269,6 +277,9 @@ public:
 // Protected methods.
 protected:
     bool is_closing() const noexcept;
+    [[nodiscard]] gate& gate() noexcept {
+        return _socket->gate();
+    }
 };
 
 
@@ -287,41 +298,39 @@ protected:
 template<typename QI>
 void quic_basic_connection<QI>::init() {
     _send_timer.set_callback([this] {
-        // fmt::print(stderr, "\t[Quic basic connection]: send timer.\n");
-        (void) repeat([this] {
-            if (_send_queue.empty()) {
-                return make_ready_future<stop_iteration>(stop_iteration::yes);
-            }
-
-            const send_time_point now = send_clock::now();
-            const send_time_point& send_time = _send_queue.top().get_time();
-
-            if (send_time <= now + SEND_TIME_EPSILON) {
-                // It is time to send the packet from the front of the queue.
-                auto payload = std::move(_send_queue.fetch_top().payload);
-                return _socket->send(std::move(payload)).then_wrapped([] (auto fut) {
-                    if (!fut.failed()) {
-                        return make_ready_future<stop_iteration>(stop_iteration::no);
-                    }
-                    fut.get_exception();
+        (void) try_with_gate(gate(), [this] () {
+            return repeat([this] {
+                if (_send_queue.empty()) {
                     return make_ready_future<stop_iteration>(stop_iteration::yes);
-                });
-            } else {
-                // No more packets should be sent now.
-                _send_timer.rearm(send_time);
-                return make_ready_future<stop_iteration>(stop_iteration::yes);
-            }
-        });
+                }
+
+                const send_time_point now = send_clock::now();
+                const send_time_point& send_time = _send_queue.top().get_time();
+
+                if (is_closing() || send_time <= now + SEND_TIME_EPSILON) {
+                    // It is time to send the packet from the front of the queue.
+                    auto payload = std::move(_send_queue.fetch_top().payload);
+                    return _socket->send(std::move(payload)).then([] () {
+                        return make_ready_future<stop_iteration>(stop_iteration::no);
+                    });
+                } else {
+                    // No more packets should be sent now.
+                    _send_timer.rearm(send_time);
+                    return make_ready_future<stop_iteration>(stop_iteration::yes);
+                }
+            }).handle_exception_type([] (const quic_aborted_exception& e) {});
+        }).handle_exception_type([] (const gate_closed_exception& e) {});
     });
 
     _timeout_timer.set_callback([this] {
         // fmt::print(stderr, "\t[Quic basic connection]: timeouted.\n");
         quiche_conn_on_timeout(_connection);
         if (is_closed()) {
-            fmt::print("Conn is closed after on_timeout.\n");
-            close();
+            qlogger.info("Calling abort from on_timeout");
+            this->abort();
             return;
         }
+
         (void) quic_flush();
     });
 
@@ -350,15 +359,15 @@ void quic_basic_connection<QI>::receive(udp_datagram&& datagram) {
             fa->size,
             &recv_info
     );
-    // fmt::print(stderr, "\t[Quic basic connection]: quiche_conn_recv finished.\n");
 
     if (recv_result < 0) {
-        fmt::print(stderr, "Failed to process a QUIC packet. Return value: {}\n", recv_result);
+        qlogger.warn("[quic_connection::receive] Failed to process a QUIC packet. Error: {}", recv_result);
         return;
     }
+
     if (is_closed()) {
-        fmt::print("Conn is closed after receive\n");
-        close();
+        qlogger.info("Calling abort from receive");
+        this->abort();
         return;
     }
 
@@ -368,7 +377,6 @@ void quic_basic_connection<QI>::receive(udp_datagram&& datagram) {
     }
 
     if (quiche_conn_is_readable(_connection)) {
-        // fmt::print("SET READABLE.\n");
         _read_marker.mark_as_ready();
     }
 }
@@ -380,50 +388,54 @@ bool quic_basic_connection<QI>::is_closed() const noexcept {
 
 template<typename QI>
 future<> quic_basic_connection<QI>::quic_flush() {
-    return repeat([this] {
-        // fmt::print(stderr, "\t[Quic basic connection]: Quic flush.\n");
-        // Converts a time point stored as `timespec` to `send_time_point`.
-        constexpr auto get_send_time = [](const timespec& at) constexpr -> send_time_point {
-            return send_time_point(
-                    std::chrono::duration_cast<send_time_duration>(
-                            std::chrono::seconds(at.tv_sec) + std::chrono::nanoseconds(at.tv_nsec)
-                    )
-            );
-        };
+    return try_with_gate(gate(), [this] () {
+        return repeat([this] {
+            // Converts a time point stored as `timespec` to `send_time_point`.
+            constexpr auto get_send_time = [](const timespec& at) constexpr -> send_time_point {
+                return send_time_point(
+                        std::chrono::duration_cast<send_time_duration>(
+                                std::chrono::seconds(at.tv_sec) + std::chrono::nanoseconds(at.tv_nsec)
+                        )
+                );
+            };
 
-        quiche_send_info send_info;
-        const auto written = quiche_conn_send(_connection, reinterpret_cast<uint8_t *>(_out_buffer.data()), _out_buffer.size(), &send_info);
+            quiche_send_info send_info;
+            const auto written = quiche_conn_send(_connection, reinterpret_cast<uint8_t *>(_out_buffer.data()), _out_buffer.size(), &send_info);
 
-        if (written == QUICHE_ERR_DONE) {
-            return make_ready_future<stop_iteration>(stop_iteration::yes);
-        }
+            if (written == QUICHE_ERR_DONE) {
+                return make_ready_future<stop_iteration>(stop_iteration::yes);
+            }
 
-        if (written < 0) {
-            throw std::runtime_error("Failed to create a packet.");
-        }
+            if (written < 0) {
+                qlogger.warn("[quic_basic_connection::quic_flush] failed to create a packet, error: {}", written);
+                return make_ready_future<stop_iteration>(stop_iteration::no);
+            }
 
-        temporary_buffer<quic_byte_type> tb{_out_buffer.data(), static_cast<size_t>(written)};
-        send_payload payload{std::move(tb), send_info.to, send_info.to_len};
+            temporary_buffer<quic_byte_type> tb{_out_buffer.data(), static_cast<size_t>(written)};
+            send_payload payload{std::move(tb), send_info.to, send_info.to_len};
 
-        const send_time_point send_time = get_send_time(send_info.at);
+            const send_time_point send_time = get_send_time(send_info.at);
 
-        if (_send_queue.empty() || send_time < _send_queue.top().get_time()) {
-            _send_timer.rearm(send_time);
-        }
-        _send_queue.push(paced_payload{std::move(payload), send_time});
+            if (_closing_marker) {
+                // User requested to close the connection. At this point we don't care about pacing.
+                return _socket->send(std::move(payload)).then([] () {
+                    return make_ready_future<stop_iteration>(stop_iteration::no);
+                });
+            }
 
-        return make_ready_future<stop_iteration>(stop_iteration::no);
-    }).then([this] {
-        if (is_closed()) {
+            if (_send_queue.empty() || send_time < _send_queue.top().get_time()) {
+                _send_timer.rearm(send_time);
+            }
+            _send_queue.push(paced_payload{std::move(payload), send_time});
+            return make_ready_future<stop_iteration>(stop_iteration::no);
+        }).then([this] {
+            const auto timeout = static_cast<int64_t>(quiche_conn_timeout_as_millis(_connection));
+            if (timeout >= 0) {
+                _timeout_timer.rearm(timeout_clock::now() + std::chrono::milliseconds(timeout));
+            }
             return make_ready_future<>();
-        }
-
-        const auto timeout = static_cast<int64_t>(quiche_conn_timeout_as_millis(_connection));
-        if (timeout >= 0) {
-            _timeout_timer.rearm(timeout_clock::now() + std::chrono::milliseconds(timeout));
-        }
-        return make_ready_future<>();
-    });
+        }).handle_exception_type([] (const quic_aborted_exception& e) {});
+    }).handle_exception_type([] (const gate_closed_exception& e) {});
 }
 
 template<typename QI>

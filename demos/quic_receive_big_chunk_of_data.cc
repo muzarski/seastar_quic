@@ -47,9 +47,11 @@ seastar::future<> handle_connection(seastar::net::quic_accept_result accept_resu
                 }
 
                 rcv_bytes += buf.size();
-                std::cout << "Received " << buf.size() << " bytes, total " << (double) rcv_bytes / 1000000.0 << "MB" << std::endl;
+                std::cout << "Received " << buf.size() << " bytes, total " << rcv_bytes << "b" << std::endl;
                 return seastar::make_ready_future();
             });
+        }).then([] () {
+           std::cout << "Connection processed!\n";
         });
     });
 }
@@ -69,7 +71,7 @@ seastar::future<> service_loop() {
                                 }).then([&listener] () {
                                    listener.abort_accept();
                                    return seastar::when_all(vec.begin(), vec.end()).then([] (auto res) {
-                                      return seastar::make_ready_future<>(); 
+                                      return seastar::make_ready_future<>();
                                    });
                                 });
                             });

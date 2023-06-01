@@ -27,6 +27,7 @@
 #include <seastar/core/shared_ptr.hh>   // seastar::lw_shared_ptr
 #include <seastar/core/weak_ptr.hh>     // seastar::weakly_referencable
 #include <seastar/net/socket_defs.hh>   // seastar::net::socket_address
+#include <seastar/core/gate.hh>         // seastar::gate
 
 // STD.
 #include <string> // TODO: Probably to be ditched.
@@ -63,8 +64,8 @@ protected:
     quic_udp_channel_manager       _channel_manager;
     quiche_configuration           _quiche_configuration;
     lw_shared_ptr<connection_type> _connection;
-    future<>                       _receive_fiber;
-    bool                           _closing_marker;
+    gate                           _service_gate;
+    std::optional<shared_future<>> _stopped;
 
 // Constructors and the destructor.
 public:
@@ -72,15 +73,15 @@ public:
     : _channel_manager()
     , _quiche_configuration(quic_config)
     , _connection()
-    , _receive_fiber(make_ready_future<>())
-    , _closing_marker(false) {}
+    , _service_gate()
+    , _stopped(std::nullopt) {}
 
     ~quic_client_instance() = default;
 
 // Public methods.
 public:
     future<> send(send_payload&& payload);
-    future<> handle_connection_closing(const quic_connection_id& cid);
+    void handle_connection_aborting(const quic_connection_id& cid);
     [[nodiscard]] connection_data connect(const socket_address& sa);
     void register_connection(lw_shared_ptr<connection_type> conn);
     void init();
@@ -90,11 +91,16 @@ public:
     [[nodiscard]] socket_address local_address() const {
         return _channel_manager.local_address();
     }
+    [[nodiscard]] gate& gate() noexcept {
+        return _service_gate;
+    }
+    future<> stop();
 
 // Private methods.
 private:
     future<> receive_loop();
     future<> receive();
+    void abort();
 };
 
 
@@ -117,13 +123,40 @@ future<> quic_client_instance<CT>::send(send_payload&& payload) {
 }
 
 template<template<typename> typename CT>
-future<> quic_client_instance<CT>::handle_connection_closing(const quic_connection_id& cid) {
-    //TODO
-    _closing_marker = true;
-    _channel_manager.abort_queues(std::make_exception_ptr(user_closed_connection_exception()));
-    return _receive_fiber.handle_exception([this] (const std::exception_ptr& e) {
-        return _channel_manager.close();
-    });
+future<> quic_client_instance<CT>::stop() {
+    if (_stopped) {
+        return _stopped->get_future();
+    }
+
+    // This will call quic_client_instance::abort() as well.
+    _connection->abort();
+    return _stopped->get_future();
+}
+
+template<template<typename> typename CT>
+void quic_client_instance<CT>::abort() {
+    if (_stopped) {
+        return;
+    }
+
+    promise<> stopped;
+    _stopped.emplace(stopped.get_future());
+
+    _channel_manager.abort_read_queue();
+
+    qlogger.info("Scheduled udp channel flush");
+    _channel_manager.flush_write_queue().then([this] () {
+        qlogger.info("After flush.");
+        _channel_manager.abort_write_queue();
+        return _service_gate.close().then([] () {
+            qlogger.info("service gate closed");
+        });
+    }).forward_to(std::move(stopped));
+}
+
+template<template<typename> typename CT>
+void quic_client_instance<CT>::handle_connection_aborting([[maybe_unused]] const quic_connection_id& cid) {
+    this->abort();
 }
 
 template<template<typename> typename CT>
@@ -156,8 +189,21 @@ void quic_client_instance<CT>::register_connection(lw_shared_ptr<connection_type
 
 template<template<typename> typename CT>
 void quic_client_instance<CT>::init() {
-    _channel_manager.init();
-    _receive_fiber = receive_loop();
+    // Start udp channel under the hood.
+    (void) try_with_gate(_service_gate, [this] () {
+        return _channel_manager.run();
+    }).handle_exception_type([] (const gate_closed_exception& e) {
+    }).handle_exception([] (const std::exception_ptr& e) {
+        qlogger.warn("[quic_client_instance::init]: udp channel manager error: {}", e);
+    });
+
+    // Run receive fiber in the background.
+    (void) try_with_gate(_service_gate, [this] () {
+        return receive_loop().handle_exception_type([] (const quic_aborted_exception& e) {});
+    }).handle_exception_type([] (const gate_closed_exception& e) {
+    }).handle_exception([] (const std::exception_ptr& e) {
+        qlogger.warn("[quic_client_instance::init]: receive_loop error {}", e);
+    });
 }
 
 // TODO: Ditch this.
@@ -173,10 +219,7 @@ future<> quic_client_instance<CT>::close() {
 
 template<template<typename> typename CT>
 future<> quic_client_instance<CT>::receive_loop() {
-    return do_until(
-            [this] { return _closing_marker; },
-            [this] { return receive(); }
-    ).then([this] { return _channel_manager.close(); });
+    return keep_doing([this] { return receive(); });
 }
 
 template<template<typename> typename CT>

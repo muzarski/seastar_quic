@@ -109,7 +109,8 @@ private:
 // Fields.
 protected:
     std::unordered_map<quic_stream_id, quic_stream> _streams;
-    future<>                                        _stream_recv_fiber;
+    shared_promise<>                                _closed_promise;
+    bool                                            _aborted = false;
 
 // Constructors and the destructor.
 public:
@@ -117,7 +118,7 @@ public:
     explicit quic_connection(Args&&... args)
     : super_type(std::forward<Args>(args)...)
     , _streams()
-    , _stream_recv_fiber(make_ready_future<>())
+    , _closed_promise()
     {
         this->_socket->register_connection(this->shared_from_this());
     }
@@ -127,6 +128,7 @@ public:
 // Public methods.
 public:
     void init();
+    void abort();
     void close();
 
     void shutdown_all_output() {
@@ -142,6 +144,7 @@ public:
 
     void send_outstanding_data_in_streams_if_possible();
     void shutdown_output(quic_stream_id stream_id);
+    future<> closed();
 
 // Private methods.
 private:
@@ -172,15 +175,10 @@ public:
 // Public methods.
 public:
     future<temporary_buffer<quic_byte_type>> get() override {
-	//fmt::print("Requested read.\n");
-        return _connection->read(_stream_id);/*.then([] (auto&& buf) {
-	    fmt::print("Read completed.\n");
-	    return make_ready_future<temporary_buffer<quic_byte_type>>(std::move(buf));
-	});*/
+        return _connection->read(_stream_id);
     }
 
     future<> close() override {
-	    // fmt::print("[QUIC] quiche_data_source close called\n");
 	    return make_ready_future<>();
     }
 };
@@ -212,22 +210,20 @@ public:
 // Public methods.
 public:
     future<> put(packet data) override {
-        const auto* fa = data.fragment_array();
-        temporary_buffer<quic_byte_type> tb{reinterpret_cast<quic_byte_type*>(fa->base), static_cast<size_t>(fa->size)};
+//        const auto* fa = data.fragment_array();
+//        temporary_buffer<quic_byte_type> tb{reinterpret_cast<quic_byte_type*>(fa->base), static_cast<size_t>(fa->size)};
 
-        return _connection->write(std::move(tb), _stream_id);
+        return _connection->write(std::move(std::move(data.release()[0])), _stream_id);
     }
 
     future<> close() override {
         // TODO: implement this by sending FIN frame to the endpoint.
         // Although, here we should wait until all data in the stream is sent - how to do it efficiently?
-	// fmt::print("[QUIC] quiche_data_sink close called\n");
-	_connection->shutdown_output(_stream_id);
+        _connection->shutdown_output(_stream_id);
         return make_ready_future();
     }
 
     [[nodiscard]] size_t buffer_size() const noexcept override {
-        // TODO: what buffer size should be chosen? Maybe MAX_STREAM_DATA from quiche config?
         return BUFFER_SIZE;
     }
 };
@@ -252,7 +248,6 @@ public:
     : _connection(conn) {}
 
     ~quiche_quic_connected_socket_impl() noexcept override {
-	// fmt::print("[QUIC], quic_connected_socket dropped. calling conn close\n");
         _connection->close();
     }
 
@@ -272,6 +267,11 @@ public:
 
     void shutdown_output(quic_stream_id stream_id) override {
         _connection->shutdown_output(stream_id);
+    }
+
+    future<> close() override {
+        _connection->close();
+        return _connection->closed();
     }
 };
 
@@ -301,65 +301,71 @@ public:
 template<typename QI>
 void quic_connection<QI>::init() {
     super_type::init();
-    _stream_recv_fiber = stream_recv_loop();
+
+    (void) try_with_gate(this->gate(), [this] () {
+        return stream_recv_loop().handle_exception_type([] (const quic_aborted_exception& e) { qlogger.info("[quic_connection::stream_recv_loop] finished"); });
+    }).handle_exception_type([] (const gate_closed_exception& e) {
+    }).handle_exception([] (const std::exception_ptr& e) {
+        qlogger.warn("[quic_connection]: stream receive loop error: {}", e);
+    });
+}
+
+template<typename QI>
+void quic_connection<QI>::abort() {
+    if (_aborted) {
+        return;
+    }
+    _closed_promise.set_value();
+
+    if (this->_send_queue.size() > 0) {
+        qlogger.warn("[quic_connection::abort] there is some unsent data in pacing queue for stream.");
+    }
+
+    _aborted = true;
+
+    this->_read_marker.abort();
+    for (auto& s : _streams) {
+        s.second.read_queue.abort(std::make_exception_ptr(quic_aborted_exception()));
+    }
+    this->_timeout_timer.cancel();
+    this->_send_timer.cancel();
+
+    this->_socket->handle_connection_aborting(this->_connection_id);
+}
+
+template<typename QI>
+future<> quic_connection<QI>::closed() {
+    return _closed_promise.get_shared_future();
 }
 
 template<typename QI>
 void quic_connection<QI>::close() {
-    // fmt::print(stderr, "\t[Quic connection]: Close.\n");
-    if (this->_closing_marker) {
+    if (this->_closing_marker || this->is_closed()) {
         return;
     }
 
-    this->_closing_marker.mark();
-
-    if (!quiche_conn_is_closed(this->_connection)) {
-        quiche_conn_close(
-                this->_connection,
-                true, // The user closed the connection.
-                0,
-                nullptr,
-                0
-        );
-	(void) this->quic_flush();
-	return;
-    }
-
     for (auto& s : _streams) {
-	s.second.read_queue.abort(std::make_exception_ptr(std::runtime_error("Connection is closed. Cannot read")));
+        if (!s.second.write_queue.empty()) {
+            qlogger.warn("[quic_connection::close] Called close on the connection whose data has not been sent yet.");
+        }
     }
 
-    /* (void) do_with(this->shared_from_this(), [] (auto zis) {
-        return zis->quic_flush().then([zis] {
-            zis->_send_timer.cancel();
-            zis->_timeout_timer.cancel();
-            zis->_read_marker.mark_as_ready();
-            // fmt::print("Flushed after close.\n");
-            for (auto &[key, stream] : zis->_streams) {
-                stream.read_queue.abort(std::make_exception_ptr(std::runtime_error("Connection is closed.")));
-            }
-
-            return zis->_stream_recv_fiber.then([zis] {
-                // fmt::print("Closed stream rcv fiber.\n");
-                return zis->_socket->handle_connection_closing(zis->_connection_id).then([zis] {
-                    // fmt::print("Socket handle connection finished.\n");
-                    zis->_ensure_closed_promise.set_value();
-                });
-            });
-        });
-    }); */
+    this->_closing_marker.mark();
+    quiche_conn_close(this->_connection, true, 0, nullptr, 0);
+    (void) this->quic_flush();
 }
 
 template<typename QI>
 future<> quic_connection<QI>::write(temporary_buffer<quic_byte_type> tb, quic_stream_id stream_id) {
-    // fmt::print(stderr, "\t[Quic connection]: write.\n");
     if (this->is_closed()) {
-        return make_exception_future<>(std::runtime_error("The connection has been closed."));
+        qlogger.warn("[quic_connection::write]: Called write after close.");
+        return make_ready_future<>();
     }
 
     auto _stream = _streams.find(stream_id);
     if (_stream != _streams.end() && _stream->second.shutdown_output) {
-        return make_exception_future<>(std::runtime_error("Output has been shutdown for a given stream.")); // TODO: custom exception?
+        qlogger.debug("[quic_connection]: called write on stream ({}) whose output has been shutdown.", stream_id);
+        return make_ready_future<>();
     }
 
     const auto written = quiche_conn_stream_send(
@@ -372,13 +378,12 @@ future<> quic_connection<QI>::write(temporary_buffer<quic_byte_type> tb, quic_st
     // fmt::print(stderr, "\t[Quic connection]: quiche_conn_stream_send finished.\n");
 
     if (written < 0) {
-        // TODO: Handle the error.
-        // fmt::print("[Write] Writing to a stream has failed with message: {}\n", written);
+        qlogger.warn("[quic_connection]: writing to stream ({}) has failed with error: {}.", stream_id, written);
     }
 
     const auto actually_written = static_cast<size_t>(written);
 
-    if (actually_written != tb.size()) {
+    if (written < 0 || actually_written != tb.size()) {
         tb.trim_front(actually_written);
         // TODO: Can a situation like this happen that Quiche keeps track
         // of a stream but we don't store it in the map? Investigate it.
@@ -394,20 +399,20 @@ future<> quic_connection<QI>::write(temporary_buffer<quic_byte_type> tb, quic_st
 
 template<typename QI>
 future<temporary_buffer<quic_byte_type>> quic_connection<QI>::read(quic_stream_id stream_id) {
-    // fmt::print(stderr, "\t[Quic connection]: read.\n");
     if (this->is_closed()) {
         // EOF
         return make_ready_future<temporary_buffer<quic_byte_type>>(
-                temporary_buffer<quic_byte_type>("", 0));
+                quic_make_eof_buffer<quic_byte_type>());
     }
 
     auto &stream = _streams[stream_id];
+
     return stream.read_queue.pop_eventually().then_wrapped([] (auto fut) {
-        // fmt::print(stderr, "\t[Quic connection]: popped from read queue.\n");
         if (fut.failed()) {
+            // quic_aborted_exception.
             fut.get_exception();
             return make_ready_future<temporary_buffer<quic_byte_type>>(
-                    temporary_buffer<quic_byte_type>("", 0));
+                    quic_make_eof_buffer<quic_byte_type>());
         }
         return fut;
     });
@@ -435,13 +440,12 @@ void quic_connection<QI>::send_outstanding_data_in_streams_if_possible() {
             );
 
             if (written < 0) {
-                // TODO: Handle quiche error.
-                // fmt::print("[Send outstanding] Writing to a stream has failed with message: {}\n", written);
+                qlogger.warn("[quic_connection]: writing to stream ({}) has failed with error: {}.", stream_id, written);
             }
 
             const auto actually_written = static_cast<size_t>(written);
 
-            if (actually_written != qb.size()) {
+            if (written < 0 || actually_written != qb.size()) {
                 qb.trim_front(actually_written);
                 queue.push_front(std::move(qb));
                 break;
@@ -462,11 +466,9 @@ template<typename QI>
 void quic_connection<QI>::shutdown_output(quic_stream_id stream_id) {
     auto& stream = _streams[stream_id];
     if (stream.shutdown_output) {
-	return;
+	    return;
     }
-    // fmt::print("Shutdown_output called\n");
 
-    //stream.write_queue.clear();
     stream.shutdown_output = true;
     if (stream.maybe_writable) {
         stream.maybe_writable->set_exception(std::runtime_error("Output has been shutdown on the given stream."));
@@ -475,31 +477,35 @@ void quic_connection<QI>::shutdown_output(quic_stream_id stream_id) {
 
     ssize_t err;
     if ((err = quiche_conn_stream_send(this->_connection, stream_id, nullptr, 0, true)) < 0) {
-	// fmt::print("[QUIC] quiche_conn_stream_send errror during shutdown_output: {}\n", err);
-        throw std::runtime_error("Unexpected quiche_conn_stream_send error");
+        qlogger.warn("[quic_connection::shutdown_output]: quiche_conn_stream_send error "
+                     "on stream ({}) when sending EOF: {}", stream_id, err);
     }
-    /*if (quiche_conn_stream_shutdown(this->_connection, stream_id, QUICHE_SHUTDOWN_WRITE, 0)) {
-        throw std::runtime_error("Unexpected quiche_conn_stream_shutdown error");
-    }*/
+
+    if (stream.write_queue.size() > 0) {
+        qlogger.info("[quic_connection::shutdown_output]: stream ({}) has non-emtpy write_queue. "
+                     "Queue size: {}", stream_id, stream.write_queue.size());
+    }
 
     (void) this->quic_flush();
 }
 
 template<typename QI>
 future<> quic_connection<QI>::stream_recv_loop() {
-    return do_until([this] { return this->is_closed(); }, [this] {
+    return keep_doing([this] () {
         return this->_read_marker.get_shared_future().then([this] {
-            // fmt::print(stderr, "\t[Quic connection]: stream_recv_loop inner loop.\n");
             quic_stream_id stream_id;
             auto iter = quiche_conn_readable(this->_connection);
 
             while (quiche_stream_iter_next(iter, &stream_id)) {
                 auto& stream = _streams[stream_id];
 
+                if (stream.read_queue.full()) {
+                    continue;
+                }
+
                 // TODO for danmas: think about it
                 if (quiche_conn_stream_finished(this->_connection, stream_id)) {
-                    // fmt::print("LOL.\n");
-                    stream.read_queue.push(temporary_buffer<char>("", 0));
+                    stream.read_queue.push(quic_make_eof_buffer<char>());
                     continue;
                 }
 
@@ -515,7 +521,8 @@ future<> quic_connection<QI>::stream_recv_loop() {
 
                     if (recv_result < 0) {
                         // TODO: Handle this properly.
-                        fmt::print(stderr, "Reading from a stream has failed with message: {}\n", recv_result);
+                        qlogger.warn("[quic_connection::stream_recv_loop] Reading from stream ({}) failed with error code {}",
+                                     stream_id, recv_result);
                     } else {
                         temporary_buffer<quic_byte_type> message{this->_buffer.data(), static_cast<size_t>(recv_result)};
                         // TODO: Wrap this in some kind of `not_full` future
@@ -529,12 +536,8 @@ future<> quic_connection<QI>::stream_recv_loop() {
             quiche_stream_iter_free(iter);
 
             if (!quiche_conn_is_readable(this->_connection)) {
-//                fmt::print("Read marker reset.\n");
                 this->_read_marker.reset();
             }
-            // else {
-            //     fmt::print("READABLE?\n");
-            // }
 
             return this->quic_flush();
         });

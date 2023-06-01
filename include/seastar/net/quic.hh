@@ -35,9 +35,8 @@ enum class quic_cc_algorithm {
 
 struct quic_connection_config {
     std::optional<uint64_t>     max_idle_timeout                    =            std::nullopt;
-    size_t                      max_datagram_size                   =                  65'507;
-    size_t                      max_recv_udp_payload_size           =                  65'507;
-    size_t                      max_send_udp_payload_size           =                  65'507;
+    size_t                      max_recv_udp_payload_size           =                  65'527;
+    size_t                      max_send_udp_payload_size           =                  65'527;
     uint64_t                    initial_max_data                    =              10'000'000;
     uint64_t                    initial_max_stream_data_bidi_local  =               1'000'000;
     uint64_t                    initial_max_stream_data_bidi_remote =               1'000'000;
@@ -62,6 +61,7 @@ public:
     virtual void shutdown_output(std::uint64_t id) = 0;
 //    virtual void shutdown_all_input() = 0;
     virtual void shutdown_all_output() = 0;
+    virtual future<> close() = 0;
 };
 
 class quic_connected_socket {
@@ -77,6 +77,9 @@ public:
     void shutdown_all_input();
     void shutdown_all_output() {
         return _impl->shutdown_all_output();
+    }
+    future<> close() {
+        return _impl->close();
     }
 };
 

@@ -88,15 +88,18 @@ private:
 
         if (!cleanup_initialized) {
             engine().at_exit([] {
+                qlogger.info("[quic_engine::at_exit] Closing {} quic instances.", _engine._instances.size());
                 future<> close_tasks = make_ready_future<>();
                 for (auto& [_, instance] : _engine._instances) {
                     close_tasks = close_tasks.then([&instance = instance] {
                         return std::visit([] (auto ptr) {
-                            return ptr->close();
+                            return ptr->stop();
                         }, instance);
                     });
                 }
-                return close_tasks;
+                return close_tasks.then([] () {
+                    qlogger.info("[quic_engine::at_exit] Successfully closed quic instances.");
+                });
             });
             cleanup_initialized = true;
         }

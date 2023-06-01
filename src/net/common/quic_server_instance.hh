@@ -31,6 +31,7 @@
 #include <seastar/net/api.hh>               // seastar::net::udp_datagram
 #include <seastar/net/socket_defs.hh>       // seastar::net::socket_address
 #include <seastar/net/quic.hh>              // seastar::net::quic_connection_config
+#include <seastar/core/gate.hh>             // seastar::gate
 
 // Debug features.
 #include <fmt/core.h>   // For development purposes, ditch this later on.
@@ -121,7 +122,7 @@ private:
 
         header_token token;
     };
-    
+
     class marker {
     private:
         bool _marked = false;
@@ -139,8 +140,8 @@ protected:
     std::unordered_map<quic_connection_id, lw_shared_ptr<connection_type>> _connections;
     queue<lw_shared_ptr<connection_type>>                                  _waiting_queue;
     future<>                                                               _send_queue;
-    future<>                                                               _service_loop;
-    marker                                                                 _is_closing;
+    gate                                                                   _service_gate;
+    std::optional<shared_future<>>                                         _stopped;
 
 // Constructors and the destructor.
 public:
@@ -152,7 +153,7 @@ public:
     , _buffer(MAX_DATAGRAM_SIZE)
     , _waiting_queue(queue_length)
     , _send_queue(make_ready_future<>())
-    , _service_loop(make_ready_future<>()) {}
+    , _service_gate() {}
 
     explicit quic_server_instance(const std::string_view cert, const std::string_view key,
             const quic_connection_config& quic_config, const size_t queue_length)
@@ -161,14 +162,14 @@ public:
     , _buffer(MAX_DATAGRAM_SIZE)
     , _waiting_queue(queue_length)
     , _send_queue(make_ready_future<>())
-    , _service_loop(make_ready_future<>()) {}
+    , _service_gate() {}
 
     ~quic_server_instance() = default;
 
 // Public methods.
 public:
     future<> send(send_payload&& payload);
-    future<> handle_connection_closing(const quic_connection_id& cid);
+    void handle_connection_aborting(const quic_connection_id& cid);
 
     future<lw_shared_ptr<connection_type>> accept();
     void abort_accept() noexcept;
@@ -181,7 +182,10 @@ public:
     void init();
     // TODO: Ditch this.
     [[nodiscard]] std::string name() const;
-    future<> close();
+    future<> stop();
+    [[nodiscard]] gate& gate() noexcept {
+        return _service_gate;
+    }
 
 // Private methods.
 private:
@@ -194,7 +198,7 @@ private:
     future<> negotiate_version(const quic_header_info& header_info, udp_datagram&& datagram);
     future<> quic_retry(const quic_header_info& header_info, udp_datagram&& datagram);
     quic_connection_id generate_new_cid();
-    
+
 
     static header_token mint_token(const quic_header_info& header_info, const ::sockaddr_storage* addr,
             ::socklen_t addr_len);
@@ -223,10 +227,10 @@ future<> quic_server_instance<CT>::send(send_payload&& payload) {
 }
 
 template<template<typename> typename CT>
-future<> quic_server_instance<CT>::handle_connection_closing(const quic_connection_id& cid) {
-    _connections.erase(cid);
-    // fmt::print("Server connection closed. Removed from the map.\n");
-    return make_ready_future<>();
+void quic_server_instance<CT>::handle_connection_aborting(const quic_connection_id& cid) {
+    if (!_stopped) {
+        _connections.erase(cid);
+    }
 }
 
 template<template<typename> typename CT>
@@ -256,8 +260,19 @@ void quic_server_instance<CT>::register_connection(lw_shared_ptr<connection_type
 
 template<template<typename> typename CT>
 void quic_server_instance<CT>::init() {
-    _channel_manager.init();
-    _service_loop = service_loop();
+    (void) try_with_gate(_service_gate, [this] () {
+        return _channel_manager.run();
+    }).handle_exception_type([] (const gate_closed_exception& e) {
+    }).handle_exception([] (const std::exception_ptr& e) {
+        qlogger.warn("[quic_server_instance::init]: udp channel manager error: {}", e);
+    });
+
+    (void) try_with_gate(_service_gate, [this] () {
+        return service_loop().handle_exception_type([] (const quic_aborted_exception& e) {});
+    }).handle_exception_type([] (const gate_closed_exception& e) {
+    }).handle_exception([] (const std::exception_ptr& e) {
+        qlogger.warn("[quic_client_instance::init]: service_loop error {}", e);
+    });
 }
 
 // TODO: Ditch this.
@@ -267,35 +282,38 @@ template<template<typename> typename CT>
 }
 
 template<template<typename> typename CT>
-future<> quic_server_instance<CT>::close() {
-    future<> close_tasks = make_ready_future<>();
-    for (auto& conn : _connections) {
-        close_tasks = close_tasks.then([conn = std::move(conn.second)] {
-            conn->close();
-            return conn->ensure_closed();
-        });
+future<> quic_server_instance<CT>::stop() {
+    if (_stopped) {
+        return _stopped->get_future();
     }
 
-    return close_tasks.then([this] {
-        _channel_manager.abort_queues(std::make_exception_ptr(user_closed_connection_exception()));
-        return _service_loop.handle_exception([this] (const std::exception_ptr& e) {
-            return _channel_manager.close();
+    promise<> stopped;
+    _stopped.emplace(stopped.get_future());
+    for (auto& c : _connections) {
+        c.second->abort();
+    }
+
+    _channel_manager.abort_read_queue();
+
+    qlogger.info("Scheduled udp channel flush");
+    _channel_manager.flush_write_queue().then([this] () {
+        qlogger.info("After flush.");
+        _channel_manager.abort_write_queue();
+        return _service_gate.close().then([] () {
+            qlogger.info("service gate closed");
         });
-    });
+    }).forward_to(std::move(stopped));
+
+    return _stopped->get_future();
 }
 
 template<template<typename> typename CT>
 future<> quic_server_instance<CT>::service_loop() {
-    // TODO: Consider changing this to seastar::repeat and passing a stop toket to it
-    // once the destructor of the class has been called.
-    return do_until(
-            [this] { return bool(_is_closing); },
-            [this] {
-                return _channel_manager.read().then([this] (udp_datagram datagram) {
-                    return handle_datagram(std::move(datagram));
-                });
-            }
-    ).then([this] { return _channel_manager.close(); });
+    return keep_doing([this] () {
+        return _channel_manager.read().then([this] (udp_datagram datagram) {
+            return handle_datagram(std::move(datagram));
+        });
+    });
 }
 
 template<template<typename> typename CT>

@@ -21,6 +21,7 @@
 #include <seastar/core/temporary_buffer.hh> // seastar::temporary_buffer
 #include <seastar/net/socket_defs.hh>       // seastar::net::socket_address
 #include <seastar/net/quic.hh>              // quic_byte_type
+#include <seastar/util/log.hh>              // seastar::logger
 
 // Third-party API.
 #include <quiche.h>                     // For `QUICHE_MAX_CONN_ID_LEN`.
@@ -31,6 +32,8 @@
 #include <random>                       // Generating IDs.
 
 namespace seastar::net {
+
+inline logger qlogger("QUIC");
 
 // TODO: Remove if unnecessary.
 constexpr inline size_t MAX_DATAGRAM_SIZE = 65'507;
@@ -87,6 +90,11 @@ struct quic_connection_id {
     }
 };
 
+template <typename CharType>
+temporary_buffer<CharType> quic_make_eof_buffer() {
+    return temporary_buffer<CharType>("", 0);
+}
+
 } // namespace seastar::net
 
 namespace std {
@@ -113,6 +121,13 @@ class user_closed_connection_exception : public std::exception {
 public:
     [[nodiscard]] const char* what() const noexcept override {
         return "User closed the connection.";
+    }
+};
+
+class quic_aborted_exception : public std::exception {
+public:
+    [[nodiscard]] const char* what() const noexcept override {
+        return "Quic aborted.";
     }
 };
 
