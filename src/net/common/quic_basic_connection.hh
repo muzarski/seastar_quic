@@ -277,8 +277,8 @@ public:
 // Protected methods.
 protected:
     bool is_closing() const noexcept;
-    [[nodiscard]] gate& gate() noexcept {
-        return _socket->gate();
+    [[nodiscard]] gate& qgate() noexcept {
+        return _socket->qgate();
     }
 };
 
@@ -298,7 +298,7 @@ protected:
 template<typename QI>
 void quic_basic_connection<QI>::init() {
     _send_timer.set_callback([this] {
-        (void) try_with_gate(gate(), [this] () {
+        (void) try_with_gate(qgate(), [this] () {
             return repeat([this] {
                 if (_send_queue.empty()) {
                     return make_ready_future<stop_iteration>(stop_iteration::yes);
@@ -388,7 +388,7 @@ bool quic_basic_connection<QI>::is_closed() const noexcept {
 
 template<typename QI>
 future<> quic_basic_connection<QI>::quic_flush() {
-    return try_with_gate(gate(), [this] () {
+    return try_with_gate(qgate(), [this] () {
         return repeat([this] {
             // Converts a time point stored as `timespec` to `send_time_point`.
             constexpr auto get_send_time = [](const timespec& at) constexpr -> send_time_point {

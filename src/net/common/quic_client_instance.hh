@@ -91,7 +91,7 @@ public:
     [[nodiscard]] socket_address local_address() const {
         return _channel_manager.local_address();
     }
-    [[nodiscard]] gate& gate() noexcept {
+    [[nodiscard]] gate& qgate() noexcept {
         return _service_gate;
     }
     future<> stop();

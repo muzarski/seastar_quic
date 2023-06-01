@@ -302,7 +302,7 @@ template<typename QI>
 void quic_connection<QI>::init() {
     super_type::init();
 
-    (void) try_with_gate(this->gate(), [this] () {
+    (void) try_with_gate(this->qgate(), [this] () {
         return stream_recv_loop().handle_exception_type([] (const quic_aborted_exception& e) { qlogger.info("[quic_connection::stream_recv_loop] finished"); });
     }).handle_exception_type([] (const gate_closed_exception& e) {
     }).handle_exception([] (const std::exception_ptr& e) {

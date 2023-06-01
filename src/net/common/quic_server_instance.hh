@@ -183,7 +183,7 @@ public:
     // TODO: Ditch this.
     [[nodiscard]] std::string name() const;
     future<> stop();
-    [[nodiscard]] gate& gate() noexcept {
+    [[nodiscard]] gate& qgate() noexcept {
         return _service_gate;
     }
 
