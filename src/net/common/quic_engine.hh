@@ -75,6 +75,9 @@ public:
                 "Invalid instance type");
 
         init_engine();
+	if (_engine._instances.find(key) != _engine._instances.end()) {
+		fmt::print("[QUIC_ENGINE]: clash between the keys of the map\n");
+	}
         _engine._instances.emplace(key, instance);
     }
 

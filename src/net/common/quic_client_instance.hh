@@ -118,6 +118,7 @@ future<> quic_client_instance<CT>::send(send_payload&& payload) {
 
 template<template<typename> typename CT>
 future<> quic_client_instance<CT>::handle_connection_closing(const quic_connection_id& cid) {
+    //TODO
     _closing_marker = true;
     _channel_manager.abort_queues(std::make_exception_ptr(user_closed_connection_exception()));
     return _receive_fiber.handle_exception([this] (const std::exception_ptr& e) {

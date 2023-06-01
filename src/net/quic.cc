@@ -172,7 +172,16 @@ public:
 // Public methods.
 public:
     future<temporary_buffer<quic_byte_type>> get() override {
-        return _connection->read(_stream_id);
+	//fmt::print("Requested read.\n");
+        return _connection->read(_stream_id);/*.then([] (auto&& buf) {
+	    fmt::print("Read completed.\n");
+	    return make_ready_future<temporary_buffer<quic_byte_type>>(std::move(buf));
+	});*/
+    }
+
+    future<> close() override {
+	    // fmt::print("[QUIC] quiche_data_source close called\n");
+	    return make_ready_future<>();
     }
 };
 
@@ -212,6 +221,8 @@ public:
     future<> close() override {
         // TODO: implement this by sending FIN frame to the endpoint.
         // Although, here we should wait until all data in the stream is sent - how to do it efficiently?
+	// fmt::print("[QUIC] quiche_data_sink close called\n");
+	_connection->shutdown_output(_stream_id);
         return make_ready_future();
     }
 
@@ -241,6 +252,7 @@ public:
     : _connection(conn) {}
 
     ~quiche_quic_connected_socket_impl() noexcept override {
+	// fmt::print("[QUIC], quic_connected_socket dropped. calling conn close\n");
         _connection->close();
     }
 
@@ -294,6 +306,7 @@ void quic_connection<QI>::init() {
 
 template<typename QI>
 void quic_connection<QI>::close() {
+    // fmt::print(stderr, "\t[Quic connection]: Close.\n");
     if (this->_closing_marker) {
         return;
     }
@@ -308,9 +321,15 @@ void quic_connection<QI>::close() {
                 nullptr,
                 0
         );
+	(void) this->quic_flush();
+	return;
     }
 
-    (void) do_with(this->shared_from_this(), [] (auto zis) {
+    for (auto& s : _streams) {
+	s.second.read_queue.abort(std::make_exception_ptr(std::runtime_error("Connection is closed. Cannot read")));
+    }
+
+    /* (void) do_with(this->shared_from_this(), [] (auto zis) {
         return zis->quic_flush().then([zis] {
             zis->_send_timer.cancel();
             zis->_timeout_timer.cancel();
@@ -328,12 +347,13 @@ void quic_connection<QI>::close() {
                 });
             });
         });
-    });
+    }); */
 }
 
 template<typename QI>
 future<> quic_connection<QI>::write(temporary_buffer<quic_byte_type> tb, quic_stream_id stream_id) {
-    if (this->_closing_marker) {
+    // fmt::print(stderr, "\t[Quic connection]: write.\n");
+    if (this->is_closed()) {
         return make_exception_future<>(std::runtime_error("The connection has been closed."));
     }
 
@@ -349,10 +369,11 @@ future<> quic_connection<QI>::write(temporary_buffer<quic_byte_type> tb, quic_st
             tb.size(),
             false
     );
+    // fmt::print(stderr, "\t[Quic connection]: quiche_conn_stream_send finished.\n");
 
     if (written < 0) {
         // TODO: Handle the error.
-        fmt::print("[Write] Writing to a stream has failed with message: {}\n", written);
+        // fmt::print("[Write] Writing to a stream has failed with message: {}\n", written);
     }
 
     const auto actually_written = static_cast<size_t>(written);
@@ -373,7 +394,8 @@ future<> quic_connection<QI>::write(temporary_buffer<quic_byte_type> tb, quic_st
 
 template<typename QI>
 future<temporary_buffer<quic_byte_type>> quic_connection<QI>::read(quic_stream_id stream_id) {
-    if (this->_closing_marker) {
+    // fmt::print(stderr, "\t[Quic connection]: read.\n");
+    if (this->is_closed()) {
         // EOF
         return make_ready_future<temporary_buffer<quic_byte_type>>(
                 temporary_buffer<quic_byte_type>("", 0));
@@ -381,6 +403,7 @@ future<temporary_buffer<quic_byte_type>> quic_connection<QI>::read(quic_stream_i
 
     auto &stream = _streams[stream_id];
     return stream.read_queue.pop_eventually().then_wrapped([] (auto fut) {
+        // fmt::print(stderr, "\t[Quic connection]: popped from read queue.\n");
         if (fut.failed()) {
             fut.get_exception();
             return make_ready_future<temporary_buffer<quic_byte_type>>(
@@ -413,7 +436,7 @@ void quic_connection<QI>::send_outstanding_data_in_streams_if_possible() {
 
             if (written < 0) {
                 // TODO: Handle quiche error.
-                fmt::print("[Send outstanding] Writing to a stream has failed with message: {}\n", written);
+                // fmt::print("[Send outstanding] Writing to a stream has failed with message: {}\n", written);
             }
 
             const auto actually_written = static_cast<size_t>(written);
@@ -438,28 +461,35 @@ void quic_connection<QI>::send_outstanding_data_in_streams_if_possible() {
 template<typename QI>
 void quic_connection<QI>::shutdown_output(quic_stream_id stream_id) {
     auto& stream = _streams[stream_id];
+    if (stream.shutdown_output) {
+	return;
+    }
+    // fmt::print("Shutdown_output called\n");
 
-    stream.write_queue.clear();
+    //stream.write_queue.clear();
     stream.shutdown_output = true;
     if (stream.maybe_writable) {
         stream.maybe_writable->set_exception(std::runtime_error("Output has been shutdown on the given stream."));
         stream.maybe_writable = std::nullopt;
     }
 
-    if (quiche_conn_stream_send(this->_connection, stream_id, nullptr, 0, true) < 0) {
+    ssize_t err;
+    if ((err = quiche_conn_stream_send(this->_connection, stream_id, nullptr, 0, true)) < 0) {
+	// fmt::print("[QUIC] quiche_conn_stream_send errror during shutdown_output: {}\n", err);
         throw std::runtime_error("Unexpected quiche_conn_stream_send error");
     }
-    if (quiche_conn_stream_shutdown(this->_connection, stream_id, QUICHE_SHUTDOWN_WRITE, 0)) {
+    /*if (quiche_conn_stream_shutdown(this->_connection, stream_id, QUICHE_SHUTDOWN_WRITE, 0)) {
         throw std::runtime_error("Unexpected quiche_conn_stream_shutdown error");
-    }
+    }*/
 
     (void) this->quic_flush();
 }
 
 template<typename QI>
 future<> quic_connection<QI>::stream_recv_loop() {
-    return do_until([this] { return this->is_closing(); }, [this] {
+    return do_until([this] { return this->is_closed(); }, [this] {
         return this->_read_marker.get_shared_future().then([this] {
+            // fmt::print(stderr, "\t[Quic connection]: stream_recv_loop inner loop.\n");
             quic_stream_id stream_id;
             auto iter = quiche_conn_readable(this->_connection);
 
@@ -640,7 +670,7 @@ public:
     virtual void shutdown() override {
         if (_conn) {
             //TODO take care of the return value
-            // fmt::print("Connection is closed after shutdown.\n");
+            fmt::print("Connection is closed after shutdown.\n");
             _conn->close();
         }
     }

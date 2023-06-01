@@ -287,6 +287,7 @@ protected:
 template<typename QI>
 void quic_basic_connection<QI>::init() {
     _send_timer.set_callback([this] {
+        // fmt::print(stderr, "\t[Quic basic connection]: send timer.\n");
         (void) repeat([this] {
             if (_send_queue.empty()) {
                 return make_ready_future<stop_iteration>(stop_iteration::yes);
@@ -314,9 +315,10 @@ void quic_basic_connection<QI>::init() {
     });
 
     _timeout_timer.set_callback([this] {
+        // fmt::print(stderr, "\t[Quic basic connection]: timeouted.\n");
         quiche_conn_on_timeout(_connection);
         if (is_closed()) {
-            // fmt::print("Conn is closed after on_timeout {}.\n", _socket->name());
+            fmt::print("Conn is closed after on_timeout.\n");
             close();
             return;
         }
@@ -325,6 +327,8 @@ void quic_basic_connection<QI>::init() {
 
     // The client side of a connection ought to flush after initialization.
     (void) quic_flush();
+
+    // fmt::print(stderr, "\t[Quic basic connection]: Initialized.\n");
 }
 
 template<typename QI>
@@ -346,13 +350,14 @@ void quic_basic_connection<QI>::receive(udp_datagram&& datagram) {
             fa->size,
             &recv_info
     );
+    // fmt::print(stderr, "\t[Quic basic connection]: quiche_conn_recv finished.\n");
 
     if (recv_result < 0) {
         fmt::print(stderr, "Failed to process a QUIC packet. Return value: {}\n", recv_result);
         return;
     }
     if (is_closed()) {
-        // fmt::print("Conn is closed after receive {}.\n", _socket->name());
+        fmt::print("Conn is closed after receive\n");
         close();
         return;
     }
@@ -376,6 +381,7 @@ bool quic_basic_connection<QI>::is_closed() const noexcept {
 template<typename QI>
 future<> quic_basic_connection<QI>::quic_flush() {
     return repeat([this] {
+        // fmt::print(stderr, "\t[Quic basic connection]: Quic flush.\n");
         // Converts a time point stored as `timespec` to `send_time_point`.
         constexpr auto get_send_time = [](const timespec& at) constexpr -> send_time_point {
             return send_time_point(
@@ -408,7 +414,7 @@ future<> quic_basic_connection<QI>::quic_flush() {
 
         return make_ready_future<stop_iteration>(stop_iteration::no);
     }).then([this] {
-        if (_closing_marker) {
+        if (is_closed()) {
             return make_ready_future<>();
         }
 
