@@ -97,6 +97,7 @@ public:
     void init();
     void close();
     void abort();
+    void handle_receive();
     future<std::unique_ptr<quic_h3_request>> read();
     future<> write(std::unique_ptr<quic_h3_reply> reply);
     void send_outstanding_data_in_streams_if_possible();
@@ -128,6 +129,11 @@ void h3_connection<QI>::init() {
     }).then([this] {
         return h3_recv_loop();
     });
+}
+
+template<typename QI>
+void h3_connection<QI>::handle_receive() {
+    // nop.
 }
 
 template<typename QI>

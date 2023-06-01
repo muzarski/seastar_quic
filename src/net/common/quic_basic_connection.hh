@@ -265,6 +265,14 @@ public:
         return static_cast<connection_type*>(this)->abort();
     }
 
+    decltype(auto) handle_receive() {
+        // CRTP.
+        static_assert(std::is_base_of_v<quic_basic_connection<QI>, connection_type>,
+                      "Invalid connection type");
+        return static_cast<connection_type*>(this)->handle_receive();
+    }
+
+
     bool is_closed() const noexcept;
 
     future<> quic_flush();
@@ -336,8 +344,6 @@ void quic_basic_connection<QI>::init() {
 
     // The client side of a connection ought to flush after initialization.
     (void) quic_flush();
-
-    // fmt::print(stderr, "\t[Quic basic connection]: Initialized.\n");
 }
 
 template<typename QI>
@@ -379,6 +385,8 @@ void quic_basic_connection<QI>::receive(udp_datagram&& datagram) {
     if (quiche_conn_is_readable(_connection)) {
         _read_marker.mark_as_ready();
     }
+
+    handle_receive();
 }
 
 template<typename QI>

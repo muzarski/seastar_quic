@@ -36,6 +36,8 @@ using namespace std::chrono_literals;
 
 static char buf[HUNDRED_MEGABYTES];
 
+static size_t iter = 10;
+
 seastar::future<> service_loop() {
     return seastar::net::quic_connect(seastar::make_ipv4_address({1234}))
             .then([](seastar::net::quic_connected_socket conn) {
@@ -43,8 +45,11 @@ seastar::future<> service_loop() {
                 auto out = conn.output(STREAM_ID);
                 return seastar::do_with(std::move(conn), std::move(out),
                                         [](auto &conn, auto &out) {
-                                            return out.write(buf, HUNDRED_MEGABYTES).then([]() {
-                                                std::cout << "Able to send again!" << std::endl;
+                                            return seastar::do_until([] () { return iter == 0; }, [&] () {
+                                                return out.write(buf, HUNDRED_MEGABYTES).then([]() {
+                                                    std::cout << "Able to send again!" << std::endl;
+                                                    --iter;
+                                                });
                                             }).then([&conn, &out] () {
                                                 // TODO Need to implement flush.
                                                 return out.close().then([&conn] () {
