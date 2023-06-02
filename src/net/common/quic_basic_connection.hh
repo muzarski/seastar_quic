@@ -138,6 +138,7 @@ private:
         }
 
         void abort() noexcept {
+            reset();
             _readable.set_exception(std::make_exception_ptr(quic_aborted_exception()));
             _aborted = true;
         }

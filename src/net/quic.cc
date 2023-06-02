@@ -110,6 +110,7 @@ private:
 protected:
     std::unordered_map<quic_stream_id, quic_stream> _streams;
     shared_promise<>                                _closed_promise;
+    future<>                                        _stream_recv_fiber;
     bool                                            _aborted = false;
 
 // Constructors and the destructor.
@@ -119,6 +120,7 @@ public:
     : super_type(std::forward<Args>(args)...)
     , _streams()
     , _closed_promise()
+    , _stream_recv_fiber(make_ready_future())
     {
         this->_socket->register_connection(this->shared_from_this());
     }
@@ -302,7 +304,7 @@ template<typename QI>
 void quic_connection<QI>::init() {
     super_type::init();
 
-    (void) try_with_gate(this->qgate(), [this] () {
+    _stream_recv_fiber = try_with_gate(this->qgate(), [this] () {
         return stream_recv_loop().handle_exception_type([] (const quic_aborted_exception& e) { qlogger.info("[quic_connection::stream_recv_loop] finished"); });
     }).handle_exception_type([] (const gate_closed_exception& e) {
     }).handle_exception([] (const std::exception_ptr& e) {
@@ -330,7 +332,9 @@ void quic_connection<QI>::abort() {
     this->_timeout_timer.cancel();
     this->_send_timer.cancel();
 
-    this->_socket->handle_connection_aborting(this->_connection_id);
+    (void) _stream_recv_fiber.then([this] {
+        return this->_socket->handle_connection_aborting(this->_connection_id);
+    });
 }
 
 template<typename QI>
@@ -364,7 +368,7 @@ future<> quic_connection<QI>::write(temporary_buffer<quic_byte_type> tb, quic_st
 
     auto _stream = _streams.find(stream_id);
     if (_stream != _streams.end() && _stream->second.shutdown_output) {
-        qlogger.debug("[quic_connection]: called write on stream ({}) whose output has been shutdown.", stream_id);
+        qlogger.debug("[quic_connection::write]: called write on stream ({}) whose output has been shutdown.", stream_id);
         return make_ready_future<>();
     }
 
@@ -378,12 +382,12 @@ future<> quic_connection<QI>::write(temporary_buffer<quic_byte_type> tb, quic_st
     // fmt::print(stderr, "\t[Quic connection]: quiche_conn_stream_send finished.\n");
 
     if (written < 0) {
-        qlogger.warn("[quic_connection]: writing to stream ({}) has failed with error: {}.", stream_id, written);
+        qlogger.warn("[quic_connection::write]: writing to stream ({}) has failed with error: {}.", stream_id, written);
     }
+    
+    const auto actually_written = written < 0 ? 0 : static_cast<size_t>(written);
 
-    const auto actually_written = static_cast<size_t>(written);
-
-    if (written < 0 || actually_written != tb.size()) {
+    if (actually_written != tb.size()) {
         tb.trim_front(actually_written);
         // TODO: Can a situation like this happen that Quiche keeps track
         // of a stream but we don't store it in the map? Investigate it.
@@ -440,12 +444,12 @@ void quic_connection<QI>::send_outstanding_data_in_streams_if_possible() {
             );
 
             if (written < 0) {
-                qlogger.warn("[quic_connection]: writing to stream ({}) has failed with error: {}.", stream_id, written);
+                qlogger.warn("[quic_connection::send_outstanding_data]: writing to stream ({}) has failed with error: {}.", stream_id, written);
             }
 
-            const auto actually_written = static_cast<size_t>(written);
+            const auto actually_written = written < 0 ? 0 : static_cast<size_t>(written);
 
-            if (written < 0 || actually_written != qb.size()) {
+            if (actually_written != qb.size()) {
                 qb.trim_front(actually_written);
                 queue.push_front(std::move(qb));
                 break;
