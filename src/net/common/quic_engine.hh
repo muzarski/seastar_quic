@@ -23,6 +23,8 @@
 #include <seastar/core/shared_ptr.hh>   // seastar::lw_shared_ptr
 #include <seastar/net/socket_defs.hh>   // seastar::net::socket_address
 
+#include "net/common/quic_common.hh"    // qlogger
+
 // STD.
 #include <unordered_map>
 #include <variant>
@@ -43,20 +45,7 @@ public:
 // Fields.
 private:
     std::unordered_map<socket_address, instance_type> _instances;
-
-    // Do not make this inline. `quic_engine<QIs...>` is still
-    // an incomplete type here, but we can declare it when no definition
-    // is provided.
-    //
-    // "The declaration of a non-inline static data member in its class
-    //  definition is not a definition and may be of an incomplete type
-    //  other than cv void."
-    //
-    // --- Standard for C++17, section 12.2.3.2 [Static data members],
-    // --- revise N4659.
-    //
-    // See also: https://en.cppreference.com/w/cpp/language/static
-    static thread_local quic_engine<QIs...>           _engine;
+    bool                                              _cleanup_initialized = false;
 
 // Constructors + the destructor.
 private:
@@ -74,23 +63,27 @@ public:
         static_assert(std::disjunction_v<std::is_same<T, QIs>...>,
                 "Invalid instance type");
 
-        init_engine();
-	if (_engine._instances.find(key) != _engine._instances.end()) {
-		fmt::print("[QUIC_ENGINE]: clash between the keys of the map\n");
-	}
-        _engine._instances.emplace(key, instance);
+        auto& engine = quic_engine<QIs...>::get_singleton_instance();
+        engine.init_engine();
+        if (engine._instances.find(key) != engine._instances.end()) {
+            fmt::print("[QUIC_ENGINE]: clash between the keys of the map\n");
+        }
+        engine._instances.emplace(key, instance);
     }
 
 // Private methods.
 private:
-    static void init_engine() {
-        thread_local bool cleanup_initialized = false;
+    static quic_engine<QIs...>& get_singleton_instance() {
+        static thread_local quic_engine<QIs...> instance{};
+        return instance;
+    }
 
-        if (!cleanup_initialized) {
-            engine().at_exit([] {
-                qlogger.info("[quic_engine::at_exit] Closing {} quic instances.", _engine._instances.size());
+    void init_engine() {
+        if (!_cleanup_initialized) {
+            engine().at_exit([this] {
+                qlogger.info("[quic_engine::at_exit] Closing {} quic instances.", _instances.size());
                 future<> close_tasks = make_ready_future<>();
-                for (auto& [_, instance] : _engine._instances) {
+                for (auto& [_, instance] : _instances) {
                     close_tasks = close_tasks.then([&instance = instance] {
                         return std::visit([] (auto ptr) {
                             return ptr->stop();
@@ -101,12 +94,9 @@ private:
                     qlogger.info("[quic_engine::at_exit] Successfully closed quic instances.");
                 });
             });
-            cleanup_initialized = true;
+            _cleanup_initialized = true;
         }
     }
 };
-
-template<typename... QIs>
-inline thread_local quic_engine<QIs...> quic_engine<QIs...>::_engine{};
 
 } // namespace seastar::net
