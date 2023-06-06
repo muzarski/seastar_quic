@@ -46,7 +46,7 @@
 
 
 namespace seastar::net {
-    namespace {
+namespace {
 
 
 
@@ -68,7 +68,7 @@ namespace seastar::net {
 template<typename QI>
 class quic_connection final
         : public quic_basic_connection<QI>
-                , public enable_lw_shared_from_this<quic_connection<QI>>
+        , public enable_lw_shared_from_this<quic_connection<QI>>
 {
 // Constants.
 private:
@@ -83,6 +83,8 @@ public:
 
 // Local structures.
 private:
+    using typename super_type::marker;
+    
     struct quic_stream {
     public:
         // Data to be read from the stream.
@@ -103,7 +105,7 @@ private:
         std::optional<shared_promise<>>              maybe_writable = std::nullopt;
         // Flag signalizing whether output has been shutdown on the stream.
         // Used as a guard for future writes.
-        bool                                         shutdown_output = false;
+        marker                                       shutdown_output;
     };
 
 // Fields.
@@ -111,7 +113,7 @@ protected:
     std::unordered_map<quic_stream_id, quic_stream> _streams;
     shared_promise<>                                _closed_promise;
     future<>                                        _stream_recv_fiber;
-    bool                                            _aborted = false;
+    std::optional<shared_future<>>                  _aborted = std::nullopt;
 
 // Constructors and the destructor.
 public:
@@ -130,7 +132,7 @@ public:
 // Public methods.
 public:
     void init();
-    void abort();
+    future<> abort();
     void close();
 
     void shutdown_all_output() {
@@ -304,7 +306,7 @@ template<typename QI>
 void quic_connection<QI>::init() {
     super_type::init();
 
-    _stream_recv_fiber = try_with_gate(this->qgate(), [this] () {
+    _stream_recv_fiber = try_with_gate(this->qgate(), [this] {
         return stream_recv_loop().handle_exception_type([] (const quic_aborted_exception& e) { qlogger.info("[quic_connection::stream_recv_loop] finished"); });
     }).handle_exception_type([] (const gate_closed_exception& e) {
     }).handle_exception([] (const std::exception_ptr& e) {
@@ -313,27 +315,32 @@ void quic_connection<QI>::init() {
 }
 
 template<typename QI>
-void quic_connection<QI>::abort() {
+future<> quic_connection<QI>::abort() {
     if (_aborted) {
-        return;
+        return _aborted->get_future();
     }
-    _closed_promise.set_value();
 
+    _closed_promise.set_value();
+    this->_read_marker.abort();
+
+    shared_promise<> aborted{};
+    _aborted.emplace(aborted.get_shared_future());
+    
     if (this->_send_queue.size() > 0) {
         qlogger.warn("[quic_connection::abort] there is some unsent data in pacing queue for stream.");
     }
 
-    _aborted = true;
-
-    this->_read_marker.abort();
-    for (auto& s : _streams) {
-        s.second.read_queue.abort(std::make_exception_ptr(quic_aborted_exception()));
+    for (auto& [_, stream] : _streams) {
+        stream.read_queue.abort(std::make_exception_ptr(quic_aborted_exception()));
     }
+
     this->_timeout_timer.cancel();
     this->_send_timer.cancel();
 
-    (void) _stream_recv_fiber.then([this] {
-        return this->_socket->handle_connection_aborting(this->_connection_id);
+    return _stream_recv_fiber.then([this, aborted = std::move(aborted)] () mutable {
+        return this->_socket->handle_connection_aborting(this->_connection_id).then([aborted = std::move(aborted)] () mutable {
+            aborted.set_value();
+        });
     });
 }
 
@@ -348,8 +355,8 @@ void quic_connection<QI>::close() {
         return;
     }
 
-    for (auto& s : _streams) {
-        if (!s.second.write_queue.empty()) {
+    for (auto& [_, stream] : _streams) {
+        if (!stream.write_queue.empty()) {
             qlogger.warn("[quic_connection::close] Called close on the connection whose data has not been sent yet.");
         }
     }
@@ -366,8 +373,8 @@ future<> quic_connection<QI>::write(temporary_buffer<quic_byte_type> tb, quic_st
         return make_ready_future<>();
     }
 
-    auto _stream = _streams.find(stream_id);
-    if (_stream != _streams.end() && _stream->second.shutdown_output) {
+    auto& stream = _streams[stream_id];
+    if (stream.shutdown_output) {
         qlogger.debug("[quic_connection::write]: called write on stream ({}) whose output has been shutdown.", stream_id);
         return make_ready_future<>();
     }
@@ -392,11 +399,10 @@ future<> quic_connection<QI>::write(temporary_buffer<quic_byte_type> tb, quic_st
         // TODO: Can a situation like this happen that Quiche keeps track
         // of a stream but we don't store it in the map? Investigate it.
         // In such a case, we should catch an exception here and report it.
-        auto& stream = _streams[stream_id];
         stream.write_queue.push_front(std::move(tb));
     }
 
-    return this->quic_flush().then([stream_id, this] () {
+    return this->quic_flush().then([stream_id, this] {
         return wait_send_available(stream_id);
     });
 }
@@ -409,7 +415,7 @@ future<temporary_buffer<quic_byte_type>> quic_connection<QI>::read(quic_stream_i
                 quic_make_eof_buffer<quic_byte_type>());
     }
 
-    auto &stream = _streams[stream_id];
+    auto& stream = _streams[stream_id];
 
     return stream.read_queue.pop_eventually().then_wrapped([] (auto fut) {
         if (fut.failed()) {
@@ -473,14 +479,14 @@ void quic_connection<QI>::shutdown_output(quic_stream_id stream_id) {
 	    return;
     }
 
-    stream.shutdown_output = true;
+    stream.shutdown_output.mark();
     if (stream.maybe_writable) {
         stream.maybe_writable->set_exception(std::runtime_error("Output has been shutdown on the given stream."));
         stream.maybe_writable = std::nullopt;
     }
 
-    ssize_t err;
-    if ((err = quiche_conn_stream_send(this->_connection, stream_id, nullptr, 0, true)) < 0) {
+    const auto err = quiche_conn_stream_send(this->_connection, stream_id, nullptr, 0, true);
+    if (err < 0) {
         qlogger.warn("[quic_connection::shutdown_output]: quiche_conn_stream_send error "
                      "on stream ({}) when sending EOF: {}", stream_id, err);
     }
@@ -495,7 +501,7 @@ void quic_connection<QI>::shutdown_output(quic_stream_id stream_id) {
 
 template<typename QI>
 future<> quic_connection<QI>::stream_recv_loop() {
-    return keep_doing([this] () {
+    return keep_doing([this] {
         return this->_read_marker.get_shared_future().then([this] {
             quic_stream_id stream_id;
             auto iter = quiche_conn_readable(this->_connection);

@@ -23,11 +23,12 @@
 #include "quiche_config.hh"
 
 // Seastar features.
-#include <seastar/core/future.hh>       // seastar::future
-#include <seastar/core/shared_ptr.hh>   // seastar::lw_shared_ptr
-#include <seastar/core/weak_ptr.hh>     // seastar::weakly_referencable
-#include <seastar/net/socket_defs.hh>   // seastar::net::socket_address
-#include <seastar/core/gate.hh>         // seastar::gate
+#include <seastar/core/future.hh>           // seastar::future
+#include <seastar/core/gate.hh>             // seastar::gate
+#include <seastar/core/shared_future.hh>    // seastar::shared_{future, promise}
+#include <seastar/core/shared_ptr.hh>       // seastar::lw_shared_ptr
+#include <seastar/core/weak_ptr.hh>         // seastar::weakly_referencable
+#include <seastar/net/socket_defs.hh>       // seastar::net::socket_address
 
 // STD.
 #include <string> // TODO: Probably to be ditched.
@@ -81,7 +82,7 @@ public:
 // Public methods.
 public:
     future<> send(send_payload&& payload);
-    void handle_connection_aborting(const quic_connection_id& cid);
+    future<> handle_connection_aborting(const quic_connection_id& cid);
     [[nodiscard]] connection_data connect(const socket_address& sa);
     void register_connection(lw_shared_ptr<connection_type> conn);
     void init();
@@ -100,7 +101,7 @@ public:
 private:
     future<> receive_loop();
     future<> receive();
-    void abort();
+    future<> abort();
 };
 
 
@@ -124,39 +125,37 @@ future<> quic_client_instance<CT>::send(send_payload&& payload) {
 
 template<template<typename> typename CT>
 future<> quic_client_instance<CT>::stop() {
-    if (_stopped) {
+    return _connection->abort().then([this] {
         return _stopped->get_future();
-    }
-
-    // This will call quic_client_instance::abort() as well.
-    _connection->abort();
-    return _stopped->get_future();
+    });
 }
 
 template<template<typename> typename CT>
-void quic_client_instance<CT>::abort() {
+future<> quic_client_instance<CT>::abort() {
     if (_stopped) {
-        return;
+        return make_ready_future<>();
     }
 
-    promise<> stopped;
-    _stopped.emplace(stopped.get_future());
+    shared_promise<> stopped;
+    _stopped.emplace(stopped.get_shared_future());
 
     _channel_manager.abort_read_queue();
 
     qlogger.info("Scheduled udp channel flush");
-    _channel_manager.flush_write_queue().then([this] () {
+    return _channel_manager.flush_write_queue().then([this] {
         qlogger.info("After flush.");
         _channel_manager.abort_write_queue();
-        return _service_gate.close().then([] () {
+        return _service_gate.close().then([] {
             qlogger.info("service gate closed");
         });
-    }).forward_to(std::move(stopped));
+    }).then([stopped = std::move(stopped)] () mutable {
+        stopped.set_value();
+    });
 }
 
 template<template<typename> typename CT>
-void quic_client_instance<CT>::handle_connection_aborting([[maybe_unused]] const quic_connection_id& cid) {
-    this->abort();
+future<> quic_client_instance<CT>::handle_connection_aborting([[maybe_unused]] const quic_connection_id& cid) {
+    return abort();
 }
 
 template<template<typename> typename CT>

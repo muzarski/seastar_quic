@@ -29,8 +29,9 @@
 #include "../net/common/quic_server_instance.hh"
 
 // Seastar features.
-#include <seastar/core/when_all.hh>
+#include <seastar/core/future.hh>
 #include <seastar/core/thread.hh>
+#include <seastar/core/when_all.hh>
 
 // Third-party API.
 #include <quiche.h>
@@ -96,7 +97,7 @@ public:
 public:
     void init();
     void close();
-    void abort();
+    future<> abort();
     future<std::unique_ptr<quic_h3_request>> read();
     future<> write(std::unique_ptr<quic_h3_reply> reply);
     void send_outstanding_data_in_streams_if_possible();
@@ -131,8 +132,9 @@ void h3_connection<QI>::init() {
 }
 
 template<typename QI>
-void h3_connection<QI>::abort() {
+future<> h3_connection<QI>::abort() {
     // TODO
+    return make_ready_future<>();
 }
 
 template<typename QI>

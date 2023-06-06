@@ -79,6 +79,14 @@ private:
     constexpr static send_time_duration SEND_TIME_EPSILON = std::chrono::nanoseconds(20);
 
 // Local structures.
+protected:
+    class marker {
+    private:
+        bool _marked = false;
+    public:
+        constexpr void mark() noexcept { _marked = true; }
+        constexpr operator bool() const noexcept { return _marked; }
+    };
 private:
     // Payload with a timestamp indicating when it should be sent.
     // Used for pacing.
@@ -116,7 +124,7 @@ private:
         // Equals to `true` if and only if the promise `_readable`
         // has been assigned a value.
         bool                _promise_resolved = false;
-        bool                _aborted = false;
+        marker              _aborted;
 
     public:
         decltype(auto) get_shared_future() const noexcept {
@@ -138,9 +146,11 @@ private:
         }
 
         void abort() noexcept {
-            reset();
-            _readable.set_exception(std::make_exception_ptr(quic_aborted_exception()));
-            _aborted = true;
+            if (!_aborted) {
+                reset();
+                _readable.set_exception(std::make_exception_ptr(quic_aborted_exception()));
+                _aborted.mark();
+            }
         }
     };
 
@@ -168,15 +178,6 @@ private:
     // If that's the case, replace this with something more efficient,
     // for example with `std::queue`.
     using send_queue = send_queue_template<paced_payload>;
-
-    class marker {
-    private:
-        bool _marked = false;
-
-    public:
-        constexpr void mark() noexcept { _marked = true; }
-        constexpr operator bool() const noexcept { return _marked; }
-    };
 
 // Fields.
 protected:
@@ -259,7 +260,7 @@ public:
     // Pass a datagram to process by the connection.
     void receive(udp_datagram&& datagram);
 
-    decltype(auto) abort() {
+    future<> abort() {
         // CRTP.
         static_assert(std::is_base_of_v<quic_basic_connection<QI>, connection_type>,
                       "Invalid connection type");
@@ -328,7 +329,7 @@ void quic_basic_connection<QI>::init() {
         quiche_conn_on_timeout(_connection);
         if (is_closed()) {
             qlogger.info("Calling abort from on_timeout");
-            this->abort();
+            (void) abort();
             return;
         }
 
@@ -368,7 +369,7 @@ void quic_basic_connection<QI>::receive(udp_datagram&& datagram) {
 
     if (is_closed()) {
         qlogger.info("Calling abort from receive");
-        this->abort();
+        (void) abort();
         return;
     }
 

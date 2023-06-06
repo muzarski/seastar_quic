@@ -24,14 +24,16 @@
 
 // Seastar features.
 #include <seastar/core/future.hh>           // seastar::future
+#include <seastar/core/gate.hh>             // seastar::gate
+#include <seastar/core/loop.hh>             // seastar::parallel_for_each
 #include <seastar/core/queue.hh>            // seastar::queue
+#include <seastar/core/shared_future.hh>    // seastar::shared_{future, promise}
 #include <seastar/core/shared_ptr.hh>       // seastar::lw_shared_ptr
 #include <seastar/core/temporary_buffer.hh> // seastar::temporary_buffer
 #include <seastar/core/weak_ptr.hh>         // seastar::weakly_referencable
 #include <seastar/net/api.hh>               // seastar::net::udp_datagram
 #include <seastar/net/socket_defs.hh>       // seastar::net::socket_address
 #include <seastar/net/quic.hh>              // seastar::net::quic_connection_config
-#include <seastar/core/gate.hh>             // seastar::gate
 
 // Debug features.
 #include <fmt/core.h>   // For development purposes, ditch this later on.
@@ -169,7 +171,7 @@ public:
 // Public methods.
 public:
     future<> send(send_payload&& payload);
-    void handle_connection_aborting(const quic_connection_id& cid);
+    future<> handle_connection_aborting(const quic_connection_id& cid);
 
     future<lw_shared_ptr<connection_type>> accept();
     void abort_accept() noexcept;
@@ -227,10 +229,11 @@ future<> quic_server_instance<CT>::send(send_payload&& payload) {
 }
 
 template<template<typename> typename CT>
-void quic_server_instance<CT>::handle_connection_aborting(const quic_connection_id& cid) {
+future<> quic_server_instance<CT>::handle_connection_aborting(const quic_connection_id& cid) {
     if (!_stopped) {
         _connections.erase(cid);
     }
+    return make_ready_future<>();
 }
 
 template<template<typename> typename CT>
@@ -287,24 +290,27 @@ future<> quic_server_instance<CT>::stop() {
         return _stopped->get_future();
     }
 
-    promise<> stopped;
-    _stopped.emplace(stopped.get_future());
-    for (auto& c : _connections) {
-        c.second->abort();
-    }
+    shared_promise<> stopped;
+    _stopped.emplace(stopped.get_shared_future());
 
-    _channel_manager.abort_read_queue();
+    return parallel_for_each(_connections, [] (auto& c) {
+        auto& [_, conn] = c;
+        return conn->abort();
+    }).then([this, stopped = std::move(stopped)] () mutable {
+        _channel_manager.abort_read_queue();
 
-    qlogger.info("Scheduled udp channel flush");
-    _channel_manager.flush_write_queue().then([this] () {
-        qlogger.info("After flush.");
-        _channel_manager.abort_write_queue();
-        return _service_gate.close().then([] () {
-            qlogger.info("service gate closed");
+        qlogger.info("Scheduled udp channel flush");
+        return _channel_manager.flush_write_queue().then([this] {
+            qlogger.info("After flush.");
+            _channel_manager.abort_write_queue();
+            return _service_gate.close().then([] () {
+                qlogger.info("service gate closed");
+            });
+        }).then([stopped = std::move(stopped)] () mutable {
+            stopped.set_value();
+            return make_ready_future<>();
         });
-    }).forward_to(std::move(stopped));
-
-    return _stopped->get_future();
+    });
 }
 
 template<template<typename> typename CT>
