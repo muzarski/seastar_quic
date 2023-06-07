@@ -319,13 +319,19 @@ future<> quic_connection<QI>::abort() {
     if (_aborted) {
         return _aborted->get_future();
     }
-    qlogger.info("ABORT: after if");
+    std::cout << "ABORT: after if" << std::endl;
 
     _closed_promise.set_value();
+
+    std::cout << "abort: after _closed_promise.set_value()" << std::endl;
     this->_read_marker.abort();
+
+    std::cout << "abort: after _read_marker.abort()" << std::endl;
 
     shared_promise<> aborted{};
     _aborted.emplace(aborted.get_shared_future());
+
+    std::cout << "abort: after _aborted.emplace(...)" << std::endl;
 
     if (this->_send_queue.size() > 0) {
         qlogger.warn("[quic_connection::abort] there is some unsent data in pacing queue for stream.");
@@ -335,18 +341,21 @@ future<> quic_connection<QI>::abort() {
         stream.read_queue.abort(std::make_exception_ptr(quic_aborted_exception()));
     }
 
-    qlogger.info("abort: about to cancel timers");
+    std::cout << "abort: about to cancel timers" << std::endl;
 
     this->_timeout_timer.cancel();
+
+    std::cout << "abort: after _timeout_timer.cancel()" << std::endl;
+
     this->_send_timer.cancel();
 
-    qlogger.info("abort: berfore _stream_recv_fiber.then()");
+    std::cout << "abort: berfore _stream_recv_fiber.then()" << std::endl;
     return _stream_recv_fiber.then([this, aborted = std::move(aborted)] () mutable {
-        qlogger.info("abort: in _stream_recv_fiber.then()");
+        std::cout << "abort: in _stream_recv_fiber.then()" << std::endl;
         return this->_socket->handle_connection_aborting(this->_connection_id).then([aborted = std::move(aborted)] () mutable {
-            qlogger.info("abort: in handle_connection_aborting.then()");
+            std::cout << "abort: in handle_connection_aborting.then()" << std::endl;
             aborted.set_value();
-            qlogger.info("abort: after aborted.set_value()");
+            std::cout << "abort: after aborted.set_value()" << std::endl;
         });
     });
 }
