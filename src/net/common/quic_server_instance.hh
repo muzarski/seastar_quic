@@ -232,6 +232,7 @@ template<template<typename> typename CT>
 future<> quic_server_instance<CT>::handle_connection_aborting(const quic_connection_id& cid) {
     if (!_stopped) {
         _connections.erase(cid);
+        qlogger.info("quic_server_instance: removed connection from the map");
     }
     return make_ready_future<>();
 }

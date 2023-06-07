@@ -84,7 +84,7 @@ public:
 // Local structures.
 private:
     using typename super_type::marker;
-    
+
     struct quic_stream {
     public:
         // Data to be read from the stream.
@@ -319,13 +319,14 @@ future<> quic_connection<QI>::abort() {
     if (_aborted) {
         return _aborted->get_future();
     }
+    qlogger.info("ABORT: after if");
 
     _closed_promise.set_value();
     this->_read_marker.abort();
 
     shared_promise<> aborted{};
     _aborted.emplace(aborted.get_shared_future());
-    
+
     if (this->_send_queue.size() > 0) {
         qlogger.warn("[quic_connection::abort] there is some unsent data in pacing queue for stream.");
     }
@@ -338,8 +339,11 @@ future<> quic_connection<QI>::abort() {
     this->_send_timer.cancel();
 
     return _stream_recv_fiber.then([this, aborted = std::move(aborted)] () mutable {
+        qlogger.info("abort: in _stream_recv_fiber.then()");
         return this->_socket->handle_connection_aborting(this->_connection_id).then([aborted = std::move(aborted)] () mutable {
+            qlogger.info("abort: in handle_connection_aborting.then()");
             aborted.set_value();
+            qlogger.info("abort: after aborted.set_value()");
         });
     });
 }
@@ -391,7 +395,7 @@ future<> quic_connection<QI>::write(temporary_buffer<quic_byte_type> tb, quic_st
     if (written < 0) {
         qlogger.warn("[quic_connection::write]: writing to stream ({}) has failed with error: {}.", stream_id, written);
     }
-    
+
     const auto actually_written = written < 0 ? 0 : static_cast<size_t>(written);
 
     if (actually_written != tb.size()) {
