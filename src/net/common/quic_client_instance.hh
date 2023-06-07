@@ -155,7 +155,7 @@ future<> quic_client_instance<CT>::abort() {
 
 template<template<typename> typename CT>
 future<> quic_client_instance<CT>::handle_connection_aborting([[maybe_unused]] const quic_connection_id& cid) {
-    std::cout << "quic_client_instance::abort()" << std::endl;
+    // std::cout << "quic_client_instance::abort()" << std::endl;
     return abort();
 }
 

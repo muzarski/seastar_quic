@@ -247,7 +247,7 @@ public:
     }
 
     ~quic_basic_connection() noexcept {
-        std::cout << "~quic_basic_connection id " << cid() << std::endl;
+        // std::cout << "~quic_basic_connection id " << cid() << std::endl;
         if (_connection) {
             quiche_conn_free(std::exchange(_connection, nullptr));
         }
@@ -330,7 +330,7 @@ void quic_basic_connection<QI>::init() {
         quiche_conn_on_timeout(_connection);
         if (is_closed()) {
             qlogger.info("Calling abort from on_timeout");
-            std::cout << "(COUT) Calling abort from on_timeout" << std::endl;
+            //std::cout << "(COUT) Calling abort from on_timeout" << std::endl;
             (void) abort();
             return;
         }
@@ -371,7 +371,7 @@ void quic_basic_connection<QI>::receive(udp_datagram&& datagram) {
 
     if (is_closed()) {
         qlogger.info("Calling abort from receive");
-        std::cout << "(COUT) Calling abort from receive" << std::endl;
+        // std::cout << "(COUT) Calling abort from receive" << std::endl;
         (void) abort();
         return;
     }
@@ -434,16 +434,16 @@ future<> quic_basic_connection<QI>::quic_flush() {
             _send_queue.push(paced_payload{std::move(payload), send_time});
             return make_ready_future<stop_iteration>(stop_iteration::no);
         }).then([this] {
-            if (is_closed()) {
-                const auto timeout = static_cast<int64_t>(quiche_conn_timeout_as_millis(_connection));
-                std::cout << "Got timeout while being closed -> " << timeout << std::endl;
+//            if (is_closed()) {
+//                const auto timeout = static_cast<int64_t>(quiche_conn_timeout_as_millis(_connection));
+//                //std::cout << "Got timeout while being closed -> " << timeout << std::endl;
+//            }
+            //if (!is_closed()) {
+            const auto timeout = static_cast<int64_t>(quiche_conn_timeout_as_millis(_connection));
+            if (timeout >= 0) {
+                _timeout_timer.rearm(timeout_clock::now() + std::chrono::milliseconds(timeout));
             }
-            if (!is_closed()) {
-                const auto timeout = static_cast<int64_t>(quiche_conn_timeout_as_millis(_connection));
-                if (timeout >= 0) {
-                    _timeout_timer.rearm(timeout_clock::now() + std::chrono::milliseconds(timeout));
-                }
-            }
+            //}
             return make_ready_future<>();
         }).handle_exception_type([] (const quic_aborted_exception& e) {});
     }).handle_exception_type([] (const gate_closed_exception& e) {});
