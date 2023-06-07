@@ -431,9 +431,11 @@ future<> quic_basic_connection<QI>::quic_flush() {
             _send_queue.push(paced_payload{std::move(payload), send_time});
             return make_ready_future<stop_iteration>(stop_iteration::no);
         }).then([this] {
-            const auto timeout = static_cast<int64_t>(quiche_conn_timeout_as_millis(_connection));
-            if (timeout >= 0) {
-                _timeout_timer.rearm(timeout_clock::now() + std::chrono::milliseconds(timeout));
+            if (!is_closed()) {
+                const auto timeout = static_cast<int64_t>(quiche_conn_timeout_as_millis(_connection));
+                if (timeout >= 0) {
+                    _timeout_timer.rearm(timeout_clock::now() + std::chrono::milliseconds(timeout));
+                }
             }
             return make_ready_future<>();
         }).handle_exception_type([] (const quic_aborted_exception& e) {});
