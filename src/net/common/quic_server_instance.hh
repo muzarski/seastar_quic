@@ -232,7 +232,7 @@ template<template<typename> typename CT>
 future<> quic_server_instance<CT>::handle_connection_aborting(const quic_connection_id& cid) {
     if (!_stopped) {
         _connections.erase(cid);
-        std::cout << "quic_server_instance: removed connection from the map" std::endl;
+        std::cout << "quic_server_instance: removed connection from the map" << std::endl;
     }
     return make_ready_future<>();
 }
