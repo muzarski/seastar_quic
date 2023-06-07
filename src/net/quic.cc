@@ -321,7 +321,7 @@ future<> quic_connection<QI>::abort() {
     }
     std::cout << "ABORT: after if in conn ";
     for (size_t i = 0; i < 20; ++i) {
-        std::cout << this->cid().cid[i];
+        std::cout << (long) this->cid().cid[i];
     }
     std::cout << std::endl;
 
