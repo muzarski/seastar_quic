@@ -335,9 +335,12 @@ future<> quic_connection<QI>::abort() {
         stream.read_queue.abort(std::make_exception_ptr(quic_aborted_exception()));
     }
 
+    qlogger.info("abort: about to cancel timers");
+
     this->_timeout_timer.cancel();
     this->_send_timer.cancel();
 
+    qlogger.info("abort: berfore _stream_recv_fiber.then()");
     return _stream_recv_fiber.then([this, aborted = std::move(aborted)] () mutable {
         qlogger.info("abort: in _stream_recv_fiber.then()");
         return this->_socket->handle_connection_aborting(this->_connection_id).then([aborted = std::move(aborted)] () mutable {
