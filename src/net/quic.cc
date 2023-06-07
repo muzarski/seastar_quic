@@ -252,6 +252,7 @@ public:
     : _connection(conn) {}
 
     ~quiche_quic_connected_socket_impl() noexcept override {
+        std::cout << "In connected_socket destructor" << std::endl;
         _connection->close();
     }
 
@@ -374,6 +375,7 @@ void quic_connection<QI>::close() {
     if (this->_closing_marker || this->is_closed()) {
         return;
     }
+    std::cout << "quic_connection::close after if" << std::endl;
 
     for (auto& [_, stream] : _streams) {
         if (!stream.write_queue.empty()) {

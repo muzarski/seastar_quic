@@ -290,6 +290,7 @@ future<> quic_server_instance<CT>::stop() {
     if (_stopped) {
         return _stopped->get_future();
     }
+    std::cout << "quic_server_instance in stop()" << std::endl;
 
     shared_promise<> stopped;
     _stopped.emplace(stopped.get_shared_future());
