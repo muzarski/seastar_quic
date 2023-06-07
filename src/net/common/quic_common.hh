@@ -90,6 +90,13 @@ struct quic_connection_id {
     }
 };
 
+inline std::ostream& operator<<(std::ostream& os, const quic_connection_id& cid) {
+    for (unsigned char i : cid.cid) {
+        os << (long) i;
+    }
+    return os;
+}
+
 template <typename CharType>
 temporary_buffer<CharType> quic_make_eof_buffer() {
     return temporary_buffer<CharType>("", 0);

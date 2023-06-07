@@ -127,7 +127,9 @@ public:
         this->_socket->register_connection(this->shared_from_this());
     }
 
-    ~quic_connection()  = default;
+    ~quic_connection() {
+        std::cout << "~quic_connection id " << this->cid() << std::endl;
+    }
 
 // Public methods.
 public:
@@ -320,10 +322,7 @@ future<> quic_connection<QI>::abort() {
     if (_aborted) {
         return _aborted->get_future();
     }
-    std::cout << "ABORT: after if in conn ";
-    for (size_t i = 0; i < 20; ++i) {
-        std::cout << (long) this->cid().cid[i];
-    }
+    std::cout << "ABORT: after if in conn " << this->cid();
     std::cout << std::endl;
 
     _closed_promise.set_value();

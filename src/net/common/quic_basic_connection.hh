@@ -247,6 +247,7 @@ public:
     }
 
     ~quic_basic_connection() noexcept {
+        std::cout << "~quic_basic_connection id " << cid() << std::endl;
         if (_connection) {
             quiche_conn_free(std::exchange(_connection, nullptr));
         }
@@ -329,6 +330,7 @@ void quic_basic_connection<QI>::init() {
         quiche_conn_on_timeout(_connection);
         if (is_closed()) {
             qlogger.info("Calling abort from on_timeout");
+            std::cout << "(COUT) Calling abort from on_timeout" << std::endl;
             (void) abort();
             return;
         }
@@ -369,6 +371,7 @@ void quic_basic_connection<QI>::receive(udp_datagram&& datagram) {
 
     if (is_closed()) {
         qlogger.info("Calling abort from receive");
+        std::cout << "(COUT) Calling abort from receive" << std::endl;
         (void) abort();
         return;
     }
