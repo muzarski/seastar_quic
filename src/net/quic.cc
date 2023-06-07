@@ -322,8 +322,10 @@ future<> quic_connection<QI>::abort() {
     if (_aborted) {
         return _aborted->get_future();
     }
-    std::cout << "ABORT: after if in conn " << this->cid();
-    std::cout << std::endl;
+    std::cout << "ABORT: after if in conn " << this->cid() << std::endl;
+    if (_aborted.has_value()) {
+        std::cout << "_aborted.has_value() after ir ??????" << std::endl;
+    }
 
     _closed_promise.set_value();
 
