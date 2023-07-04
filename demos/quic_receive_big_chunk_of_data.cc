@@ -58,8 +58,8 @@ seastar::future<> handle_connection(seastar::net::quic_accept_result accept_resu
 
 seastar::future<> service_loop() {
     // TODO: Either add keys to the repo or generate them here.
-    std::string cert_file = "/home/muzarski/sem5/zpp/seastar_quic/quiche/quiche/examples/cert.crt";
-    std::string key_file = "/home/muzarski/sem5/zpp/seastar_quic/quiche/quiche/examples/cert.key";
+    std::string cert_file = "/home/mikolajuzarski/zpp/seastar_quic/quiche/quiche/examples/cert.crt";
+    std::string key_file = "/home/mikolajuzarski/zpp/seastar_quic/quiche/quiche/examples/cert.key";
 
     return seastar::do_with(seastar::net::quic_listen(seastar::make_ipv4_address({1234}), cert_file, key_file),
                             [](auto &listener) {

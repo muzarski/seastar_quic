@@ -308,7 +308,8 @@ future<> quic_server_instance<CT>::stop() {
             return _service_gate.close().then([] () {
                 qlogger.info("service gate closed");
             });
-        }).then([stopped = std::move(stopped)] () mutable {
+        }).then([this, stopped = std::move(stopped)] () mutable {
+            abort_accept();
             stopped.set_value();
             return make_ready_future<>();
         });
