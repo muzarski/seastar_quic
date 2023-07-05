@@ -383,7 +383,14 @@ void quic_connection<QI>::close() {
     }
 
     this->_closing_marker.mark();
-    quiche_conn_close(this->_connection, true, 0, nullptr, 0);
+    // Although the documentation of Quiche does not specify the buffer being passed here
+    // cannot be a NULL pointer, it is an assumption made by Rust's standard library.
+    //
+    // Violating this may lead to undefined behavior or panic.
+    //
+    // For more information, see the implementation of this function. As of the time of these changes,
+    // it uses Rust's: `slice::from_raw_parts` where the assumption about the pointer being non-null is made.
+    quiche_conn_close(this->_connection, true, 0, (const uint8_t*) "", 0);
     (void) this->quic_flush();
 }
 
@@ -506,7 +513,14 @@ void quic_connection<QI>::shutdown_output(quic_stream_id stream_id) {
         stream.maybe_writable = std::nullopt;
     }
 
-    const auto err = quiche_conn_stream_send(this->_connection, stream_id, nullptr, 0, true);
+    // Although the documentation of Quiche does not specify the buffer being passed here
+    // cannot be a NULL pointer, it is an assumption made by Rust's standard library.
+    //
+    // Violating this may lead to undefined behavior or panic.
+    //
+    // For more information, see the implementation of this function. As of the time of these changes,
+    // it uses Rust's: `slice::from_raw_parts` where the assumption about the pointer being non-null is made.
+    const auto err = quiche_conn_stream_send(this->_connection, stream_id, (const uint8_t*) "", 0, true);
     if (err < 0) {
         qlogger.warn("[quic_connection::shutdown_output]: quiche_conn_stream_send error "
                      "on stream ({}) when sending EOF: {}", stream_id, err);
