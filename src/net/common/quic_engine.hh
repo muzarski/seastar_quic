@@ -39,8 +39,6 @@ private:
     // Wrap pointers in a variant, not the types.
     // Pointers have the same size.
     using instance_type = std::variant<lw_shared_ptr<QIs>...>;
-public:
-    using type          = quic_engine<QIs...>;
 
 // Fields.
 private:
@@ -65,10 +63,10 @@ public:
 
         auto& engine = quic_engine<QIs...>::get_singleton_instance();
         engine.init_engine();
-        if (engine._instances.find(key) != engine._instances.end()) {
+        const auto [_, emplaced] = engine._instances.try_emplace(key, instance);
+        if (!emplaced) {
             fmt::print("[QUIC_ENGINE]: clash between the keys of the map\n");
         }
-        engine._instances.emplace(key, instance);
     }
 
 // Private methods.

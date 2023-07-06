@@ -92,7 +92,7 @@ struct quic_connection_id {
 
 inline std::ostream& operator<<(std::ostream& os, const quic_connection_id& cid) {
     for (unsigned char i : cid.cid) {
-        os << (long) i;
+        os << +i;
     }
     return os;
 }

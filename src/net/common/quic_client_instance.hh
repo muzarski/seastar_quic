@@ -52,7 +52,9 @@ namespace seastar::net {
 // to any type connection other than the "raw" QUIC one, we make this
 // class a template for preserving a consistent code style.
 //
-// For the template parameter, see the comment for `quic_server_instance`.
+// The connection type is a template parameterized by
+// the QUIC socket instance that holds it, i.e.
+// this or some other instance class.
 template<template<typename> typename ConnectionT>
 class quic_client_instance : public weakly_referencable<quic_client_instance<ConnectionT>> {
 // Local definitions.
@@ -86,8 +88,6 @@ public:
     [[nodiscard]] connection_data connect(const socket_address& sa);
     void register_connection(lw_shared_ptr<connection_type> conn);
     void init();
-    // TODO: Ditch this.
-    [[nodiscard]] std::string name();
     future<> close();
     [[nodiscard]] socket_address local_address() const {
         return _channel_manager.local_address();
@@ -204,12 +204,6 @@ void quic_client_instance<CT>::init() {
     }).handle_exception([] (const std::exception_ptr& e) {
         qlogger.warn("[quic_client_instance::init]: receive_loop error {}", e);
     });
-}
-
-// TODO: Ditch this.
-template<template<typename> typename CT>
-[[nodiscard]] std::string quic_client_instance<CT>::name() {
-    return "client";
 }
 
 template<template<typename> typename CT>

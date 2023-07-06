@@ -28,7 +28,7 @@
 // Seastar features.
 #include <seastar/core/do_with.hh>          // seastar::do_with
 #include <seastar/core/future.hh>           // seastar::future
-#include <seastar/core/loop.hh>             // seastar::do_until
+#include <seastar/core/loop.hh>             // seastar::do_until, seastar::do_for_each
 #include <seastar/core/shared_ptr.hh>       // seastar::enable_lw_shared_from_this
 #include <seastar/core/temporary_buffer.hh> // seastar::temporary_buffer
 #include <seastar/core/shared_future.hh>    // seastar::shared_promise
@@ -214,10 +214,12 @@ public:
 // Public methods.
 public:
     future<> put(packet data) override {
-//        const auto* fa = data.fragment_array();
-//        temporary_buffer<quic_byte_type> tb{reinterpret_cast<quic_byte_type*>(fa->base), static_cast<size_t>(fa->size)};
-
-        return _connection->write(std::move(std::move(data.release()[0])), _stream_id);
+        return do_with(std::move(data), [=](auto&& d) {
+            auto fragments = d.fragments();
+            return do_for_each(fragments.begin(), fragments.end(), [=](auto&& frag) {
+                return _connection->write(temporary_buffer<char>(frag.base, frag.size), _stream_id);
+            });
+        });
     }
 
     future<> close() override {
@@ -252,7 +254,6 @@ public:
     : _connection(conn) {}
 
     ~quiche_quic_connected_socket_impl() noexcept override {
-        //std::cout << "In connected_socket destructor" << std::endl;
         _connection->close();
     }
 
@@ -320,22 +321,12 @@ future<> quic_connection<QI>::abort() {
     if (_aborted) {
         return _aborted->get_future();
     }
-//    std::cout << "ABORT: after if in conn " << this->cid() << std::endl;
-//    if (_aborted.has_value()) {
-//        std::cout << "_aborted.has_value() after ir ??????" << std::endl;
-//    }
 
     _closed_promise.set_value();
-
-    //std::cout << "abort: after _closed_promise.set_value()" << std::endl;
     this->_read_marker.abort();
-
-    //std::cout << "abort: after _read_marker.abort()" << std::endl;
 
     shared_promise<> aborted{};
     _aborted.emplace(aborted.get_shared_future());
-
-    // std::cout << "abort: after _aborted.emplace(...)" << std::endl;
 
     if (this->_send_queue.size() > 0) {
         qlogger.warn("[quic_connection::abort] there is some unsent data in pacing queue for stream.");
@@ -345,21 +336,12 @@ future<> quic_connection<QI>::abort() {
         stream.read_queue.abort(std::make_exception_ptr(quic_aborted_exception()));
     }
 
-    // std::cout << "abort: about to cancel timers" << std::endl;
-
     this->_timeout_timer.cancel();
-
-    // std::cout << "abort: after _timeout_timer.cancel()" << std::endl;
-
     this->_send_timer.cancel();
 
-    // std::cout << "abort: berfore _stream_recv_fiber.then()" << std::endl;
     return _stream_recv_fiber.then([this, aborted = std::move(aborted)] () mutable {
-        // std::cout << "abort: in _stream_recv_fiber.then()" << std::endl;
         return this->_socket->handle_connection_aborting(this->_connection_id).then([aborted = std::move(aborted)] () mutable {
-            // std::cout << "abort: in handle_connection_aborting.then()" << std::endl;
             aborted.set_value();
-            // std::cout << "abort: after aborted.set_value()" << std::endl;
         });
     });
 }
@@ -374,7 +356,6 @@ void quic_connection<QI>::close() {
     if (this->_closing_marker || this->is_closed()) {
         return;
     }
-    // std::cout << "quic_connection::close after if" << std::endl;
 
     for (auto& [_, stream] : _streams) {
         if (!stream.write_queue.empty()) {
@@ -414,7 +395,6 @@ future<> quic_connection<QI>::write(temporary_buffer<quic_byte_type> tb, quic_st
             tb.size(),
             false
     );
-    // fmt::print(stderr, "\t[Quic connection]: quiche_conn_stream_send finished.\n");
 
     if (written < -1) {
         qlogger.warn("[quic_connection::write]: writing to stream ({}) has failed with error: {}.", stream_id, written);
@@ -704,7 +684,7 @@ void quiche_log_printer(const char* line, [[maybe_unused]] void*) {
 }
 
 class quiche_q_socket_impl : public q_socket_impl{
-    quiche_configuration                    _config;
+    quiche_configuration                  _config;
     lw_shared_ptr<quic_client_connection> _conn;
 public:
 
@@ -744,14 +724,14 @@ socket_address shard_aware_address(socket_address sa) {
 
 
 quic_server_socket quic_listen(const socket_address& sa, const std::string_view cert_file,
-                           const std::string_view cert_key, const quic_connection_config& quic_config)
+        const std::string_view cert_key, const quic_connection_config& quic_config)
 {
     socket_address _sa = shard_aware_address(sa);
     return quic_server_socket(std::make_unique<quiche_server_socket_impl>(_sa, cert_file, cert_key, quic_config));
 }
 
 future<quic_connected_socket> quic_connect(const socket_address& sa,
-                                       const quic_connection_config& quic_config)
+        const quic_connection_config& quic_config)
 {
     using impl_type = quiche_quic_connected_socket_impl<quic_client_connection>;
     socket_address _sa = shard_aware_address(sa);
