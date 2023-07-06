@@ -49,6 +49,7 @@ struct quic_h3_request {
 struct quic_h3_reply {
     int64_t _stream_id;
     std::unique_ptr<http::reply> _resp;
+    std::optional<sstring> _status_code = std::nullopt;
 };
 
 class quic_h3_connected_socket_impl {

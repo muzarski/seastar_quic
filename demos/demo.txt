@@ -74,30 +74,11 @@ public:
     }
 };
 
-constexpr static std::uint64_t HUNDRED_MEGABYTES = 1000 * 1000 * 100;
-static char buf[HUNDRED_MEGABYTES];
-
-class handl_huge : public httpd::handler_base {
-public:
-    virtual future<std::unique_ptr<http::reply> > handle(const sstring& path,
-                                                         std::unique_ptr<http::request> req, std::unique_ptr<http::reply> rep) {
-        for (char & i : buf) {
-            i = 'a';
-        }
-        rep->_content = buf;
-        rep->done("text");
-
-        return make_ready_future<std::unique_ptr<http::reply>>(std::move(rep));
-    }
-};
-
 void set_routes(routes& r) {
     handl* quic = new handl();
     r.add(operation_type::GET, url("/"), quic);
-    auto *file_handler = new seastar::httpd::file_handler("/home/mikolajuzarski/zpp/seastar_quic/demos/demo.txt");
+    auto *file_handler = new seastar::httpd::file_handler("/home/mikolajuzarski/zpp/seastar_quic/demos/http3_demo.cc");
     r.add(operation_type::GET, url("/file"), file_handler);
-    auto *huge = new handl_huge();
-    r.add(operation_type::GET, url("/huge"), huge);
 }
 
 const std::string ms_cert_default = "/home/mikolajuzarski/zpp/seastar_quic/localhost.pem";
@@ -112,16 +93,15 @@ int main(int ac, char** av) {
 
     return app.run_deprecated(ac, av, [&] {
         return seastar::async([&] {
-            seastar::net::quic_enable_logging();
             stop_signal stop_signal;
             auto&& config = app.configuration();
 
             uint16_t port = config["port"].as<uint16_t>();
             auto server = new http3_server_control();
-            
+
             sstring ms_cert = config["cert_file"].as<std::string>();
             sstring ms_key = config["cert_key"].as<std::string>();
-            
+
             server->start().get();
 
             server->set_routes(set_routes).get();

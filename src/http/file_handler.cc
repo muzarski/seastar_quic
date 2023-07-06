@@ -107,6 +107,7 @@ future<std::unique_ptr<http::reply>> file_interaction_handler::read(
 bool file_interaction_handler::redirect_if_needed(const http::request& req,
         http::reply& rep) const {
     if (req._url.length() == 0 || req._url.back() != '/') {
+        std::cout << "URL: " << req._url << ", " << req.get_url() << '\n';
         rep.set_status(http::reply::status_type::moved_permanently);
         rep._headers["Location"] = req.get_url() + "/";
         rep.done();
