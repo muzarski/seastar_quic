@@ -23,15 +23,19 @@
 #include "udp_manager.hh"
 
 // Seastar features.
-#include <seastar/core/future.hh>           // seastar::future
-#include <seastar/core/gate.hh>             // seastar::gate
+#include <seastar/core/byteorder.hh>        // seastar::{write_be, read_be}
+#include <seastar/core/future.hh>
+#include <seastar/core/gate.hh>
 #include <seastar/core/loop.hh>             // seastar::parallel_for_each
-#include <seastar/core/queue.hh>            // seastar::queue
-#include <seastar/core/shared_future.hh>    // seastar::shared_{future, promise}
-#include <seastar/core/shared_ptr.hh>       // seastar::lw_shared_ptr
-#include <seastar/core/temporary_buffer.hh> // seastar::temporary_buffer
+#include <seastar/core/queue.hh>
+#include <seastar/core/shared_future.hh>
+#include <seastar/core/shared_ptr.hh>
+#include <seastar/core/temporary_buffer.hh>
 #include <seastar/core/weak_ptr.hh>         // seastar::weakly_referencable
 #include <seastar/net/api.hh>               // seastar::net::udp_datagram
+#include <seastar/net/inet_address.hh>
+#include <seastar/net/ipv4_address.hh>
+#include <seastar/net/ipv6_address.hh>
 #include <seastar/net/socket_defs.hh>       // seastar::net::socket_address
 #include <seastar/net/quic.hh>              // seastar::net::quic_connection_config
 
@@ -43,18 +47,18 @@
 
 // STD.
 #include <algorithm>
-#include <chrono>           // Pacing
+#include <chrono>           // Pacing, random seed.
 #include <cstring>          // std::memcpy, etc.
-#include <string>           // TODO: Probably to be ditched.
-#include <string_view>
 #include <exception>
+#include <optional>
+#include <random>           // Generating tokens.
+#include <stdexcept>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
 
 namespace seastar::net {
-
-// TODO: Think if some classes/structs should/should not be marked as `final`.
 
 
 //@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
@@ -67,6 +71,202 @@ namespace seastar::net {
 //@|=================================|@
 //@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
 
+
+struct invalid_address : std::exception {
+    const char* what() const noexcept {
+        return "The passed address is unspecified or invalid.";
+    }
+};
+
+struct invalid_cid : std::exception {
+    const char* what() const noexcept {
+        return "The passed connection ID is invalid.";
+    }
+};
+
+struct invalid_token : std::exception {
+    const char* what() const noexcept {
+        return "The passed token is invalid.";
+    }
+};
+
+struct quic_dcid : public quic_connection_id {
+    constexpr static size_t MAX_DCID_LENGTH = MAX_QUIC_CONNECTION_ID_LENGTH;
+    size_t size = quic_dcid::MAX_DCID_LENGTH;
+};
+
+struct header_token {
+public:
+    using version_type = char;
+    constexpr static size_t VERSION_SIZE = sizeof(version_type);
+    constexpr static size_t IP_SIZE = ipv6_address::size();
+    constexpr static size_t PORT_SIZE = sizeof(::in_port_t);
+    constexpr static size_t ENTROPY_SIZE = 16;
+private:
+    constexpr static size_t VERSION_OFFSET = 0;
+    constexpr static size_t IP_OFFSET = VERSION_SIZE;
+    constexpr static size_t PORT_OFFSET = IP_OFFSET + IP_SIZE;
+    constexpr static size_t ENTROPY_OFFSET = PORT_OFFSET + PORT_SIZE;
+    constexpr static size_t DCID_OFFSET = ENTROPY_OFFSET + ENTROPY_SIZE;
+
+    constexpr static size_t TOKEN_SIZE = VERSION_SIZE + IP_SIZE + PORT_SIZE + ENTROPY_SIZE + quic_dcid::MAX_DCID_LENGTH;
+
+public:
+    char   bytes[TOKEN_SIZE];
+    size_t length = sizeof(bytes);
+
+public:
+    inet_address::family ip_version() const {
+        // TODO: Change this to std::bit_cast when C++20 is fully supported.
+        //
+        // Right now we're forced to use `std::memcpy` to avoid undefined behavior
+        // related to unaligned access. Do NOT change this to a "raw" `reinterpret_cast`.
+        version_type version;
+        std::memcpy(&version, bytes + VERSION_OFFSET, sizeof(version));
+        switch (version) {
+            case 4: return inet_address::family::INET;
+            case 6: return inet_address::family::INET6;
+            default: throw invalid_token{};
+        }
+    }
+
+    inet_address ip_address() const {
+        switch (ip_version()) {
+            case inet_address::family::INET:
+                return ipv4_address::read(bytes + IP_OFFSET);
+            case inet_address::family::INET6:
+                return ipv6_address::read(bytes + IP_OFFSET);
+        }
+    }
+
+    ::in_port_t port() const noexcept {
+        // TODO: Change this to std::bit_cast when C++20 is fully supported.
+        //
+        // Right now we're forced to use `std::memcpy` to avoid undefined behavior
+        // related to unaligned access. Do NOT change this to a "raw" `reinterpret_cast`.
+        ::in_port_t result;
+        std::memcpy(&result, bytes + PORT_OFFSET, sizeof(result));
+        return result;
+    }
+
+    const uint8_t* entropy_data() const noexcept {
+        return reinterpret_cast<const uint8_t*>(bytes + ENTROPY_OFFSET);
+    }
+    uint8_t* entropy_data() noexcept {
+        return reinterpret_cast<uint8_t*>(bytes + ENTROPY_OFFSET);
+    }
+
+    quic_dcid dcid() const noexcept {
+        // TODO: Change this to std::bit_cast when C++20 is fully supported.
+        //
+        // Right now we're forced to use `std::memcpy` to avoid undefined behavior
+        // related to unaligned access. Do NOT change this to a "raw" `reinterpret_cast`.
+        quic_dcid result;
+        std::memcpy(&result.cid, bytes + DCID_OFFSET, quic_dcid::MAX_DCID_LENGTH);
+        result.size = size() - DCID_OFFSET;
+        return result;
+    }
+
+    // Perhaps unaligned.
+    const uint8_t* cid_data() const noexcept {
+        return reinterpret_cast<const uint8_t*>(bytes + DCID_OFFSET);
+    }
+    // Perhaps unaligned.
+    uint8_t* cid_data() noexcept {
+        return reinterpret_cast<uint8_t*>(bytes + DCID_OFFSET);
+    }
+
+    const uint8_t* data() const noexcept {
+        return reinterpret_cast<const uint8_t*>(bytes);
+    }
+    uint8_t* data() noexcept {
+        return reinterpret_cast<uint8_t*>(bytes);
+    }
+    const size_t size() const noexcept {
+        return length;
+    }
+
+public:
+    static header_token mint_token(const socket_address& sa, const std::string_view dcid) {
+        // In QUIC version 1, connection IDs cannot be longer than 20 bytes.
+        //
+        // It is recommended that servers be able read longer connection IDs to
+        // support other QUIC versions. That's a TODO.
+        //
+        // See RFC 9000, section 17.2 for more information.
+        if (dcid.length() > quic_dcid::MAX_DCID_LENGTH) {
+            throw invalid_cid{};
+        }
+
+        header_token result;
+        char* dst = result.bytes;
+
+        encode_address(dst, sa);
+        generate_random_number(dst, ENTROPY_SIZE);
+
+        std::memcpy(dst, dcid.data(), dcid.length());
+        
+        result.length = DCID_OFFSET + dcid.length();
+        return result;
+    }
+
+    static bool validate_address(const header_token& token, const socket_address& sa) {
+        char tmp[ENTROPY_OFFSET];
+        char* dst = tmp;
+
+        encode_address(dst, sa);
+
+        return std::memcmp(tmp, token.bytes, sizeof(tmp)) == 0;
+    }
+
+private:
+    static void encode_version(char*& dst, version_type version) noexcept {
+        produce_be(dst, version);
+    }
+
+    static void encode_ipv4_addr(char*& dst, const ipv4_address& sa) noexcept {
+        constexpr size_t IP_ZERO_PADDING_SIZE = IP_SIZE - ipv4_address::size(); 
+        sa.produce(dst);
+        std::memset(dst, 0, IP_ZERO_PADDING_SIZE);
+        dst += IP_ZERO_PADDING_SIZE;
+    }
+
+    static void encode_ipv6_addr(char*& dst, const ipv6_address& sa) noexcept {
+        sa.produce(dst);
+    }
+
+    static void encode_port(char*& dst, uint16_t port) noexcept {
+        produce_be(dst, port);
+    }
+
+    static void encode_address(char*& dst, const socket_address& sa) {
+        if (sa.addr().is_ipv4()) {
+            encode_version(dst, 4);
+            encode_ipv4_addr(dst, sa.addr().as_ipv4_address());
+        } else if (sa.addr().is_ipv6()) {
+            encode_version(dst, 6);
+            encode_ipv6_addr(dst, sa.addr().as_ipv6_address());
+        } else {
+            throw invalid_address{};
+        }
+
+        encode_port(dst, sa.port());
+    }
+
+    static void generate_random_number(char*& dst, size_t width) {
+        static thread_local std::mt19937_64 mersenne64(
+                std::chrono::system_clock::now().time_since_epoch().count());
+        
+        while (width) {
+            const auto random_number = mersenne64();
+            const auto len = std::min(sizeof(random_number), width);
+
+            std::memcpy(dst, &random_number, len);
+            dst += len;
+            width -= len;
+        }
+    }
+};
 
 
 // Servers are parameterized by the type of connections they hold,
@@ -85,14 +285,6 @@ public:
     using connection_type = ConnectionT<quic_server_instance<ConnectionT>>;
     using type            = quic_server_instance<ConnectionT>;
 
-// Local constants.
-private:
-    // TODO: Check the comments left in the function `quic_retry`.
-    // Right now, tokens aren't used properly and passing `socket_address::length()`
-    // to quiche's functions causes validation of them return false. Investigate it.
-    constexpr static size_t MAX_TOKEN_SIZE =
-            sizeof("quiche") - 1 + sizeof(::sockaddr_storage) + MAX_QUIC_CONNECTION_ID_LENGTH;
-
 // Local structures.
 private:
     template<size_t Length>
@@ -103,16 +295,7 @@ private:
         size_t  length = sizeof(data);
     };
 
-    template<size_t TokenSize>
-    struct header_token_template {
-        constexpr static size_t HEADER_TOKEN_MAX_SIZE = TokenSize;
-
-        uint8_t data[TokenSize];
-        size_t  size = sizeof(data);
-    };
-
-    using cid          = cid_template<MAX_QUIC_CONNECTION_ID_LENGTH>;
-    using header_token = header_token_template<MAX_TOKEN_SIZE>;
+    using cid = cid_template<MAX_QUIC_CONNECTION_ID_LENGTH>;
 
     struct quic_header_info {
         uint8_t  type;
@@ -140,6 +323,7 @@ protected:
     quic_udp_channel_manager                                               _channel_manager;
     std::vector<quic_byte_type>                                            _buffer;
     std::unordered_map<quic_connection_id, lw_shared_ptr<connection_type>> _connections;
+    std::unordered_map<socket_address, header_token>                       _address_tokens;
     queue<lw_shared_ptr<connection_type>>                                  _waiting_queue;
     future<>                                                               _send_queue;
     gate                                                                   _service_gate;
@@ -182,8 +366,6 @@ public:
     }
     void register_connection(lw_shared_ptr<connection_type> conn);
     void init();
-    // TODO: Ditch this.
-    [[nodiscard]] std::string name() const;
     future<> stop();
     [[nodiscard]] gate& qgate() noexcept {
         return _service_gate;
@@ -195,18 +377,12 @@ private:
     future<> handle_datagram(udp_datagram&& datagram);
     future<> handle_post_hs_connection(lw_shared_ptr<connection_type> conn, udp_datagram&& datagram);
     // TODO: Check if we cannot provide const references here instead.
-    future<> handle_pre_hs_connection(quic_header_info& header_info, udp_datagram&& datagram,
+    future<> handle_pre_hs_connection(const quic_header_info& header_info, udp_datagram&& datagram,
             const quic_connection_id& key);
     future<> negotiate_version(const quic_header_info& header_info, udp_datagram&& datagram);
     future<> quic_retry(const quic_header_info& header_info, udp_datagram&& datagram);
     quic_connection_id generate_new_cid();
-
-
-    static header_token mint_token(const quic_header_info& header_info, const ::sockaddr_storage* addr,
-            ::socklen_t addr_len);
-    // TODO: Change this function to something proper, less C-like.
-    static bool validate_token(const uint8_t* token, size_t token_len, const ::sockaddr_storage* addr,
-            ::socklen_t addr_len, uint8_t* odcid, size_t* odcid_len);
+    std::optional<quic_dcid> validate_token(const header_token& token, const socket_address& sa);
 };
 
 
@@ -264,14 +440,14 @@ void quic_server_instance<CT>::register_connection(lw_shared_ptr<connection_type
 
 template<template<typename> typename CT>
 void quic_server_instance<CT>::init() {
-    (void) try_with_gate(_service_gate, [this] () {
+    (void) try_with_gate(_service_gate, [this] {
         return _channel_manager.run();
     }).handle_exception_type([] (const gate_closed_exception& e) {
     }).handle_exception([] (const std::exception_ptr& e) {
         qlogger.warn("[quic_server_instance::init]: udp channel manager error: {}", e);
     });
 
-    (void) try_with_gate(_service_gate, [this] () {
+    (void) try_with_gate(_service_gate, [this] {
         return service_loop().handle_exception_type([] (const quic_aborted_exception& e) {});
     }).handle_exception_type([] (const gate_closed_exception& e) {
     }).handle_exception([] (const std::exception_ptr& e) {
@@ -279,18 +455,11 @@ void quic_server_instance<CT>::init() {
     });
 }
 
-// TODO: Ditch this.
-template<template<typename> typename CT>
-[[nodiscard]] std::string quic_server_instance<CT>::name() const {
-    return "server";
-}
-
 template<template<typename> typename CT>
 future<> quic_server_instance<CT>::stop() {
     if (_stopped) {
         return _stopped->get_future();
     }
-    std::cout << "quic_server_instance in stop()" << std::endl;
 
     shared_promise<> stopped;
     _stopped.emplace(stopped.get_shared_future());
@@ -343,8 +512,8 @@ future<> quic_server_instance<CT>::handle_datagram(udp_datagram&& datagram) {
             &header_info.scid.length,
             header_info.dcid.data,
             &header_info.dcid.length,
-            header_info.token.data,
-            &header_info.token.size
+            header_info.token.data(),
+            &header_info.token.length
     );
 
     if (parse_header_result < 0) {
@@ -371,56 +540,50 @@ future<> quic_server_instance<CT>::handle_post_hs_connection(lw_shared_ptr<conne
 
 // TODO: Check if we cannot provide const references here instead.
 template<template<typename> typename CT>
-future<> quic_server_instance<CT>::handle_pre_hs_connection(quic_header_info& header_info,
+future<> quic_server_instance<CT>::handle_pre_hs_connection(const quic_header_info& header_info,
         udp_datagram&& datagram, const quic_connection_id& key) {
     if (!quiche_version_is_supported(header_info.version)) {
         // fmt::print("Negotiating the version...\n");
         return negotiate_version(header_info, std::move(datagram));
     }
 
-    if (header_info.token.size == 0) {
+    if (header_info.token.size() == 0) {
         // fmt::print("quic_retry...\n");
         return quic_retry(header_info, std::move(datagram));
     }
 
     // TODO: Refactor this
-    const auto addr = datagram.get_src().as_posix_sockaddr();
-    const auto* peer_addr = reinterpret_cast<const ::sockaddr_storage*>(&addr);
-    const auto peer_addr_len = sizeof(addr);
+    const auto peer_addr = datagram.get_src().as_posix_sockaddr();
+    const auto peer_addr_len = sizeof(peer_addr);
 
     const auto local_addr = datagram.get_dst().as_posix_sockaddr();
     const auto local_addr_len = sizeof(local_addr);
 
-    const bool validated_token = validate_token(
-            header_info.token.data,
-            header_info.token.size,
-            peer_addr,
-            peer_addr_len,
-            reinterpret_cast<uint8_t*>(header_info.odcid.data),
-            &header_info.odcid.length
-    );
+    const std::optional<quic_dcid> odcid = validate_token(header_info.token, datagram.get_src());
 
-    if (!validated_token) {
-        fmt::print(stderr, "Invalid address validation token.\n");
+    if (!odcid) {
+        qlogger.warn("Invalid address validation token.");
         return make_ready_future<>();
     }
 
     quiche_conn* connection = quiche_accept(
             header_info.dcid.data,
             header_info.dcid.length,
-            header_info.odcid.data,
-            header_info.odcid.length,
+            odcid->cid,
+            odcid->size,
             &local_addr,
             local_addr_len,
-            &addr,
+            &peer_addr,
             peer_addr_len,
             _quiche_configuration.get_underlying_config()
     );
 
     if (connection == nullptr) {
-        // fmt::print(stderr, "Creating a connection has failed.\n");
+        qlogger.info("Creating a QUIC connection has failed.");
         return make_ready_future<>();
     }
+
+    _address_tokens.erase(datagram.get_src());
 
     auto conn = make_lw_shared<connection_type>(connection, this->weak_from_this(),
             datagram.get_src(), key);
@@ -441,7 +604,7 @@ future<> quic_server_instance<CT>::negotiate_version(const quic_header_info& hea
     );
 
     if (written < 0) {
-        // fmt::print(stderr, "negotiate_version: failed to created a packet. Return value: {}\n", written);
+        qlogger.info("Creating a packet to negotiate the version has failed.");
         return make_ready_future<>();
     }
 
@@ -453,14 +616,13 @@ future<> quic_server_instance<CT>::negotiate_version(const quic_header_info& hea
 
 template<template<typename> typename CT>
 future<> quic_server_instance<CT>::quic_retry(const quic_header_info& header_info, udp_datagram&& datagram) {
-    const auto addr = datagram.get_src().as_posix_sockaddr();
-    const auto* peer_addr = reinterpret_cast<const ::sockaddr_storage*>(&addr);
-    // TODO: Changing this to `datagram.get_src().length()`, which, to my understanding, should be
-    // the right thing to do, causes validating the token return false later on. I think we should review
-    // how exactly we use sizes of the address structs.
-    const auto addr_len = sizeof(addr);
-
-    const auto token = mint_token(header_info, peer_addr, addr_len);
+    header_token token;
+    try {
+        token = header_token::mint_token(datagram.get_src(), { reinterpret_cast<const char*>(header_info.dcid.data), header_info.dcid.length });
+    } catch (const std::exception& excp) {
+        qlogger.info("Minting a token has failed with the message: {}", excp.what());
+    }
+    _address_tokens[datagram.get_src()] = token;
     quic_connection_id new_cid = generate_new_cid();
 
     const auto written = quiche_retry(
@@ -470,15 +632,15 @@ future<> quic_server_instance<CT>::quic_retry(const quic_header_info& header_inf
             header_info.dcid.length,
             new_cid.cid,
             sizeof(new_cid.cid),
-            token.data,
-            token.size,
+            token.data(),
+            token.size(),
             header_info.version,
             reinterpret_cast<uint8_t*>(_buffer.data()),
             _buffer.size()
     );
 
     if (written < 0) {
-        fmt::print(stderr, "Failed to create a retry QUIC packet. Return value: {}\n", written);
+        qlogger.error("Failed to create a retry QUIC packet. Return value: {}\n", written);
         return make_ready_future<>();
     }
 
@@ -499,52 +661,27 @@ quic_connection_id quic_server_instance<CT>::generate_new_cid() {
     return result;
 }
 
-
-/// STATIC
-
+// Returns the new DCID of a connection.
 template<template<typename> typename CT>
-typename quic_server_instance<CT>::header_token quic_server_instance<CT>::mint_token(
-            const quic_header_info& header_info, const ::sockaddr_storage* addr,
-            ::socklen_t addr_len)
+std::optional<quic_dcid> quic_server_instance<CT>::validate_token(
+        const header_token& token, const socket_address& sa)
 {
-    header_token result;
+    try {
+        if (!header_token::validate_address(token, sa)) {
+            return std::nullopt;
+        }
 
-    std::memcpy(result.data, "quiche", sizeof("quiche") - 1);
-    std::memcpy(result.data + sizeof("quiche") - 1, addr, addr_len);
-    std::memcpy(result.data + sizeof("quiche") - 1 + addr_len, header_info.dcid.data, header_info.dcid.length);
+        // Check the entropy.
+        const auto& tok = _address_tokens.at(sa);
+        if (std::memcmp(token.entropy_data(), tok.entropy_data(), header_token::ENTROPY_SIZE) != 0) {
+            return std::nullopt;
+        }
 
-    result.size = sizeof("quiche") - 1 + addr_len + header_info.dcid.length;
-
-    return result;
-}
-
-// TODO: Change this function to something proper, less C-like.
-template<template<typename> typename CT>
-bool quic_server_instance<CT>::validate_token(const uint8_t* token, size_t token_len, const ::sockaddr_storage* addr,
-        ::socklen_t addr_len, uint8_t* odcid, size_t* odcid_len)
-{
-    if (token_len < sizeof("quiche") - 1 || std::memcmp(token, "quiche", sizeof("quiche") - 1) != 0) {
-        return false;
+        // Extract the new DCID.
+        return { token.dcid() };
+    } catch (...) {
+        return std::nullopt;
     }
-
-    token += sizeof("quiche") - 1;
-    token_len -= sizeof("quiche") - 1;
-
-    if (token_len < addr_len || std::memcmp(token, addr, addr_len) != 0) {
-        return false;
-    }
-
-    token += addr_len;
-    token_len -= addr_len;
-
-    if (*odcid_len < token_len) {
-        return false;
-    }
-
-    std::memcpy(odcid, token, token_len);
-    *odcid_len = token_len;
-
-    return true;
 }
 
 
