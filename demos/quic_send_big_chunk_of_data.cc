@@ -19,43 +19,50 @@
  * Copyright (C) 2015 Cloudius Systems, Ltd.
  */
 
-// Demonstration of ability to send big chunks of data. Shows the ability to buffer the data, like in TCP.
+// Demonstration of ability to send big chunks of data. Shows the ability to buffer data, like in TCP.
 
 #include <seastar/core/app-template.hh>
-#include <seastar/core/reactor.hh>
 #include <seastar/core/future-util.hh>
-#include <seastar/net/api.hh>
-#include <seastar/net/quic.hh>
-#include "seastar/core/sleep.hh"
 #include <seastar/core/reactor.hh>
+#include <seastar/net/api.hh>
+#include <seastar/net/inet_address.hh>
+#include <seastar/net/quic.hh>
 
-constexpr static std::uint64_t STREAM_ID = 4;
-constexpr static std::uint64_t HUNDRED_MEGABYTES = 1000 * 1000 * 100;
+namespace bpo = boost::program_options;
 
-using namespace std::chrono_literals;
+seastar::future<> service_loop(const uint16_t port, const std::string address) {
+    constexpr static std::uint64_t STREAM_ID = 4;
+    constexpr static std::uint64_t HUNDRED_MEGABYTES = 1000 * 1000 * 100;
+    static char buff[HUNDRED_MEGABYTES];
 
-static char buf[HUNDRED_MEGABYTES];
-
-seastar::future<> service_loop() {
-    return seastar::net::quic_connect(seastar::make_ipv4_address({1234}))
-            .then([](seastar::net::quic_connected_socket conn) {
-                std::cout << "Connected!" << std::endl;
-                auto out = conn.output(STREAM_ID);
-                return seastar::do_with(std::move(conn), std::move(out),
-                                        [](auto &conn, auto &out) {
-                                            return out.write(buf, HUNDRED_MEGABYTES).then([]() {
-                                                std::cout << "Able to send again!" << std::endl;
-                                            }).then([&conn, &out] () {
-                                                // TODO Need to implement flush.
-                                                return out.close().then([&conn] () {
-                                                    return conn.close();
-                                                });
-                                            });
-                                        });
+    return seastar::net::quic_connect(
+        { seastar::net::inet_address(address), port }
+    ).then([](seastar::net::quic_connected_socket conn) {
+        std::cout << "Connected!" << std::endl;
+        auto out = conn.output(STREAM_ID);
+        return seastar::do_with(std::move(conn), std::move(out), [] (auto& conn, auto& out) {
+            return out.write(buff, HUNDRED_MEGABYTES).then([] {
+                std::cout << "Able to send again!" << std::endl;
+            }).then([&conn, &out] {
+                // TODO Need to implement flush.
+                return out.close().then([&conn] {
+                    return conn.close();
+                });
             });
+        });
+    });
 }
 
-int main(int ac, char **av) {
+int main(int ac, char** av) {
     seastar::app_template app;
-    return app.run(ac, av, service_loop);
+    app.add_options()
+            ("port", bpo::value<uint16_t>()->default_value(1234), "Server port")
+            ("address", bpo::value<std::string>()->default_value("127.0.0.1"), "Server IP address");
+
+    return app.run(ac, av, [&] {
+        auto&& config = app.configuration();
+        auto port = config["port"].as<uint16_t>();
+        auto address = config["address"].as<std::string>();
+        return service_loop(port, address);
+    });
 }

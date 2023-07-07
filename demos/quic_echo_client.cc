@@ -22,49 +22,58 @@
 // Demonstration of ability to connect to QUIC server, send data to it, and receive the response.
 
 #include <seastar/core/app-template.hh>
-#include <seastar/core/reactor.hh>
 #include <seastar/core/future-util.hh>
+#include <seastar/core/reactor.hh>
+#include <seastar/core/sleep.hh>
 #include <seastar/net/api.hh>
+#include <seastar/net/inet_address.hh>
 #include <seastar/net/quic.hh>
-#include "seastar/core/sleep.hh"
 
-constexpr static std::uint64_t STREAM_ID = 4;
-static std::uint64_t msg_id = 0;
-
+namespace bpo = boost::program_options;
 using namespace std::chrono_literals;
 
-seastar::future<> service_loop() {
-    return seastar::net::quic_connect(seastar::make_ipv4_address({1234}))
-            .then([](seastar::net::quic_connected_socket conn) {
-                std::cout << "Connected!" << std::endl;
-                auto in = conn.input(STREAM_ID);
-                auto out = conn.output(STREAM_ID);
-                return seastar::do_with(std::move(conn), std::move(in), std::move(out),
-                                        [](auto &conn, auto &in, auto &out) {
-                                            return seastar::keep_doing([&in, &out]() {
-                                                return seastar::sleep(1s).then([&in, &out]() {
-                                                    std::string msg = "Hello from client " + std::to_string(msg_id++);
-                                                    return out.write(msg).then([&in, &out]() {
-                                                        return out.flush().then([&in]() {
-                                                            std::cout << "Sent message." << std::endl;
-                                                            return in.read().then(
-                                                                    [](seastar::temporary_buffer<char> buf) {
-                                                                        char msg_buf[buf.size() + 1];
-                                                                        memcpy(msg_buf, buf.get(), buf.size());
-                                                                        msg_buf[buf.size()] = '\0';
-                                                                        std::cout << "Received message: " << msg_buf
-                                                                                  << std::endl;
-                                                                        return seastar::make_ready_future();
-                                                                    });
-                                                        });
-                                                    });
-                                                });
-                                            });
-                                        });
+seastar::future<> service_loop(const uint16_t port, const std::string address) {
+    constexpr static uint64_t STREAM_ID = 4;
+    static uint64_t msg_id = 0;
+
+    return seastar::net::quic_connect(
+        { seastar::net::inet_address(address), port }
+    ).then([] (seastar::net::quic_connected_socket conn) {
+        std::cout << "Connected!" << std::endl;
+
+        auto in = conn.input(STREAM_ID);
+        auto out = conn.output(STREAM_ID);
+
+        return seastar::do_with(std::move(conn), std::move(in), std::move(out), [] (auto& conn, auto& in, auto& out) {
+            return seastar::keep_doing([&in, &out] {
+                return seastar::sleep(1s).then([&in, &out] {
+                    std::string msg = "Hello from client " + std::to_string(msg_id++);
+                    return out.write(msg).then([&in, &out] {
+                        return out.flush().then([&in] {
+                            std::cout << "Sent message." << std::endl;
+                            return in.read().then([] (seastar::temporary_buffer<char> buf) {
+                                const auto msg = std::string_view{buf.begin(), buf.size()};
+                                std::cout << "Received message: " << msg << std::endl;
+                                return seastar::make_ready_future();
+                            });
+                        });
+                    });
+                });
             });
+        });
+    });
 }
 
-int main(int ac, char **av) {
+int main(int ac, char** av) {
     seastar::app_template app;
-    return app.run(ac, av, service_loop);
+    app.add_options()
+            ("port", bpo::value<uint16_t>()->default_value(1234), "Server port")
+            ("address", bpo::value<std::string>()->default_value("127.0.0.1"), "Server IP address");
+
+    return app.run(ac, av, [&] {
+        auto&& config = app.configuration();
+        auto port = config["port"].as<uint16_t>();
+        auto address = config["address"].as<std::string>();
+        return service_loop(port, address);
+    });
 }
