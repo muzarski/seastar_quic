@@ -149,7 +149,7 @@ void h3_connection<QI>::close() {
                 this->_connection,
                 true, // The user closed the connection.
                 0,
-                nullptr,
+                (uint8_t*) "",
                 0
         );
     }
