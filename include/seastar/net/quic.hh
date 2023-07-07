@@ -122,11 +122,11 @@ public:
 
 // Initiate the quic server, provide certs, choose version etc.
 quic_server_socket quic_listen(const socket_address &sa, const std::string_view cert_file,
-                               const std::string_view cert_key, const quic_connection_config& quic_config = quic_connection_config());
+        const std::string_view cert_key, const quic_connection_config& quic_config = quic_connection_config());
 
 // Initiate connection to the server, choose version etc.
-future<quic_connected_socket>
-quic_connect(const socket_address &sa, const quic_connection_config& quic_config = quic_connection_config());
+future<quic_connected_socket> quic_connect(const socket_address &sa,
+        const quic_connection_config& quic_config = quic_connection_config());
 
 // Quiche raw logs
 void quic_enable_logging();

@@ -39,9 +39,6 @@
 #include <seastar/net/socket_defs.hh>       // seastar::net::socket_address
 #include <seastar/net/quic.hh>              // seastar::net::quic_connection_config
 
-// Debug features.
-#include <fmt/core.h>   // For development purposes, ditch this later on.
-
 // Third-party API.
 #include <quiche.h>
 
@@ -444,7 +441,7 @@ void quic_server_instance<CT>::init() {
         return _channel_manager.run();
     }).handle_exception_type([] (const gate_closed_exception& e) {
     }).handle_exception([] (const std::exception_ptr& e) {
-        qlogger.warn("[quic_server_instance::init]: udp channel manager error: {}", e);
+        qlogger.warn("[quic_server_instance::init]: UDP channel manager error: {}", e);
     });
 
     (void) try_with_gate(_service_gate, [this] {
@@ -470,13 +467,9 @@ future<> quic_server_instance<CT>::stop() {
     }).then([this, stopped = std::move(stopped)] () mutable {
         _channel_manager.abort_read_queue();
 
-        qlogger.info("Scheduled udp channel flush");
         return _channel_manager.flush_write_queue().then([this] {
-            qlogger.info("After flush.");
             _channel_manager.abort_write_queue();
-            return _service_gate.close().then([] () {
-                qlogger.info("service gate closed");
-            });
+            return _service_gate.close();
         }).then([stopped = std::move(stopped)] () mutable {
             stopped.set_value();
             return make_ready_future<>();
@@ -512,12 +505,12 @@ future<> quic_server_instance<CT>::handle_datagram(udp_datagram&& datagram) {
             &header_info.scid.length,
             header_info.dcid.data,
             &header_info.dcid.length,
-            header_info.token.data(),
+            reinterpret_cast<uint8_t*>(header_info.token.bytes),
             &header_info.token.length
     );
 
     if (parse_header_result < 0) {
-        // fmt::print(stderr, "Failed to parse a QUIC header: {}\n", parse_header_result);
+        qlogger.warn("Failed to process a QUIC header with result: {}", parse_header_result);
         return make_ready_future<>();
     }
 
@@ -543,12 +536,10 @@ template<template<typename> typename CT>
 future<> quic_server_instance<CT>::handle_pre_hs_connection(const quic_header_info& header_info,
         udp_datagram&& datagram, const quic_connection_id& key) {
     if (!quiche_version_is_supported(header_info.version)) {
-        // fmt::print("Negotiating the version...\n");
         return negotiate_version(header_info, std::move(datagram));
     }
 
     if (header_info.token.size() == 0) {
-        // fmt::print("quic_retry...\n");
         return quic_retry(header_info, std::move(datagram));
     }
 
@@ -585,8 +576,7 @@ future<> quic_server_instance<CT>::handle_pre_hs_connection(const quic_header_in
 
     _address_tokens.erase(datagram.get_src());
 
-    auto conn = make_lw_shared<connection_type>(connection, this->weak_from_this(),
-            datagram.get_src(), key);
+    auto conn = make_lw_shared<connection_type>(connection, this->weak_from_this(), datagram.get_src(), key);
     _waiting_queue.push(lw_shared_ptr(conn));
     conn->init(); // TODO: to be checked
     return handle_post_hs_connection(conn, std::move(datagram));
@@ -618,7 +608,10 @@ template<template<typename> typename CT>
 future<> quic_server_instance<CT>::quic_retry(const quic_header_info& header_info, udp_datagram&& datagram) {
     header_token token;
     try {
-        token = header_token::mint_token(datagram.get_src(), { reinterpret_cast<const char*>(header_info.dcid.data), header_info.dcid.length });
+        token = header_token::mint_token(
+            datagram.get_src(),
+            { reinterpret_cast<const char*>(header_info.dcid.data), header_info.dcid.length }
+        );
     } catch (const std::exception& excp) {
         qlogger.info("Minting a token has failed with the message: {}", excp.what());
     }
@@ -671,7 +664,6 @@ std::optional<quic_dcid> quic_server_instance<CT>::validate_token(
             return std::nullopt;
         }
 
-        // Check the entropy.
         const auto& tok = _address_tokens.at(sa);
         if (std::memcmp(token.entropy_data(), tok.entropy_data(), header_token::ENTROPY_SIZE) != 0) {
             return std::nullopt;
