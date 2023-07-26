@@ -85,11 +85,10 @@ private:
     // Requests that are not FINISHED yet.
     std::unordered_map<int64_t, quic_h3_request> _requests;
     std::unordered_map<int64_t, h3_stream> _streams;
+    bool _aborted = false;
 public:
     // Data to be read from the stream.
     queue<std::unique_ptr<quic_h3_request>> _read_queue = queue<std::unique_ptr<quic_h3_request>>(H3_READ_QUEUE_SIZE);
-    // Data to be sent via the stream.
-    // std::deque<quic_buffer>         write_queue; TODO: implement buffering (not only quic_buffer, but also headers!)
 
 // Constructors + the destructor.
 public:
@@ -146,7 +145,20 @@ void h3_connection<QI>::init() {
 
 template<typename QI>
 future<> h3_connection<QI>::abort() {
-    // TODO
+    if (_aborted) {
+        return make_ready_future<>();
+    }
+    _aborted = true;
+    this->_read_marker.abort();
+    _read_queue.abort(std::make_exception_ptr(quic_aborted_exception()));
+    for (auto &[stream_id, s] : _streams) {
+        if (s.maybe_writable) {
+            s.maybe_writable->set_exception(std::make_exception_ptr(quic_aborted_exception()));
+        }
+    }
+
+    this->_timeout_timer.cancel();
+    this->_send_timer.cancel();
     return make_ready_future<>();
 }
 
@@ -162,7 +174,7 @@ void h3_connection<QI>::close() {
                 this->_connection,
                 true, // The user closed the connection.
                 0,
-                nullptr,
+                (uint8_t*) "",
                 0
         );
     }
@@ -201,7 +213,6 @@ std::vector<quiche_h3_header> h3_connection<QI>::to_quiche_headers(const std::un
 
 template<typename QI>
 void h3_connection<QI>::send_outstanding_data_in_streams_if_possible() {
-    qlogger.info("In send_outstanding");
     auto* iter = quiche_conn_writable(this->_connection);
     quic_stream_id stream_id;
     int header_res;
@@ -213,7 +224,6 @@ void h3_connection<QI>::send_outstanding_data_in_streams_if_possible() {
         auto& buffered_reply = stream.buffered_reply;
 
         if (!stream.maybe_writable) {
-            qlogger.info("!stream.maybe_writable for stream: {}", stream_id);
             continue;
         }
 
@@ -260,7 +270,6 @@ void h3_connection<QI>::send_outstanding_data_in_streams_if_possible() {
 
         body_written = body_res < 0 ? 0 : static_cast<size_t>(body_res);
         stream.buffered_reply.body_iter += body_written;
-        qlogger.info("Current body iter: {} for stream: {}", stream.buffered_reply.body_iter, stream_id);
 
         if (stream.buffered_reply.body_iter >= to_write && stream.maybe_writable) {
             stream.maybe_writable->set_value();
@@ -280,8 +289,7 @@ template<typename QI>
 future<> h3_connection<QI>::wait_send_available(h3_stream& stream) {
     size_t written = stream.buffered_reply.body_iter;
     size_t to_write = stream.buffered_reply.reply->_resp->_content.size();
-    qlogger.info("In wait send available, written_headers: {}, written body: {}, to write: {}", stream.buffered_reply.written_headers,
-                 written, to_write);
+
     if (stream.buffered_reply.written_headers && written == to_write) {
         return make_ready_future<>();
     }
@@ -306,8 +314,6 @@ future<> h3_connection<QI>::write(std::unique_ptr<quic_h3_reply> reply) {
     stream.buffered_reply.written_headers = true;
     stream.buffered_reply.body_iter = 0;
     auto headers = to_quiche_headers(reply);
-    qlogger.info("Writing reply with {} headers and {} bytes in body, content_length: {}, status: {}",
-                 headers.size(), reply->_resp->_content.size(), reply->_resp->content_length, reply->_resp->_status);
 
     header_res = quiche_h3_send_response(
             _h3_conn,
@@ -341,7 +347,6 @@ future<> h3_connection<QI>::write(std::unique_ptr<quic_h3_reply> reply) {
         }
 
         body_written = body_res < 0 ? 0 : static_cast<size_t>(body_res);
-        qlogger.info("Current body iter: {} for stream {}", body_written, stream_id);
         stream.buffered_reply.body_iter = body_written;
     }
 
@@ -362,8 +367,6 @@ int for_each_header(uint8_t *name, size_t name_len, uint8_t *value, size_t value
     auto key = sstring(cname, name_len);
     auto val = sstring(cvalue, value_len);
 
-//    qlogger.info("{}: {}", key, val);
-
     request_in_callback->_req->_headers[std::move(key)] = std::move(val);
     return 0;
 }
@@ -373,9 +376,6 @@ future<> h3_connection<QI>::do_h3_poll() {
     if (!quiche_conn_is_established(this->_connection)) {
         return make_ready_future<>();
     }
-//    if (_h3_conn == nullptr) {
-//        throw std::runtime_error("Invalid state");
-//    }
 
     while(true) {
         quiche_h3_event* ev;
@@ -434,9 +434,16 @@ future<> h3_connection<QI>::do_h3_poll() {
             }
 
             case QUICHE_H3_EVENT_RESET:
+                h3logger.warn("[h3_connection::do_h3_poll] Unhandled RESET event.");
+                break;
             case QUICHE_H3_EVENT_PRIORITY_UPDATE:
+                h3logger.warn("[h3_connection::do_h3_poll] Unhandled PRIORITY_UPDATE event.");
+                break;
             case QUICHE_H3_EVENT_DATAGRAM:
+                h3logger.warn("[h3_connection::do_h3_poll] Unhandled DATAGRAM event.");
+                break;
             case QUICHE_H3_EVENT_GOAWAY:
+                h3logger.warn("[h3_connection::do_h3_poll] Unhandled GOAWAY event.");
                 break;
         }
 
@@ -448,7 +455,7 @@ future<> h3_connection<QI>::do_h3_poll() {
 
 template <typename QI>
 future<> h3_connection<QI>::h3_recv_loop() {
-    return do_until([this] { return this->is_closing(); }, [this] {
+    return keep_doing([this] {
         return this->_read_marker.get_shared_future().then([this] {
             return do_h3_poll();
         }).then([this] {
@@ -496,7 +503,6 @@ public:
     : _connection(conn) {}
 
     ~h3_connected_socket_impl() noexcept {
-        std::cout << "h3 socket impl DELETING" << std::endl;
         _connection->close();
     }
 
@@ -507,6 +513,9 @@ public:
     }
     future<> write(std::unique_ptr<quic_h3_reply> reply) {
         return _connection->write(std::move(reply));
+    }
+    future<> abort() {
+        return _connection->abort();
     }
 };
 
@@ -569,6 +578,10 @@ future<> quic_h3_connected_socket::write(std::unique_ptr<quic_h3_reply> reply) {
     return future<>(_impl->write(std::move(reply)));
 }
 
+future<> quic_h3_connected_socket::abort() {
+    return _impl->abort();
+}
+
 } // namespace net
 
 namespace http3 {
@@ -582,7 +595,6 @@ connection::~connection() {
 }
 
 future<> connection::process() {
-    h3logger.info("ABOUT TO PROCESS");
     return when_all(read(), respond()).then([] (std::tuple<future<>, future<>> joined) {
         try {
             std::get<0>(joined).get();
@@ -618,7 +630,6 @@ future<> connection::read_one() {
         auto method = req->_req->_method;
 
         req->_req->protocol_name = "https";
-
         sstring length_header = req->_req->get_header("Content-Length");
         req->_req->content_length = strtol(length_header.c_str(), nullptr, 10);
 
@@ -707,10 +718,14 @@ future<> connection::start_response() {
     return _socket.write(std::move(_resp));
 }
 
+future<> connection::stop() {
+    _replies.abort(std::make_exception_ptr(net::quic_aborted_exception()));
+    return _socket.abort();
+}
+
 future<> http3_server::listen(socket_address addr, const std::string &cert_file, const std::string &cert_key,
                                   [[maybe_unused]] const net::quic_connection_config &quic_config)
 {
-    // fmt::print("Called http3_server::listen with: {}, {}, {}", addr, cert_file, cert_key);
     _listener = net::quic_h3_listen(addr, cert_file, cert_key, quic_config);
     do_accepts();
     return make_ready_future<>();
@@ -729,14 +744,12 @@ void http3_server::do_accepts() {
 
 future<> http3_server::accept_one() {
     return _listener.accept().then([this] (net::quic_h3_accept_result result) mutable {
-        h3logger.info("ACCEPTED");
         auto conn = std::make_unique<connection>(*this, std::move(result.connection));
         (void) try_with_gate(_task_gate, [conn = std::move(conn)] () mutable {
             return conn->process().handle_exception([conn = std::move(conn)] (const std::exception_ptr& e) {
                 h3logger.debug("Connection processing error: {}", e);
             });
         }).handle_exception_type([] (const gate_closed_exception& e) {
-            h3logger.debug("Gate closed.");
         });
         return make_ready_future<>();
     }).handle_exception([] (const std::exception_ptr& e) {
@@ -747,10 +760,9 @@ future<> http3_server::accept_one() {
 future<> http3_server::stop() {
     future<> closed = _task_gate.close();
     _listener.abort_accept();
-    // TODO: implement stop
-//    for (auto&& conn : _connections) {
-//        // conn.stop();
-//    }
+    for (auto&& conn : _connections) {
+        (void) conn.stop();
+    }
     return closed;
 }
 
@@ -803,7 +815,6 @@ future<> http3_server_control::setup_alt_svc_server(socket_address addr, const s
        creds->set_dh_level(tls::dh_params::level::MEDIUM);
        creds->set_x509_key_file(cert_file, cert_key, tls::x509_crt_format::PEM).get();
        creds->set_system_trust().get();
-       std::cout << "set keys\n";
 
        _alt_svc_server.server().invoke_on_all([alt_svc_port = addr.port() + 1, creds] (httpd::http_server &server) {
            server.set_tls_credentials(creds->build_server_credentials());
