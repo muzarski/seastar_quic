@@ -94,21 +94,16 @@ public:
 void set_routes(routes& r) {
     handl* quic = new handl();
     r.add(operation_type::GET, url("/"), quic);
-    auto *file_handler = new seastar::httpd::file_handler("/home/mikolajuzarski/zpp/seastar_quic/demos/demo.txt");
-    r.add(operation_type::GET, url("/file"), file_handler);
     auto *huge = new handl_huge();
     r.add(operation_type::GET, url("/huge"), huge);
 }
-
-const std::string ms_cert_default = "/home/mikolajuzarski/zpp/seastar_quic/localhost.pem";
-const std::string ms_key_default = "/home/mikolajuzarski/zpp/seastar_quic/localhost-key.pem";
 
 int main(int ac, char** av) {
     app_template app;
 
     app.add_options()("port", bpo::value<uint16_t>()->default_value(3334), "HTTP Server port");
-    app.add_options()("cert_file", bpo::value<std::string>()->default_value(ms_cert_default), "cert file");
-    app.add_options()("cert_key", bpo::value<std::string>()->default_value(ms_key_default), "cert file");
+    app.add_options()("cert_file", bpo::value<std::string>()->required(), "cert file");
+    app.add_options()("cert_key", bpo::value<std::string>()->required(), "cert key");
 
     return app.run_deprecated(ac, av, [&] {
         return seastar::async([&] {
