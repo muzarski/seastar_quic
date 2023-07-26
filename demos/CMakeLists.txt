@@ -122,3 +122,18 @@ seastar_add_demo (tutorial_examples
 
 seastar_add_demo (http_client
   SOURCES http_client_demo.cc)
+
+seastar_add_demo (quic_echo_server
+  SOURCES quic_echo_server.cc)
+
+seastar_add_demo (quic_echo_client
+  SOURCES quic_echo_client.cc)
+
+seastar_add_demo (quic_receive_big_chunk_of_data
+        SOURCES quic_receive_big_chunk_of_data.cc)
+
+seastar_add_demo (quic_send_big_chunk_of_data
+        SOURCES quic_send_big_chunk_of_data.cc)
+
+seastar_add_demo (http3_server
+        SOURCES http3_demo.cc)

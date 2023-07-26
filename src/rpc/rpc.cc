@@ -163,7 +163,7 @@ namespace rpc {
   future<> connection::stop_send_loop(std::exception_ptr ex) {
       _error = true;
       if (_connected) {
-          _fd.shutdown_output();
+          _fd.shutdown_all_output();
       }
       if (ex == nullptr) {
           ex = std::make_exception_ptr(closed_error());
@@ -197,13 +197,14 @@ namespace rpc {
       });
   }
 
-  void connection::set_socket(connected_socket&& fd) {
+  void connection::set_socket(net::quic_connected_socket&& fd) {
       if (_connected) {
           throw std::runtime_error("already connected");
       }
       _fd = std::move(fd);
-      _read_buf =_fd.input();
-      _write_buf = _fd.output();
+      // TODO: 4 as a temporary solution
+      _read_buf =_fd.input(4);
+      _write_buf = _fd.output(4);
       _connected = true;
   }
 
@@ -315,7 +316,7 @@ namespace rpc {
   void connection::abort() {
       if (!_error) {
           _error = true;
-          _fd.shutdown_input();
+          _fd.shutdown_all_input();
       }
   }
 
@@ -738,18 +739,12 @@ namespace rpc {
       });
   }
 
-  client::client(const logger& l, void* s, client_options ops, socket socket, const socket_address& addr, const socket_address& local)
+  client::client(const logger& l, void* s, client_options ops, q_socket socket, const socket_address& addr, const socket_address& local)
   : rpc::connection(l, s), _socket(std::move(socket)), _server_addr(addr), _local_addr(local), _options(ops) {
-       _socket.set_reuseaddr(ops.reuseaddr);
       // Run client in the background.
       // Communicate result via _stopped.
       // The caller has to call client::stop() to synchronize.
-      (void)_socket.connect(addr, local).then([this, ops = std::move(ops)] (connected_socket fd) {
-          fd.set_nodelay(ops.tcp_nodelay);
-          if (ops.keepalive) {
-              fd.set_keepalive(true);
-              fd.set_keepalive_parameters(ops.keepalive.value());
-          }
+      (void)_socket.connect(addr).then([this, ops = std::move(ops)] (net::quic_connected_socket fd) {
           set_socket(std::move(fd));
 
           feature_map features;
@@ -840,14 +835,14 @@ namespace rpc {
   }
 
   client::client(const logger& l, void* s, const socket_address& addr, const socket_address& local)
-  : client(l, s, client_options{}, make_socket(), addr, local)
+  : client(l, s, client_options{}, net::new_q_socket(), addr, local)
   {}
 
   client::client(const logger& l, void* s, client_options options, const socket_address& addr, const socket_address& local)
-  : client(l, s, options, make_socket(), addr, local)
+  : client(l, s, options, net::new_q_socket(), addr, local)
   {}
 
-  client::client(const logger& l, void* s, socket socket, const socket_address& addr, const socket_address& local)
+  client::client(const logger& l, void* s, q_socket socket, const socket_address& addr, const socket_address& local)
   : client(l, s, client_options{}, std::move(socket), addr, local)
   {}
 
@@ -1073,7 +1068,7 @@ future<> server::connection::send_unknown_verb_reply(std::optional<rpc_clock_typ
               log_exception(*this, log_level::error,
                       format("server{} connection dropped", is_stream() ? " stream" : "").c_str(), ep);
           }
-          _fd.shutdown_input();
+          _fd.shutdown_all_input();
           _error = true;
           _stream_queue.abort(std::make_exception_ptr(stream_closed()));
           return stop_send_loop(ep).then_wrapped([this] (future<> f) {
@@ -1092,7 +1087,7 @@ future<> server::connection::send_unknown_verb_reply(std::optional<rpc_clock_typ
       });
   }
 
-  server::connection::connection(server& s, connected_socket&& fd, socket_address&& addr, const logger& l, void* serializer, connection_id id)
+  server::connection::connection(server& s, net::quic_connected_socket&& fd, socket_address&& addr, const logger& l, void* serializer, connection_id id)
       : rpc::connection(std::move(fd), l, serializer, id), _server(s) {
       _info.addr = std::move(addr);
   }
@@ -1113,17 +1108,21 @@ future<> server::connection::send_unknown_verb_reply(std::optional<rpc_clock_typ
       });
   }
 
+  //insert your path to keys
+  std::string cert_file = "/home/zpp2022-http3/quic-keys/cert.crt";
+  std::string key_file = "/home/zpp2022-http3/quic-keys/cert.key";
+
   thread_local std::unordered_map<streaming_domain_type, server*> server::_servers;
 
   server::server(protocol_base* proto, const socket_address& addr, resource_limits limits)
-      : server(proto, seastar::listen(addr, listen_options{true}), limits, server_options{})
+          : server(proto, net::quic_listen(addr, cert_file, key_file), limits, server_options{})
   {}
 
   server::server(protocol_base* proto, server_options opts, const socket_address& addr, resource_limits limits)
-      : server(proto, seastar::listen(addr, listen_options{true, opts.load_balancing_algorithm}), limits, opts)
+          : server(proto, net::quic_listen(addr, cert_file, key_file), limits, opts)
   {}
 
-  server::server(protocol_base* proto, server_socket ss, resource_limits limits, server_options opts)
+  server::server(protocol_base* proto, net::quic_server_socket ss, resource_limits limits, server_options opts)
           : _proto(proto), _ss(std::move(ss)), _limits(limits), _resources_available(limits.max_memory), _options(opts)
   {
       if (_options.streaming_domain) {
@@ -1135,7 +1134,7 @@ future<> server::connection::send_unknown_verb_reply(std::optional<rpc_clock_typ
       accept();
   }
 
-  server::server(protocol_base* proto, server_options opts, server_socket ss, resource_limits limits)
+  server::server(protocol_base* proto, server_options opts, net::quic_server_socket ss, resource_limits limits)
           : server(proto, std::move(ss), limits, opts)
   {}
 
@@ -1144,13 +1143,12 @@ future<> server::connection::send_unknown_verb_reply(std::optional<rpc_clock_typ
       // Communicate result via __ss_stopped.
       // The caller has to call server::stop() to synchronize.
       (void)keep_doing([this] () mutable {
-          return _ss.accept().then([this] (accept_result ar) mutable {
+          return _ss.accept().then([this] (net::quic_accept_result ar) mutable {
               if (_options.filter_connection && !_options.filter_connection(ar.remote_address)) {
                   return;
               }
               auto fd = std::move(ar.connection);
               auto addr = std::move(ar.remote_address);
-              fd.set_nodelay(_options.tcp_nodelay);
               connection_id id = _options.streaming_domain ?
                       connection_id::make_id(_next_client_id++, uint16_t(this_shard_id())) :
                       connection_id::make_invalid_id(_next_client_id++);

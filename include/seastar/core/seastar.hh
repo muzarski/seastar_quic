@@ -66,6 +66,7 @@ template <class CharType> class input_stream;
 template <class CharType> class output_stream;
 
 class server_socket;
+class q_socket;
 class socket;
 class connected_socket;
 class socket_address;

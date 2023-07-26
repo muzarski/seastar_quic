@@ -118,6 +118,7 @@ class http_server {
     uint64_t _requests_served = 0;
     uint64_t _read_errors = 0;
     uint64_t _respond_errors = 0;
+    std::optional<uint16_t> h3_alt_svc_port = std::nullopt;
     shared_ptr<seastar::tls::server_credentials> _credentials;
     sstring _date = http_date();
     timer<> _date_format_timer { [this] {_date = http_date();} };
@@ -165,6 +166,8 @@ public:
     bool get_content_streaming() const;
 
     void set_content_streaming(bool b);
+
+    void set_http3_alt_svc_port(uint16_t p);
 
     future<> listen(socket_address addr, listen_options lo);
     future<> listen(socket_address addr);

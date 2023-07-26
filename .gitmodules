@@ -1,3 +1,7 @@
 [submodule "dpdk"]
 	path = dpdk
 	url = ../dpdk
+[submodule "quiche"]
+	path = quiche
+	url = https://github.com/danmastalerz/quiche.git
+	branch = master

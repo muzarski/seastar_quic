@@ -328,7 +328,12 @@ future<> connection::write_body() {
 void connection::set_headers(http::reply& resp) {
     resp._headers["Server"] = "Seastar httpd";
     resp._headers["Date"] = _server._date;
+    if (_server.h3_alt_svc_port) {
+        resp._headers["Alt-Svc"] = seastar::format("h3=\":{}\"", _server.h3_alt_svc_port.value());
+    }
 }
+
+
 
 future<bool> connection::generate_reply(std::unique_ptr<http::request> req) {
     auto resp = std::make_unique<http::reply>();
@@ -352,6 +357,10 @@ future<bool> connection::generate_reply(std::unique_ptr<http::request> req) {
 
 void http_server::set_tls_credentials(shared_ptr<seastar::tls::server_credentials> credentials) {
     _credentials = credentials;
+}
+
+void http_server::set_http3_alt_svc_port(uint16_t p) {
+    h3_alt_svc_port = p;
 }
 
 size_t http_server::get_content_length_limit() const {

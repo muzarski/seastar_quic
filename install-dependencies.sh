@@ -106,6 +106,7 @@ fedora_packages=(
     libasan
     libatomic
     valgrind-devel
+    cargo
 )
 
 centos7_packages=(
@@ -235,3 +236,7 @@ case "$ID" in
         exit 1
     ;;
 esac
+
+git submodule update --init --recursive -- quiche
+cd quiche
+cargo build --features ffi
