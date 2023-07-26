@@ -398,6 +398,7 @@ private:
 
 template<template<typename> typename CT>
 future<> quic_server_instance<CT>::send(send_payload&& payload) {
+    qlogger.info("Sending {} bytes", payload.buffer.size());
     return _channel_manager.send(std::move(payload));
 }
 
@@ -481,6 +482,7 @@ template<template<typename> typename CT>
 future<> quic_server_instance<CT>::service_loop() {
     return keep_doing([this] () {
         return _channel_manager.read().then([this] (udp_datagram datagram) {
+            qlogger.info("Received {} bytes", datagram.get_data().fragment_array()->size);
             return handle_datagram(std::move(datagram));
         });
     });

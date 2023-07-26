@@ -49,6 +49,7 @@ struct quic_h3_request {
 struct quic_h3_reply {
     int64_t _stream_id;
     std::unique_ptr<http::reply> _resp;
+    std::optional<sstring> _status_code = std::nullopt;
 };
 
 class quic_h3_connected_socket_impl {
@@ -56,6 +57,7 @@ public:
     virtual ~quic_h3_connected_socket_impl() {}
     virtual future<std::unique_ptr<quic_h3_request>> read() = 0;
     virtual future<> write(std::unique_ptr<quic_h3_reply> reply) = 0;
+    virtual future<> abort() = 0;
 };
 
 class quic_h3_connected_socket {
@@ -67,6 +69,7 @@ public:
 
     future<std::unique_ptr<quic_h3_request>> read();
     future<> write(std::unique_ptr<quic_h3_reply> reply);
+    future<> abort();
 };
 
 struct quic_h3_accept_result {
@@ -145,6 +148,7 @@ public:
     void set_headers(seastar::net::quic_h3_reply& resp);
     future<> start_response();
     future<bool> generate_reply(std::unique_ptr<seastar::net::quic_h3_request> req);
+    future<> stop();
 };
 
 class http3_server {

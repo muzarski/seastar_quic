@@ -327,13 +327,20 @@ future<> quic_connection<QI>::abort() {
 
     shared_promise<> aborted{};
     _aborted.emplace(aborted.get_shared_future());
+    if (this->_connect_done_promise) {
+        this->_connect_done_promise->set_exception(std::make_exception_ptr(quic_aborted_exception()));
+    }
 
     if (this->_send_queue.size() > 0) {
         qlogger.warn("[quic_connection::abort] there is some unsent data in pacing queue for stream.");
     }
 
+    // Abort streams' read and write queues.
     for (auto& [_, stream] : _streams) {
         stream.read_queue.abort(std::make_exception_ptr(quic_aborted_exception()));
+        if (stream.maybe_writable) {
+            stream.maybe_writable->set_exception(std::make_exception_ptr(quic_aborted_exception()));
+        }
     }
 
     this->_timeout_timer.cancel();

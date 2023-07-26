@@ -60,6 +60,17 @@ public:
 private:
     using super_type    = quic_basic_connection<QI>;
 
+    struct h3_buffered_reply {
+        std::unique_ptr<quic_h3_reply> reply;
+        size_t body_iter = 0;
+        bool written_headers = false;
+    };
+
+    struct h3_stream {
+        h3_buffered_reply buffered_reply{};
+        std::optional<shared_promise<>> maybe_writable = std::nullopt;
+    };
+
 // Quiche HTTP3 specific fields.
 private:
     quiche_h3_config* _h3_config = nullptr;
@@ -73,11 +84,11 @@ private:
 
     // Requests that are not FINISHED yet.
     std::unordered_map<int64_t, quic_h3_request> _requests;
+    std::unordered_map<int64_t, h3_stream> _streams;
+    bool _aborted = false;
 public:
     // Data to be read from the stream.
     queue<std::unique_ptr<quic_h3_request>> _read_queue = queue<std::unique_ptr<quic_h3_request>>(H3_READ_QUEUE_SIZE);
-    // Data to be sent via the stream.
-    // std::deque<quic_buffer>         write_queue; TODO: implement buffering (not only quic_buffer, but also headers!)
 
 // Constructors + the destructor.
 public:
@@ -104,9 +115,10 @@ public:
     future<> h3_connect_done();
 // Private methods.
 private:
+    static std::vector<quiche_h3_header> to_quiche_headers(const std::unique_ptr<quic_h3_reply>& reply);
     future<> h3_recv_loop();
     future<> do_h3_poll();
-    // future<> wait_send_available(); TODO: buffering
+    future<> wait_send_available(h3_stream& stream);
 };
 
 template<typename QI>
@@ -133,7 +145,20 @@ void h3_connection<QI>::init() {
 
 template<typename QI>
 future<> h3_connection<QI>::abort() {
-    // TODO
+    if (_aborted) {
+        return make_ready_future<>();
+    }
+    _aborted = true;
+    this->_read_marker.abort();
+    _read_queue.abort(std::make_exception_ptr(quic_aborted_exception()));
+    for (auto &[stream_id, s] : _streams) {
+        if (s.maybe_writable) {
+            s.maybe_writable->set_exception(std::make_exception_ptr(quic_aborted_exception()));
+        }
+    }
+
+    this->_timeout_timer.cancel();
+    this->_send_timer.cancel();
     return make_ready_future<>();
 }
 
@@ -157,8 +182,102 @@ void h3_connection<QI>::close() {
 }
 
 template<typename QI>
+std::vector<quiche_h3_header> h3_connection<QI>::to_quiche_headers(const std::unique_ptr<quic_h3_reply> &reply) {
+    // TODO get status header from seastar handler
+    std::vector<quiche_h3_header> headers;
+//    if (!reply->_status_code) {
+//        reply->_status_code = to_sstring(reply->_resp->_status);
+//    }
+
+//reply->_status_code->c_str()
+//reply->_status_code->size()
+    quiche_h3_header status = {
+            .name      = reinterpret_cast<const uint8_t*>(":status"),
+            .name_len  = sizeof(":status") - 1,
+            .value     = reinterpret_cast<const uint8_t *>("200"),
+            .value_len = sizeof("200") - 1,
+    };
+    headers.push_back(status);
+
+    for (const auto& h : reply->_resp->_headers) {
+        headers.push_back({
+                  .name      = reinterpret_cast<const uint8_t*>(h.first.c_str()),
+                  .name_len  = h.first.size(),
+                  .value     = reinterpret_cast<const uint8_t*>(h.second.c_str()),
+                  .value_len = h.second.size(),
+        });
+    }
+
+    return headers;
+}
+
+template<typename QI>
 void h3_connection<QI>::send_outstanding_data_in_streams_if_possible() {
-    // TODO: buffering
+    auto* iter = quiche_conn_writable(this->_connection);
+    quic_stream_id stream_id;
+    int header_res;
+    ssize_t body_res;
+    size_t body_written, to_write;
+
+    while (quiche_stream_iter_next(iter, &stream_id)) {
+        auto& stream = _streams[stream_id];
+        auto& buffered_reply = stream.buffered_reply;
+
+        if (!stream.maybe_writable) {
+            continue;
+        }
+
+        if (!buffered_reply.written_headers) {
+            auto headers = to_quiche_headers(buffered_reply.reply);
+
+            header_res = quiche_h3_send_response(
+                    _h3_conn,
+                    this->_connection,
+                    stream_id,
+                    headers.data(),
+                    headers.size(),
+                    buffered_reply.reply->_resp->_content.empty()
+            );
+
+            // Write the headers.
+            if (header_res == QUICHE_H3_ERR_STREAM_BLOCKED) {
+                stream.buffered_reply.written_headers = false;
+                continue;
+            }
+            else if (header_res < 0) {
+                h3logger.warn("Unexpected error during quiche_h3_send_response: {}", header_res);
+                continue;
+            }
+
+            buffered_reply.written_headers = true;
+        }
+
+        body_written = buffered_reply.body_iter;
+        to_write = buffered_reply.reply->_resp->_content.size();
+
+        body_res = quiche_h3_send_body(
+                _h3_conn,
+                this->_connection,
+                stream_id,
+                reinterpret_cast<uint8_t*>(buffered_reply.reply->_resp->_content.data() + body_written),
+                buffered_reply.reply->_resp->content_length - body_written,
+                true
+        );
+        if (body_res < -1) {
+            h3logger.warn("[h3_connection::write]: writing reply body to stream ({}) has failed with error: {}.",
+                          stream_id, body_res);
+        }
+
+        body_written = body_res < 0 ? 0 : static_cast<size_t>(body_res);
+        stream.buffered_reply.body_iter += body_written;
+
+        if (stream.buffered_reply.body_iter >= to_write && stream.maybe_writable) {
+            stream.maybe_writable->set_value();
+            stream.maybe_writable = std::nullopt;
+            stream.buffered_reply.reply.reset();
+        }
+    }
+    quiche_stream_iter_free(iter);
 }
 
 template<typename QI>
@@ -167,57 +286,75 @@ future<std::unique_ptr<quic_h3_request>> h3_connection<QI>::read() {
 }
 
 template<typename QI>
+future<> h3_connection<QI>::wait_send_available(h3_stream& stream) {
+    size_t written = stream.buffered_reply.body_iter;
+    size_t to_write = stream.buffered_reply.reply->_resp->_content.size();
+
+    if (stream.buffered_reply.written_headers && written == to_write) {
+        return make_ready_future<>();
+    }
+
+    if (!stream.maybe_writable) {
+        stream.maybe_writable = shared_promise<>();
+    }
+    return stream.maybe_writable->get_shared_future();
+}
+
+template<typename QI>
 future<> h3_connection<QI>::write(std::unique_ptr<quic_h3_reply> reply) {
     if (this->_closing_marker) {
         return make_exception_future<>(std::runtime_error("The connection has been closed."));
     }
 
-    std::vector<quiche_h3_header> headers;
+    int64_t stream_id = reply->_stream_id;
+    int header_res;
+    ssize_t body_res;
+    size_t body_written;
+    h3_stream &stream = _streams[stream_id];
+    stream.buffered_reply.written_headers = true;
+    stream.buffered_reply.body_iter = 0;
+    auto headers = to_quiche_headers(reply);
 
-    // TODO: get status from Seastar handler
-    quiche_h3_header status = {
-            .name      = reinterpret_cast<const uint8_t*>(":status"),
-            .name_len  = sizeof(":status") - 1,
-            .value     = reinterpret_cast<const uint8_t *>("200"),
-            .value_len = sizeof("200") - 1
-    };
-    headers.push_back(status);
-
-    for (const auto& h : reply->_resp->_headers) {
-        headers.push_back({
-            .name      = reinterpret_cast<const uint8_t*>(h.first.c_str()),
-            .name_len  = h.first.size(),
-            .value     = reinterpret_cast<const uint8_t*>(h.second.c_str()),
-            .value_len = h.second.size(),
-        });
-    }
-
-    // TODO: check result
-    quiche_h3_send_response(
+    header_res = quiche_h3_send_response(
             _h3_conn,
             this->_connection,
             reply->_stream_id,
             headers.data(),
             headers.size(),
-            false
+            reply->_resp->_content.empty()
     );
 
-    // TODO: check result
-    quiche_h3_send_body(
-            _h3_conn,
-            this->_connection,
-            reply->_stream_id,
-            reinterpret_cast<uint8_t*>(reply->_resp->_content.data()),
-            reply->_resp->content_length,
-            true
-    );
+    // Write the headers.
+    if (header_res == QUICHE_H3_ERR_STREAM_BLOCKED) {
+        stream.buffered_reply.written_headers = false;
+    }
+    else if (header_res < 0) {
+        h3logger.warn("Unexpected error during quiche_h3_send_response: {}", header_res);
+    }
+    // Write the body if reply contains one and headers were written successfully.
+    else if (!reply->_resp->_content.empty()) {
+        body_res = quiche_h3_send_body(
+                _h3_conn,
+                this->_connection,
+                reply->_stream_id,
+                reinterpret_cast<uint8_t*>(reply->_resp->_content.data()),
+                reply->_resp->content_length,
+                true
+        );
+        if (body_res < -1) {
+            h3logger.warn("[h3_connection::write]: writing reply body to stream ({}) has failed with error: {}.",
+                          stream_id, body_res);
+        }
 
-        // TODO: buffering
-//        if (written != reply->_resp->content_length) {
-//
-//        }
+        body_written = body_res < 0 ? 0 : static_cast<size_t>(body_res);
+        stream.buffered_reply.body_iter = body_written;
+    }
 
-    return this->quic_flush();
+    stream.buffered_reply.reply = std::move(reply);
+
+    return this->quic_flush().then([this, &stream] () {
+       return wait_send_available(stream);
+    });
 }
 
 [[maybe_unused]] // Unnecessary, but Clang complains.
@@ -239,17 +376,16 @@ future<> h3_connection<QI>::do_h3_poll() {
     if (!quiche_conn_is_established(this->_connection)) {
         return make_ready_future<>();
     }
-//    if (_h3_conn == nullptr) {
-//        throw std::runtime_error("Invalid state");
-//    }
 
     while(true) {
         quiche_h3_event* ev;
         auto s = quiche_h3_conn_poll(_h3_conn, this->_connection, &ev);
 
-        if (s < 0) {
-            std::cout << "poll res: " << s << std::endl;
+        if (s == QUICHE_ERR_DONE) {
             break;
+        }
+        else if (s < 0) {
+            h3logger.warn("[h3_connection::do_h3_poll] Unexpected error during quiche_h3_conn_poll: {}", s);
         }
 
         auto& cur_req = _requests[s];
@@ -265,6 +401,7 @@ future<> h3_connection<QI>::do_h3_poll() {
                 cur_req._req->_url     = cur_req._req->_headers[":path"];
                 cur_req._req->_method  = cur_req._req->_headers[":method"];
                 cur_req._req->_version = cur_req._req->_headers[":scheme"];
+                cur_req._req->_headers["Host"] = cur_req._req->_headers[":authority"];
 
                 if (rc != 0) {
                     fmt::print(stderr, "failed to process headers\n");
@@ -297,9 +434,16 @@ future<> h3_connection<QI>::do_h3_poll() {
             }
 
             case QUICHE_H3_EVENT_RESET:
+                h3logger.warn("[h3_connection::do_h3_poll] Unhandled RESET event.");
+                break;
             case QUICHE_H3_EVENT_PRIORITY_UPDATE:
+                h3logger.warn("[h3_connection::do_h3_poll] Unhandled PRIORITY_UPDATE event.");
+                break;
             case QUICHE_H3_EVENT_DATAGRAM:
+                h3logger.warn("[h3_connection::do_h3_poll] Unhandled DATAGRAM event.");
+                break;
             case QUICHE_H3_EVENT_GOAWAY:
+                h3logger.warn("[h3_connection::do_h3_poll] Unhandled GOAWAY event.");
                 break;
         }
 
@@ -311,7 +455,7 @@ future<> h3_connection<QI>::do_h3_poll() {
 
 template <typename QI>
 future<> h3_connection<QI>::h3_recv_loop() {
-    return do_until([this] { return this->is_closing(); }, [this] {
+    return keep_doing([this] {
         return this->_read_marker.get_shared_future().then([this] {
             return do_h3_poll();
         }).then([this] {
@@ -359,7 +503,6 @@ public:
     : _connection(conn) {}
 
     ~h3_connected_socket_impl() noexcept {
-        std::cout << "h3 socket impl DELETING" << std::endl;
         _connection->close();
     }
 
@@ -370,6 +513,9 @@ public:
     }
     future<> write(std::unique_ptr<quic_h3_reply> reply) {
         return _connection->write(std::move(reply));
+    }
+    future<> abort() {
+        return _connection->abort();
     }
 };
 
@@ -424,12 +570,16 @@ quic_h3_server_socket quic_h3_listen(const socket_address &sa, const std::string
             sa, cert_file, cert_key, quic_config));
 }
 
-future<std::unique_ptr<quic_h3_request>> quic_h3_connected_socket:: read() {
+future<std::unique_ptr<quic_h3_request>> quic_h3_connected_socket::read() {
     return future<std::unique_ptr<quic_h3_request>>(_impl->read());
 }
 
 future<> quic_h3_connected_socket::write(std::unique_ptr<quic_h3_reply> reply) {
     return future<>(_impl->write(std::move(reply)));
+}
+
+future<> quic_h3_connected_socket::abort() {
+    return _impl->abort();
 }
 
 } // namespace net
@@ -445,7 +595,6 @@ connection::~connection() {
 }
 
 future<> connection::process() {
-    h3logger.info("ABOUT TO PROCESS");
     return when_all(read(), respond()).then([] (std::tuple<future<>, future<>> joined) {
         try {
             std::get<0>(joined).get();
@@ -481,7 +630,6 @@ future<> connection::read_one() {
         auto method = req->_req->_method;
 
         req->_req->protocol_name = "https";
-
         sstring length_header = req->_req->get_header("Content-Length");
         req->_req->content_length = strtol(length_header.c_str(), nullptr, 10);
 
@@ -570,10 +718,14 @@ future<> connection::start_response() {
     return _socket.write(std::move(_resp));
 }
 
+future<> connection::stop() {
+    _replies.abort(std::make_exception_ptr(net::quic_aborted_exception()));
+    return _socket.abort();
+}
+
 future<> http3_server::listen(socket_address addr, const std::string &cert_file, const std::string &cert_key,
                                   [[maybe_unused]] const net::quic_connection_config &quic_config)
 {
-    // fmt::print("Called http3_server::listen with: {}, {}, {}", addr, cert_file, cert_key);
     _listener = net::quic_h3_listen(addr, cert_file, cert_key, quic_config);
     do_accepts();
     return make_ready_future<>();
@@ -592,14 +744,12 @@ void http3_server::do_accepts() {
 
 future<> http3_server::accept_one() {
     return _listener.accept().then([this] (net::quic_h3_accept_result result) mutable {
-        h3logger.info("ACCEPTED");
         auto conn = std::make_unique<connection>(*this, std::move(result.connection));
         (void) try_with_gate(_task_gate, [conn = std::move(conn)] () mutable {
             return conn->process().handle_exception([conn = std::move(conn)] (const std::exception_ptr& e) {
                 h3logger.debug("Connection processing error: {}", e);
             });
         }).handle_exception_type([] (const gate_closed_exception& e) {
-            h3logger.debug("Gate closed.");
         });
         return make_ready_future<>();
     }).handle_exception([] (const std::exception_ptr& e) {
@@ -610,10 +760,9 @@ future<> http3_server::accept_one() {
 future<> http3_server::stop() {
     future<> closed = _task_gate.close();
     _listener.abort_accept();
-    // TODO: implement stop
-//    for (auto&& conn : _connections) {
-//        // conn.stop();
-//    }
+    for (auto&& conn : _connections) {
+        (void) conn.stop();
+    }
     return closed;
 }
 
@@ -666,7 +815,6 @@ future<> http3_server_control::setup_alt_svc_server(socket_address addr, const s
        creds->set_dh_level(tls::dh_params::level::MEDIUM);
        creds->set_x509_key_file(cert_file, cert_key, tls::x509_crt_format::PEM).get();
        creds->set_system_trust().get();
-       std::cout << "set keys\n";
 
        _alt_svc_server.server().invoke_on_all([alt_svc_port = addr.port() + 1, creds] (httpd::http_server &server) {
            server.set_tls_credentials(creds->build_server_credentials());
